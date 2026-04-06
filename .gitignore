@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment
+.env
+.venv/
+env/
+
+# Data files (large, archived on Zenodo)
+*.pkl
+saved_pbx/
+saved_pbx_entries/
+saved_sea_pbx/
+saved_sea_pbx_entries/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output files
+*.out
+
+# Original notebooks (large, 24 GB)
+3rd_Iteration/
+
+# Claude Code
+.claude/
+CLAUDE.md
+spices-package-dev-prompts.txt
+
+# Pytest
+.pytest_cache/
