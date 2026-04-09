@@ -352,7 +352,7 @@ def add_charged_struct_info(
     dict
         Updated sheets_dict with charged-phase rows appended.
     """
-    from spices.screening.dilute_water import collect_all_info_from_chemsys
+    from spices.screening.mp_query import collect_mp_data_from_chemsys
     from spices.dataframe_ops import update_seawater_metastability_columns_by_mp_id
 
     if cache_dict is None:
@@ -400,13 +400,11 @@ def add_charged_struct_info(
         )
 
         # Query thermo data for the new charged MP IDs
-        data_dict_list = collect_all_info_from_chemsys(
+        data_dict_list = collect_mp_data_from_chemsys(
             chemsys=None,
             element_str=element_str,
             mp_client=mp_client,
-            cache=cache,
             material_ids=completely_charged_mpids,
-            calculate_water_stability=False,
         )
 
         # Add placeholder water stability columns

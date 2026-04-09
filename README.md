@@ -6,10 +6,11 @@ A Python package for high-throughput screening of cathode materials for desalina
 
 ## Overview
 
-SPICES implements a 5-stage computational pipeline for identifying promising cathode materials for electrochemical desalination:
+SPICES implements a 6-stage computational pipeline (Stages 0--5) for identifying promising cathode materials for electrochemical desalination:
 
-1. **Dilute-limit filter** -- Screen materials for stability in pure water using Pourbaix diagram analysis
-2. **Seawater filter** -- Evaluate stability under seawater ionic conditions
+0. **MP data query** -- Query Materials Project for structural and thermodynamic metadata (mandatory)
+1. **Dilute-limit filter** -- Evaluate stability in pure water using Pourbaix diagram analysis (optional)
+2. **Seawater filter** -- Evaluate stability under seawater ionic conditions (accepts Stage 0 or Stage 1 output)
 3. **Intercalation voltage filter** -- Filter by electrochemical voltage profiles
 4. **Framework comparison** -- Compare material frameworks across different working ions (Ca, K, Li, Mg, Na)
 5. **Statistical analysis** -- Generate aggregate statistics, Venn diagrams, and publication-ready figures
@@ -41,29 +42,37 @@ echo "MP_API_KEY=your_key_here" > .env
 
 ```python
 from spices.mp_client import set_api_key
-from spices.screening.dilute_water import run_dilute_water_screening
+from spices.screening.mp_query import run_mp_query
+from spices.screening.dilute_water import run_dilute_water_evaluation
 from spices.screening.seawater import run_seawater_screening
 
 # Set your API key
 set_api_key("your_api_key_here")
 
-# Stage 1: Run dilute-water screening for calcium cathodes
-df = run_dilute_water_screening(
+# Stage 0: Query Materials Project data (mandatory)
+df_mp = run_mp_query(
     element="Ca",
-    output_path="Ca_screening_results.xlsx",
+    output_path="Ca_cathodes_mp_data.xlsx",
 )
 
-# Stage 2: Run seawater screening on Stage 1 output
+# Stage 1: Evaluate dilute-water stability (optional)
+df_water = run_dilute_water_evaluation(
+    element="Ca",
+    input_data="Ca_cathodes_mp_data.xlsx",
+    output_path="Ca_cathodes_pure_water_metastability.xlsx",
+)
+
+# Stage 2: Seawater screening — accepts Stage 0 or Stage 1 output
 df_sea = run_seawater_screening(
     element="Ca",
-    input_path="Ca_screening_results.xlsx",
+    input_path="Ca_cathodes_mp_data.xlsx",  # or Stage 1 output
     output_path="Ca_seawater_results.xlsx",
 )
 
 # Stage 2 with multiprocessing (48 cores)
 df_sea = run_seawater_screening(
     element="Ca",
-    input_path="Ca_screening_results.xlsx",
+    input_path="Ca_cathodes_mp_data.xlsx",
     output_path="Ca_seawater_results.xlsx",
     n_workers=48,
 )
@@ -129,7 +138,8 @@ spices/
         structure.py           # Charged structure gen, StructureMatcher grouping
 
     screening/                 # Pipeline stage modules
-        dilute_water.py        # Stage 1: pure water screening
+        mp_query.py            # Stage 0: Materials Project data query
+        dilute_water.py        # Stage 1: pure water stability evaluation
         seawater.py            # Stage 2: seawater stability screening
         intercalation.py       # Stage 3: intercalation voltage filtering
         framework_comparison.py # Stage 4: cross-element framework comparison

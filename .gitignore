@@ -41,7 +41,7 @@ Thumbs.db
 # Claude Code
 .claude/
 CLAUDE.md
-spices-package-dev-prompts.txt
+claude-prompts/
 
 # Pytest
 .pytest_cache/

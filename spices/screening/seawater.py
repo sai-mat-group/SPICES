@@ -1,9 +1,11 @@
 """
 Stage 2: Seawater stability and metastability screening.
 
-This module takes Stage 1 output (dilute-water screening Excel) as input
-and applies seawater Pourbaix analysis to evaluate material stability
-under realistic ocean conditions (pH 7-8.5, real ionic concentrations).
+This module takes Stage 0 or Stage 1 output as input and applies
+seawater Pourbaix analysis to evaluate material stability under
+realistic ocean conditions (pH 7-8.5, real ionic concentrations).
+Only the "MP id" and "Formula" columns are required from the input;
+all other columns are passed through unchanged.
 
 Replaces the per-element ``add_seawater_metastability_multi-core.ipynb``
 notebooks with a single parameterized implementation.
