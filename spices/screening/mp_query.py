@@ -87,9 +87,16 @@ def collect_mp_data_from_chemsys(
         material_ids=material_ids,
         all_fields=False,
         fields=[
-            "material_id", "composition", "chemsys", "formula_pretty",
-            "thermo_type", "energy_type", "entries", "energy_per_atom",
-            "energy_above_hull", "symmetry",
+            "material_id",
+            "composition",
+            "chemsys",
+            "formula_pretty",
+            "thermo_type",
+            "energy_type",
+            "entries",
+            "energy_per_atom",
+            "energy_above_hull",
+            "symmetry",
         ],
     )
 
@@ -112,31 +119,41 @@ def collect_mp_data_from_chemsys(
         data["GGA(+U)/R2SCAN mixing adjustment"] = np.nan
 
         # Determine base and correction XC functionals
+        mixing_correction_found = False
         for correction_dict in find_correction(entry):
-            if correction_dict["name"] == "MP GGA(+U)/R2SCAN mixing adjustment":
+            if correction_dict["name"].upper() == "MP GGA(+U)/R2SCAN MIXING ADJUSTMENT":
                 desc = correction_dict["description"].strip()
+                # Normalize R2SCAN casing in stored description
+                desc_normalized = desc.replace("r2SCAN", "R2SCAN")
+                desc_upper = desc.upper()
+                mixing_correction_found = True
 
-                if desc == "Place GGA(+U) energy onto the R2SCAN hull":
+                if desc_upper == "PLACE GGA(+U) ENERGY ONTO THE R2SCAN HULL":
                     data["Base XC Functional"] = "R2SCAN"
                     data["Correction XC functional"] = entry.energy_type
-                    data["GGA(+U)/R2SCAN mixing adjustment"] = desc
+                    data["GGA(+U)/R2SCAN mixing adjustment"] = desc_normalized
 
-                elif desc in (
-                    "Place R2SCAN energy onto the GGA(+U) hull",
-                    "Replace R2SCAN energy with GGA(+U) energy",
+                elif desc_upper in (
+                    "PLACE R2SCAN ENERGY ONTO THE GGA(+U) HULL",
+                    "REPLACE R2SCAN ENERGY WITH GGA(+U) ENERGY",
                 ):
                     gga_types = [
-                        t.energy_type for t in thermo_list
-                        if "GGA" in t.energy_type
+                        t.energy_type for t in thermo_list if "GGA" in t.energy_type
                     ]
-                    data["Base XC Functional"] = gga_types[0] if gga_types else entry.energy_type
+                    data["Base XC Functional"] = (
+                        gga_types[0] if gga_types else entry.energy_type
+                    )
                     data["Correction XC functional"] = entry.energy_type
-                    data["GGA(+U)/R2SCAN mixing adjustment"] = desc
+                    data["GGA(+U)/R2SCAN mixing adjustment"] = desc_normalized
 
                 else:
                     data["Base XC Functional"] = entry.energy_type
                     data["Correction XC functional"] = entry.energy_type
-                    data["GGA(+U)/R2SCAN mixing adjustment"] = desc
+                    data["GGA(+U)/R2SCAN mixing adjustment"] = desc_normalized
+
+        # Standalone R2SCAN entries (thermo_type=R2SCAN, no mixing corrections)
+        if not mixing_correction_found and entry.energy_type.upper() == "R2SCAN":
+            data["Base XC Functional"] = "R2SCAN"
 
         # Energy per formula unit
         atoms_per_formula = sum(
@@ -147,6 +164,12 @@ def collect_mp_data_from_chemsys(
         data["Energy Above Hull (eV)"] = entry.energy_above_hull
         data["Crystal Structure"] = entry.symmetry.crystal_system.value
         data["Space Group"] = entry.symmetry.symbol
+
+        # Normalize R2SCAN casing in stored values for downstream consistency
+        if data["Base XC Functional"].upper() == "R2SCAN":
+            data["Base XC Functional"] = "R2SCAN"
+        if data["Correction XC functional"].upper() == "R2SCAN":
+            data["Correction XC functional"] = "R2SCAN"
 
         # Skip R2SCAN base entries
         if remove_R2SCAN_base and data["Base XC Functional"] == "R2SCAN":
@@ -163,18 +186,29 @@ def collect_mp_data_from_chemsys(
             if req_index > -1:
                 existing = return_list[req_index]
                 if existing["Base XC Functional"] == data["Base XC Functional"]:
-                    if existing["Correction XC functional"] != data["Correction XC functional"]:
-                        if ("GGA" in data["Correction XC functional"]
-                                and existing["Correction XC functional"] == "R2SCAN"):
+                    if (
+                        existing["Correction XC functional"]
+                        != data["Correction XC functional"]
+                    ):
+                        if (
+                            "GGA" in data["Correction XC functional"]
+                            and existing["Correction XC functional"] == "R2SCAN"
+                        ):
                             continue
-                        elif (data["Correction XC functional"] == "R2SCAN"
-                              and "GGA" in existing["Correction XC functional"]):
+                        elif (
+                            data["Correction XC functional"] == "R2SCAN"
+                            and "GGA" in existing["Correction XC functional"]
+                        ):
                             # Replace existing with current (R2SCAN-corrected)
-                            data["Charged composition"] = existing.get("Charged composition")
+                            data["Charged composition"] = existing.get(
+                                "Charged composition"
+                            )
                             data["No. of charged structures present"] = existing.get(
                                 "No. of charged structures present"
                             )
-                            data["No. of charged structure with same crystal structure"] = existing.get(
+                            data[
+                                "No. of charged structure with same crystal structure"
+                            ] = existing.get(
                                 "No. of charged structure with same crystal structure"
                             )
                             return_list.append(data)
@@ -188,7 +222,9 @@ def collect_mp_data_from_chemsys(
         data["Charged composition"] = charged_formula
 
         charged_entries = mp_client.materials.search(
-            formula=charged_formula, all_fields=False, fields=["material_id"],
+            formula=charged_formula,
+            all_fields=False,
+            fields=["material_id"],
         )
         data["No. of charged structures present"] = len(
             {e.material_id for e in charged_entries}
@@ -197,7 +233,8 @@ def collect_mp_data_from_chemsys(
         same_crystal_entries = mp_client.materials.search(
             formula=charged_formula,
             crystal_system=entry.symmetry.crystal_system,
-            all_fields=False, fields=["material_id"],
+            all_fields=False,
+            fields=["material_id"],
         )
         data["No. of charged structure with same crystal structure"] = len(
             {e.material_id for e in same_crystal_entries}
@@ -237,7 +274,7 @@ def run_mp_query(
     transition_metals : list of str or None
         Transition metals to include (default: 15 common TMs).
     anions : list of str or None
-        Anion elements (default: O, S, Se, F, Cl, Br, I, P, N).
+        Anion elements (default: O, S, Se, F, Cl, Br, I, P, N, C, Si).
     min_tm, max_tm : int
         Min/max number of transition metals per compound.
     min_anions, max_anions : int
@@ -275,13 +312,16 @@ def run_mp_query(
             for n_an in range(min_anions, max_anions + 1):
                 for an_combo in combinations(anions, n_an):
                     chemsys = make_chemsys_from_combinations(
-                        tm_combo, an_combo, element,
+                        tm_combo,
+                        an_combo,
+                        element,
                     )
                     chemsys_list.append(chemsys)
 
     logger.info(
         "Starting MP data query for %s: %d chemsys to process",
-        element, len(chemsys_list),
+        element,
+        len(chemsys_list),
     )
 
     all_rows = []
@@ -301,7 +341,10 @@ def run_mp_query(
             except Exception as e:
                 logger.warning(
                     "Attempt %d/%d for %s failed: %s",
-                    attempt + 1, max_retries, chemsys, e,
+                    attempt + 1,
+                    max_retries,
+                    chemsys,
+                    e,
                 )
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)

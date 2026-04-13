@@ -21,7 +21,7 @@ DEFAULT_TRANSITION_METALS = [
 ]
 
 # Default anions to include in chemical system search
-DEFAULT_ANIONS = ["O", "S", "Se", "F", "Cl", "Br", "I", "P", "N"]
+DEFAULT_ANIONS = ["O", "S", "Se", "F", "Cl", "Br", "I", "P", "N", "C", "Si"]
 
 # Supported working ion elements
 SUPPORTED_ELEMENTS = ["Ca", "K", "Li", "Mg", "Na"]
@@ -39,7 +39,7 @@ DEFAULT_VOLTAGE_RANGE = [-1, 1.5]
 ANIONIC_ELEMENTS = frozenset({
     Element("H"), Element("O"), Element("S"), Element("Se"),
     Element("F"), Element("Cl"), Element("Br"), Element("I"),
-    Element("P"), Element("N"),
+    Element("P"), Element("N"), Element("C"), Element("Si"),
 })
 
 # H and O elements (frequently excluded from Pourbaix composition)
