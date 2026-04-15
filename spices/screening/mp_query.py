@@ -3,7 +3,7 @@ Stage 0: Materials Project data query and metadata collection.
 
 This module queries the Materials Project for structural and thermodynamic
 data across chemical systems defined by combinations of transition metals,
-anions, and a working ion.  It produces a DataFrame with 14 columns that
+anions, and a working ion.  It produces a DataFrame with 15 columns that
 serves as the mandatory input for all downstream pipeline stages.
 """
 
@@ -42,6 +42,7 @@ MP_QUERY_COLUMNS = [
     "Energy Above Hull (eV)",
     "Crystal Structure",
     "Space Group",
+    "Is experimental",
     "Charged composition",
     "No. of charged structures present",
     "No. of charged structure with same crystal structure",
@@ -55,6 +56,8 @@ def collect_mp_data_from_chemsys(
     material_ids=None,
     remove_R2SCAN_base=True,
     remove_uncorrected_duplicates=True,
+    max_retries=500,
+    retry_delay=10.0,
 ):
     """
     Query the Materials Project for all materials in a chemical system
@@ -76,6 +79,10 @@ def collect_mp_data_from_chemsys(
     remove_uncorrected_duplicates : bool
         If an entry has both corrected and uncorrected versions, keep
         only the R2SCAN-corrected one.
+    max_retries : int
+        Maximum retries for the summary endpoint query.
+    retry_delay : float
+        Seconds to wait between retries.
 
     Returns
     -------
@@ -99,6 +106,37 @@ def collect_mp_data_from_chemsys(
             "symmetry",
         ],
     )
+
+    # Query summary endpoint for experimental status
+    mp_ids = [e.material_id.string for e in thermo_list]
+    theoretical_map = {}
+    if mp_ids:
+        for attempt in range(max_retries):
+            try:
+                summary_list = mp_client.materials.summary.search(
+                    material_ids=mp_ids,
+                    all_fields=False,
+                    fields=["material_id", "theoretical"],
+                )
+                theoretical_map = {
+                    s.material_id.string: s.theoretical for s in summary_list
+                }
+                break
+            except Exception as e:
+                logger.warning(
+                    "Summary query attempt %d/%d failed: %s",
+                    attempt + 1,
+                    max_retries,
+                    e,
+                )
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+        else:
+            logger.warning(
+                "Summary query failed after %d retries; "
+                "marking all entries as non-experimental",
+                max_retries,
+            )
 
     return_list = []
 
@@ -164,6 +202,9 @@ def collect_mp_data_from_chemsys(
         data["Energy Above Hull (eV)"] = entry.energy_above_hull
         data["Crystal Structure"] = entry.symmetry.crystal_system.value
         data["Space Group"] = entry.symmetry.symbol
+        data["Is experimental"] = not theoretical_map.get(
+            entry.material_id.string, True
+        )
 
         # Normalize R2SCAN casing in stored values for downstream consistency
         if data["Base XC Functional"].upper() == "R2SCAN":
@@ -294,7 +335,7 @@ def run_mp_query(
     Returns
     -------
     pd.DataFrame
-        Query results with 14 columns (see ``MP_QUERY_COLUMNS``).
+        Query results with 15 columns (see ``MP_QUERY_COLUMNS``).
     """
     if transition_metals is None:
         transition_metals = DEFAULT_TRANSITION_METALS
@@ -336,6 +377,8 @@ def run_mp_query(
                     chemsys=chemsys,
                     element_str=element,
                     mp_client=mp_client,
+                    max_retries=max_retries,
+                    retry_delay=retry_delay,
                 )
                 break
             except Exception as e:
