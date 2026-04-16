@@ -13,8 +13,11 @@ notebooks with a single parameterized implementation.
 Supports optional multiprocessing via ``n_workers`` parameter.
 """
 
+import glob as _glob
 import logging
 import os
+import re
+import shutil
 import time
 from multiprocessing import Pool
 
@@ -61,6 +64,7 @@ def run_seawater_screening(
     max_retries=500,
     retry_delay=10.0,
     n_workers=1,
+    restart=False,
     api_key=None,
 ):
     """
@@ -109,6 +113,11 @@ def run_seawater_screening(
         Number of parallel workers.  ``1`` (default) runs
         sequentially.  Values > 1 use ``multiprocessing.Pool``
         with round-robin row distribution.
+    restart : bool
+        If True, resume a previous interrupted run by loading
+        checkpoint files from ``runtime_sheets/`` and any backup
+        from a prior restart.  ``n_workers`` may differ from the
+        original run.
     api_key : str or None
         Materials Project API key.
 
@@ -117,7 +126,6 @@ def run_seawater_screening(
     pd.DataFrame
         Screening results with seawater columns added.
     """
-    # TODO: put process_logs in a seaparate direcotry
 
     if decomp_energy is None:
         decomp_energy = SEAWATER_DECOMP_ENERGY_THRESHOLD
@@ -145,17 +153,67 @@ def run_seawater_screening(
         input_path,
     )
 
-    # Remove pre-existing seawater columns (for re-runs)
-    for col in SEAWATER_COLUMNS:
-        if col in df.columns:
-            df.drop(columns=[col], inplace=True)
-
-    # Initialize seawater columns
-    for col in SEAWATER_COLUMNS:
-        df[col] = None
-
     start_time = time.time()
     output_dir = os.path.dirname(output_path) or "."
+    runtime_dir = os.path.join(output_dir, "runtime_sheets")
+    if restart:
+        # Keep existing seawater columns for merging
+        for col in SEAWATER_COLUMNS:
+            if col not in df.columns:
+                df[col] = None
+
+        # Load backup from a previous restart (if any)
+        backup_path = os.path.join(
+            output_dir, f"{element}_evaluated_backup.xlsx",
+        )
+        if os.path.isfile(backup_path):
+            backup_df = pd.read_excel(backup_path)
+            _merge_evaluated_rows(df, backup_df)
+            logger.info(
+                "Loaded %d evaluated rows from backup %s",
+                backup_df["Seawater stability"].notna().sum(),
+                backup_path,
+            )
+
+        # Load checkpoint files from runtime_sheets/
+        if os.path.isdir(runtime_dir):
+            ckpt_dfs = _load_checkpoints(runtime_dir, element)
+            if ckpt_dfs:
+                combined = pd.concat(ckpt_dfs, ignore_index=True)
+                _merge_evaluated_rows(df, combined)
+                logger.info(
+                    "Loaded %d evaluated rows from checkpoints",
+                    combined["Seawater stability"].notna().sum(),
+                )
+
+        evaluated = df["Seawater stability"].notna().sum()
+        pending = df["Seawater stability"].isna().sum()
+
+        # Save cumulative backup before deleting old checkpoints
+        if evaluated > 0:
+            backup_path = os.path.join(
+                output_dir, f"{element}_evaluated_backup.xlsx",
+            )
+            df[df["Seawater stability"].notna()].to_excel(
+                backup_path, index=False,
+            )
+            logger.info(
+                "Saved backup: %d evaluated rows to %s",
+                evaluated, backup_path,
+            )
+
+        # Clean slate for new checkpoints
+        if os.path.isdir(runtime_dir):
+            shutil.rmtree(runtime_dir)
+
+        logger.info("Restart: %d evaluated, %d pending", evaluated, pending)
+    else:
+        # Fresh run: reset seawater columns
+        for col in SEAWATER_COLUMNS:
+            if col in df.columns:
+                df.drop(columns=[col], inplace=True)
+        for col in SEAWATER_COLUMNS:
+            df[col] = None
 
     # Common keyword args for the worker function
     worker_kwargs = dict(
@@ -174,6 +232,7 @@ def run_seawater_screening(
         save_interval=save_interval,
         max_retries=max_retries,
         retry_delay=retry_delay,
+        restart=restart,
     )
 
     if n_workers <= 1:
@@ -201,6 +260,11 @@ def run_seawater_screening(
     # Final save
     df.to_excel(output_path, index=False)
 
+    # Clean up runtime sheets after successful save
+    if os.path.isdir(runtime_dir):
+        shutil.rmtree(runtime_dir)
+        logger.info("Cleaned up %s", runtime_dir)
+
     elapsed = time.time() - start_time
     logger.info(
         "Seawater screening completed in %.1f sec. Saved to %s",
@@ -209,6 +273,63 @@ def run_seawater_screening(
     )
 
     return df
+
+
+def _merge_evaluated_rows(df, source_df):
+    """Copy evaluated seawater values from *source_df* into *df* by MP id.
+
+    Only rows whose seawater columns are still NaN in *df* are updated.
+    Modifies *df* in place.
+    """
+    evaluated = source_df[source_df["Seawater stability"].notna()]
+    if evaluated.empty:
+        return
+    eval_map = evaluated.set_index("MP id")[SEAWATER_COLUMNS]
+    needs_update = df["Seawater stability"].isna() & df["MP id"].isin(eval_map.index)
+    if not needs_update.any():
+        return
+    mp_ids = df.loc[needs_update, "MP id"]
+    for col in SEAWATER_COLUMNS:
+        df.loc[needs_update, col] = mp_ids.map(eval_map[col]).values
+
+
+def _load_checkpoints(runtime_dir, element):
+    """Load the best checkpoint DataFrame for each core.
+
+    For each core, picks ``_final.xlsx`` if it exists, otherwise the
+    latest ``_partN.xlsx``.
+
+    Returns a list of DataFrames (one per core that had checkpoints).
+    """
+    all_files = _glob.glob(
+        os.path.join(runtime_dir, f"{element}_core*_*.xlsx"),
+    )
+    if not all_files:
+        return []
+
+    # Group files by core id
+    cores = {}
+    for f in all_files:
+        base = os.path.basename(f)
+        after_core = base.split("_core")[1]
+        core_id = int(after_core.split("_")[0])
+        cores.setdefault(core_id, []).append(f)
+
+    dfs = []
+    for core_id in sorted(cores):
+        files = cores[core_id]
+        final = [f for f in files if "_final." in f]
+        if final:
+            dfs.append(pd.read_excel(final[0]))
+            continue
+        parts = [f for f in files if "_part" in f]
+        if parts:
+            parts.sort(
+                key=lambda f: int(re.search(r"_part(\d+)", f).group(1)),
+            )
+            dfs.append(pd.read_excel(parts[-1]))
+
+    return dfs
 
 
 def _split_dataframe(df, n_workers):
@@ -263,6 +384,7 @@ def _process_chunk(
     save_interval,
     max_retries,
     retry_delay,
+    restart=False,
 ):
     """
     Process a DataFrame chunk for seawater screening.
@@ -288,6 +410,8 @@ def _process_chunk(
     save_interval : int
     max_retries : int
     retry_delay : float
+    restart : bool
+        If True, skip already-evaluated rows and append to logs.
 
     Returns
     -------
@@ -295,8 +419,10 @@ def _process_chunk(
         Processed chunk with seawater columns populated.
     """
     # Set up per-worker logging
-    log_path = os.path.join(output_dir, f"process_log_core{chunk_id}.txt")
-    file_handler = logging.FileHandler(log_path, mode="w")
+    log_dir = os.path.join(output_dir, "process_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"process_log_core{chunk_id}.txt")
+    file_handler = logging.FileHandler(log_path, mode="a" if restart else "w")
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     )
@@ -316,6 +442,16 @@ def _process_chunk(
 
     for index in range(len(chunk_df)):
         row = chunk_df.iloc[index]
+
+        # Skip rows already evaluated (restart mode)
+        if pd.notna(row.get("Seawater stability")):
+            worker_logger.info(
+                "[core %d] [%d/%d] %s (%s) — skipping (already evaluated)",
+                chunk_id, index + 1, len(chunk_df),
+                row.get("Formula", "?"), row.get("MP id", "?"),
+            )
+            continue
+
         worker_logger.info(
             "[core %d] [%d/%d] %s (%s)",
             chunk_id,

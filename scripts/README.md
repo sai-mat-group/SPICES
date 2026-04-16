@@ -57,5 +57,8 @@ When running with multiple workers, intermediate files are saved to:
 
 - `runtime_sheets/{element}_core{n}_part{k}.xlsx` — per-worker checkpoints (every 100 rows)
 - `runtime_sheets/{element}_core{n}_final.xlsx` — per-worker final output
-- `process_log_core{n}.txt` — per-worker log files
+- `process_logs/process_log_core{n}.txt` — per-worker log files
+- `{element}_evaluated_backup.xlsx` — backup of evaluated rows (created on restart)
 - Final merged output at the path specified by `-o`
+
+Runtime sheets are automatically cleaned up after a successful run.

@@ -77,6 +77,15 @@ df_sea = run_seawater_screening(
     n_workers=48,
 )
 
+# Stage 2: restart an interrupted run (n_workers may differ from original)
+df_sea = run_seawater_screening(
+    element="Ca",
+    input_path="Ca_cathodes_mp_data.xlsx",
+    output_path="Ca_seawater_results.xlsx",
+    n_workers=24,
+    restart=True,
+)
+
 # Stage 3: Run intercalation voltage screening on Stage 2 output
 from spices.screening.intercalation import run_intercalation_screening
 

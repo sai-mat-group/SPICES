@@ -366,7 +366,7 @@ def is_metastable_phase_stable_in_seawater_search_by_mp_id(
                     )
                 )
                 if decomposition_energy < decomp_energy_for_metastability:
-                    metastability_points.append((pH, voltage))
+                    metastability_points.append((float(pH), float(voltage)))
 
     return metastability_points
 
