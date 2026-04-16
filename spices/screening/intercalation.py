@@ -98,29 +98,38 @@ DISCHARGED_COLUMNS = list(TO_DISCHARGED.values())
 def get_columns_order(selection_criterion):
     """Return the standard column order for voltage plateau output."""
     return [
-        "Charged MP id", "Charged Formula",
-        "Discharged MP id", "Discharged Formula",
+        "Charged MP id",
+        "Charged Formula",
+        "Discharged MP id",
+        "Discharged Formula",
         "V vs SHE (V)",
         f"pH range metastability criterion {selection_criterion}",
         "Charged Structure E (eV/formula)",
-        "Charged base XC Functional", "Charged correction XC Functional",
+        "Charged base XC Functional",
+        "Charged correction XC Functional",
         "Pbx elements per charged formula",
-        "Charged E above hull (eV)", "Charged Thermo-type",
-        "Charged Crystal Structure", "Charged Space Group",
+        "Charged E above hull (eV)",
+        "Charged Thermo-type",
+        "Charged Crystal Structure",
+        "Charged Space Group",
         "Charged structure stable in water",
         "Charged structure metastable in water",
         "Charged GGA(+U)/R2SCAN mixing adjustment",
         "No of working ions per charged framework",
         "No of working ions per discharged framework",
         "Discharged Structure E (eV/formula)",
-        "Discharged base XC Functional", "Discharged correction XC Functional",
+        "Discharged base XC Functional",
+        "Discharged correction XC Functional",
         "Pbx elements per discharged formula",
-        "Discharged E above hull (eV)", "Discharged Thermo-type",
-        "Discharged Crystal Structure", "Discharged Space Group",
+        "Discharged E above hull (eV)",
+        "Discharged Thermo-type",
+        "Discharged Crystal Structure",
+        "Discharged Space Group",
         "Discharged structure stable in water",
         "Discharged structure metastable in water",
         "Discharged GGA(+U)/R2SCAN mixing adjustment",
-        "Charged Is experimental", "Discharged Is experimental",
+        "Charged Is experimental",
+        "Discharged Is experimental",
         "Total metastability area fraction",
         "Below V metastability area fraction",
         "Above V metastability area fraction",
@@ -149,18 +158,13 @@ def _intelligent_outer_merge(df1, df2):
     conflicting columns to ``object``.
     """
     common_cols = set(df1.columns).intersection(set(df2.columns))
-    mismatched = [
-        col for col in common_cols
-        if df1[col].dtype != df2[col].dtype
-    ]
+    mismatched = [col for col in common_cols if df1[col].dtype != df2[col].dtype]
     for col in mismatched:
         df1[col] = df1[col].astype("object")
         df2[col] = df2[col].astype("object")
 
     if mismatched:
-        warnings.warn(
-            f"Dtype mismatches fixed by converting to 'object': {mismatched}"
-        )
+        warnings.warn(f"Dtype mismatches fixed by converting to 'object': {mismatched}")
 
     return df1.merge(df2, how="outer")
 
@@ -179,9 +183,7 @@ def merge_subgroups(all_sheets):
     dict
         Updated dict with ``'merged subgroup N'`` keys added.
     """
-    subgroup_names = [
-        name for name in all_sheets if name.startswith("subgroup")
-    ]
+    subgroup_names = [name for name in all_sheets if name.startswith("subgroup")]
 
     if not subgroup_names:
         raise ValueError("all_sheets contains no 'subgroup' sheets")
@@ -226,18 +228,17 @@ def _append_if_new(df, new_df):
         return df
 
     relevant_cols = [
-        "Charged MP id", "Charged Formula",
-        "Discharged MP id", "Discharged Formula", "V vs SHE (V)",
+        "Charged MP id",
+        "Charged Formula",
+        "Discharged MP id",
+        "Discharged Formula",
+        "V vs SHE (V)",
     ]
 
-    new_set = set(
-        map(tuple, new_df[relevant_cols].to_records(index=False))
-    )
+    new_set = set(map(tuple, new_df[relevant_cols].to_records(index=False)))
 
     for _, group in df.groupby("Plot number"):
-        existing_set = set(
-            map(tuple, group[relevant_cols].to_records(index=False))
-        )
+        existing_set = set(map(tuple, group[relevant_cols].to_records(index=False)))
         if new_set.issubset(existing_set):
             return df
 
@@ -249,7 +250,11 @@ def _append_if_new(df, new_df):
 
 
 def populate_seawater_metastability_points_for_seawater_stable_phases(
-    df, selection_criteria, cache, mp_client, element_str,
+    df,
+    selection_criteria,
+    cache,
+    mp_client,
+    element_str,
     decomp_energy_for_metastability=0.3,
 ):
     """
@@ -290,7 +295,9 @@ def populate_seawater_metastability_points_for_seawater_stable_phases(
     for index, row in df_stable.iterrows():
         if any(pd.isna(row.get(col)) for col in metastability_cols):
             updated_row = update_seawater_metastability_columns_by_mp_id(
-                row, cache=cache, mp_client=mp_client,
+                row,
+                cache=cache,
+                mp_client=mp_client,
                 element_str=element_str,
                 metastability_points=True,
                 check_stability=True,
@@ -312,9 +319,7 @@ def populate_seawater_metastability_points_for_seawater_stable_phases(
                 if isinstance(val, (list, tuple)):
                     df.loc[index, f"{col}_bool"] = int(len(val) > 0)
                 elif isinstance(val, str):
-                    df.loc[index, f"{col}_bool"] = int(
-                        len(ast.literal_eval(val)) > 0
-                    )
+                    df.loc[index, f"{col}_bool"] = int(len(ast.literal_eval(val)) > 0)
                 else:
                     df.loc[index, f"{col}_bool"] = 0
 
@@ -327,11 +332,15 @@ def populate_seawater_metastability_points_for_seawater_stable_phases(
 
 
 def _get_voltage_plateau_df(
-    df, df_on_hull,
-    working_ion, working_ion_valency, working_ion_voltage_vs_SHE,
+    df,
+    df_on_hull,
+    working_ion,
+    working_ion_valency,
+    working_ion_voltage_vs_SHE,
     working_ion_energies,
     stability_criterion=3,
-    save_plot=False, save_plot_path="./",
+    save_plot=False,
+    save_plot_path="./",
     voltage_plateau_df=None,
 ):
     """
@@ -345,12 +354,15 @@ def _get_voltage_plateau_df(
     if not isinstance(voltage_plateau_df, pd.DataFrame):
         voltage_plateau_df = pd.DataFrame(
             columns=(
-                CHARGED_COLUMNS + DISCHARGED_COLUMNS
+                CHARGED_COLUMNS
+                + DISCHARGED_COLUMNS
                 + [f"pH range metastability criterion {stability_criterion}"]
                 + ["V vs SHE (V)"]
-                + ["Total metastability area fraction",
-                   "Below V metastability area fraction",
-                   "Above V metastability area fraction"]
+                + [
+                    "Total metastability area fraction",
+                    "Below V metastability area fraction",
+                    "Above V metastability area fraction",
+                ]
             )
         )
 
@@ -409,14 +421,19 @@ def _get_voltage_plateau_df(
                 )
 
             stability_pH = find_ph_range_at_voltage(
-                charged_coords, discharged_coords, voltage_vs_SHE,
-                save_plot=save_plot, save_plot_path=plot_path,
+                charged_coords,
+                discharged_coords,
+                voltage_vs_SHE,
+                save_plot=save_plot,
+                save_plot_path=plot_path,
                 title=f"Seawater metastability (Criterion {stability_criterion})",
                 A_phase_name=f"{charged_row['Formula']} {charged_row['MP id']}",
                 B_phase_name=f"{discharged_row['Formula']} {discharged_row['MP id']}",
             )
             total_area, area_below, area_above = find_stability_area_around_voltage(
-                charged_coords, discharged_coords, voltage_vs_SHE,
+                charged_coords,
+                discharged_coords,
+                voltage_vs_SHE,
             )
 
         # Update final stability pH window
@@ -434,25 +451,40 @@ def _get_voltage_plateau_df(
             for col in TO_CHARGED:
                 voltage_plateau_df.at[new_idx, TO_CHARGED[col]] = charged_row.get(col)
             for col in TO_DISCHARGED:
-                voltage_plateau_df.at[new_idx, TO_DISCHARGED[col]] = discharged_row.get(col)
+                voltage_plateau_df.at[new_idx, TO_DISCHARGED[col]] = discharged_row.get(
+                    col
+                )
 
-            voltage_plateau_df.at[new_idx, f"pH range metastability criterion {stability_criterion}"] = stability_pH
+            voltage_plateau_df.at[
+                new_idx, f"pH range metastability criterion {stability_criterion}"
+            ] = stability_pH
             voltage_plateau_df.at[new_idx, "V vs SHE (V)"] = voltage_vs_SHE
-            voltage_plateau_df.at[new_idx, "Total metastability area fraction"] = total_area
-            voltage_plateau_df.at[new_idx, "Below V metastability area fraction"] = area_below
-            voltage_plateau_df.at[new_idx, "Above V metastability area fraction"] = area_above
+            voltage_plateau_df.at[new_idx, "Total metastability area fraction"] = (
+                total_area
+            )
+            voltage_plateau_df.at[new_idx, "Below V metastability area fraction"] = (
+                area_below
+            )
+            voltage_plateau_df.at[new_idx, "Above V metastability area fraction"] = (
+                area_above
+            )
         else:
             # Remove unstable discharged phase and recurse
             df_trimmed = df[df["MP id"] != discharged_row["MP id"]]
             df_on_hull_trimmed = filter_df_to_get_on_hull_phases(
-                df_trimmed, working_ion,
+                df_trimmed,
+                working_ion,
             )
             return _get_voltage_plateau_df(
-                df_trimmed, df_on_hull_trimmed,
-                working_ion, working_ion_valency,
-                working_ion_voltage_vs_SHE, working_ion_energies,
+                df_trimmed,
+                df_on_hull_trimmed,
+                working_ion,
+                working_ion_valency,
+                working_ion_voltage_vs_SHE,
+                working_ion_energies,
                 stability_criterion=stability_criterion,
-                save_plot=save_plot, save_plot_path=save_plot_path,
+                save_plot=save_plot,
+                save_plot_path=save_plot_path,
                 voltage_plateau_df=voltage_plateau_df,
             )
 
@@ -462,12 +494,18 @@ def _get_voltage_plateau_df(
 
 
 def obtain_voltage_plateau_data_based_on_convex_hull(
-    df, selection_criteria,
-    working_ion, working_ion_valency, working_ion_voltage_vs_SHE,
+    df,
+    selection_criteria,
+    working_ion,
+    working_ion_valency,
+    working_ion_voltage_vs_SHE,
     working_ion_energies,
-    cache, mp_client, element_str,
+    cache,
+    mp_client,
+    element_str,
     use_only_on_hull_phases=True,
-    save_plot=False, save_plot_path="./",
+    save_plot=False,
+    save_plot_path="./",
     decomp_energy_for_metastability=0.3,
 ):
     """
@@ -499,8 +537,11 @@ def obtain_voltage_plateau_data_based_on_convex_hull(
     logger.debug("Selection criteria: %s", selection_criteria)
 
     df = populate_seawater_metastability_points_for_seawater_stable_phases(
-        df, selection_criteria=selection_criteria,
-        cache=cache, mp_client=mp_client, element_str=element_str,
+        df,
+        selection_criteria=selection_criteria,
+        cache=cache,
+        mp_client=mp_client,
+        element_str=element_str,
         decomp_energy_for_metastability=decomp_energy_for_metastability,
     )
 
@@ -530,21 +571,27 @@ def obtain_voltage_plateau_data_based_on_convex_hull(
 
         while max_charged != max_discharged:
             plateau_df = _get_voltage_plateau_df(
-                df_, df_on_hull_,
-                working_ion, working_ion_valency,
-                working_ion_voltage_vs_SHE, working_ion_energies,
+                df_,
+                df_on_hull_,
+                working_ion,
+                working_ion_valency,
+                working_ion_voltage_vs_SHE,
+                working_ion_energies,
                 stability_criterion=sc,
-                save_plot=save_plot, save_plot_path=save_plot_path,
+                save_plot=save_plot,
+                save_plot_path=save_plot_path,
             )
 
             if isinstance(result[f"sc {sc}"], pd.DataFrame):
                 result[f"sc {sc}"] = _append_if_new(
-                    result[f"sc {sc}"], plateau_df,
+                    result[f"sc {sc}"],
+                    plateau_df,
                 )
             elif len(plateau_df) > 0:
                 plateau_df = plateau_df.copy()
                 plateau_df.insert(
-                    loc=0, column="Plot number",
+                    loc=0,
+                    column="Plot number",
                     value=[0] * len(plateau_df),
                 )
                 result[f"sc {sc}"] = plateau_df
@@ -567,7 +614,9 @@ def obtain_voltage_plateau_data_based_on_convex_hull(
 
 
 def step1_create_unique_composition_sheets(
-    input_path, output_dir, element,
+    input_path,
+    output_dir,
+    element,
 ):
     """
     Step 1: Filter Stage 2 output and group by unique charged composition.
@@ -602,12 +651,9 @@ def step1_create_unique_composition_sheets(
         )
 
     # Create boolean columns from metastability lists
-    for i in range(1, 9):
-        col = f"Seawater metastability (Criterion {i})"
-        if col in df.columns:
-            df[f"{col}_bool"] = df[col].apply(
-                _convert_metastability_list_to_bool
-            )
+    col = "Seawater metastability (Criterion 4)"
+    if col in df.columns:
+        df[f"{col}_bool"] = df[col].apply(_convert_metastability_list_to_bool)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -617,37 +663,40 @@ def step1_create_unique_composition_sheets(
     for composition in unique_compositions:
         sub_df = df[df["Charged composition"] == composition]
 
-        # Check if any metastability criterion or seawater stability is True
+        # Check if metastability criterion 4 or seawater stability is True
         bool_cols = [
-            f"Seawater metastability (Criterion {i})_bool"
-            for i in range(1, 9)
-            if f"Seawater metastability (Criterion {i})_bool" in sub_df.columns
+            "Seawater metastability (Criterion 4)_bool",
         ]
+        bool_cols = [c for c in bool_cols if c in sub_df.columns]
 
-        has_metastable = (
-            sub_df[bool_cols].any().any() if bool_cols else False
-        )
+        has_metastable = sub_df[bool_cols].any().any() if bool_cols else False
         has_stable = (
             sub_df["Seawater stability"].any()
-            if "Seawater stability" in sub_df.columns else False
+            if "Seawater stability" in sub_df.columns
+            else False
         )
 
         if has_metastable or has_stable:
             fname = f"{composition}.xlsx"
             sub_df.to_excel(
-                os.path.join(output_dir, fname), index=False,
+                os.path.join(output_dir, fname),
+                index=False,
             )
             filenames.append(fname)
 
     logger.info(
         "Step 1: %d/%d compositions have metastable/stable phases",
-        len(filenames), len(unique_compositions),
+        len(filenames),
+        len(unique_compositions),
     )
     return filenames
 
 
 def step2_create_subgroups(
-    composition_dir, working_ion, mp_client, cache,
+    composition_dir,
+    working_ion,
+    mp_client,
+    cache,
     element_str,
     charged_struct_dir="charged_structs",
     struct_dir="structs",
@@ -671,9 +720,7 @@ def step2_create_subgroups(
     structure_cache_dir : str
     decomp_energy_for_metastability : float
     """
-    excel_files = [
-        f for f in os.listdir(composition_dir) if f.endswith(".xlsx")
-    ]
+    excel_files = [f for f in os.listdir(composition_dir) if f.endswith(".xlsx")]
     total = len(excel_files)
     cache_dict = {}
 
@@ -685,7 +732,9 @@ def step2_create_subgroups(
 
         # Create subgroups
         subgroups = create_subgroups(
-            df, working_ion, mp_client,
+            df,
+            working_ion,
+            mp_client,
             charged_struct_dir=charged_struct_dir,
             struct_dir=struct_dir,
             cache_dict=cache_dict,
@@ -694,7 +743,11 @@ def step2_create_subgroups(
 
         # Add fully-charged phase info
         sheets = add_charged_struct_info(
-            sheets, working_ion, mp_client, cache, element_str,
+            sheets,
+            working_ion,
+            mp_client,
+            cache,
+            element_str,
             charged_struct_dir=charged_struct_dir,
             struct_dir=struct_dir,
             structure_cache_dir=structure_cache_dir,
@@ -709,10 +762,15 @@ def step2_create_subgroups(
 
 
 def step3_create_voltage_plateau_sheets(
-    composition_dir, output_dir,
-    working_ion, working_ion_valency, working_ion_voltage_vs_SHE,
+    composition_dir,
+    output_dir,
+    working_ion,
+    working_ion_valency,
+    working_ion_voltage_vs_SHE,
     working_ion_energies,
-    cache, mp_client, element_str,
+    cache,
+    mp_client,
+    element_str,
     selection_criteria=None,
     use_only_on_hull_phases=True,
     save_plots=False,
@@ -744,9 +802,7 @@ def step3_create_voltage_plateau_sheets(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    excel_files = [
-        f for f in os.listdir(composition_dir) if f.endswith(".xlsx")
-    ]
+    excel_files = [f for f in os.listdir(composition_dir) if f.endswith(".xlsx")]
     total = len(excel_files)
 
     for idx, fname in enumerate(excel_files):
@@ -763,9 +819,7 @@ def step3_create_voltage_plateau_sheets(
         all_sheets = merge_subgroups(all_sheets)
 
         # Get merged subgroup sheet names
-        merged_names = [
-            name for name in all_sheets if "merged subgroup" in name
-        ]
+        merged_names = [name for name in all_sheets if "merged subgroup" in name]
 
         voltage_results = {sc: {} for sc in selection_criteria}
 
@@ -778,22 +832,25 @@ def step3_create_voltage_plateau_sheets(
                 os.makedirs(sc_dir, exist_ok=True)
 
                 plateau_dict = obtain_voltage_plateau_data_based_on_convex_hull(
-                    df_sheet, selection_criteria=[sc],
+                    df_sheet,
+                    selection_criteria=[sc],
                     working_ion=working_ion,
                     working_ion_valency=working_ion_valency,
                     working_ion_voltage_vs_SHE=working_ion_voltage_vs_SHE,
                     working_ion_energies=working_ion_energies,
-                    cache=cache, mp_client=mp_client,
+                    cache=cache,
+                    mp_client=mp_client,
                     element_str=element_str,
                     use_only_on_hull_phases=use_only_on_hull_phases,
-                    save_plot=save_plots, save_plot_path=sc_dir,
+                    save_plot=save_plots,
+                    save_plot_path=sc_dir,
                     decomp_energy_for_metastability=decomp_energy_for_metastability,
                 )
 
                 if isinstance(plateau_dict.get(f"sc {sc}"), pd.DataFrame):
-                    voltage_results[sc][f"voltage_{sheet_name}"] = (
-                        plateau_dict[f"sc {sc}"]
-                    )
+                    voltage_results[sc][f"voltage_{sheet_name}"] = plateau_dict[
+                        f"sc {sc}"
+                    ]
 
         # Save voltage plateau sheets per criterion
         for sc in selection_criteria:
@@ -809,7 +866,8 @@ def step3_create_voltage_plateau_sheets(
 
 
 def step4_create_combined_sheet(
-    voltage_plateau_dir, output_path,
+    voltage_plateau_dir,
+    output_path,
     selection_criteria=None,
 ):
     """
@@ -859,9 +917,7 @@ def step4_create_combined_sheet(
                 continue
 
             # Find Excel file in sc directory
-            xlsx_files = [
-                f for f in os.listdir(sc_path) if f.endswith(".xlsx")
-            ]
+            xlsx_files = [f for f in os.listdir(sc_path) if f.endswith(".xlsx")]
             if not xlsx_files:
                 continue
 
@@ -884,10 +940,9 @@ def step4_create_combined_sheet(
 
                 # Reorder columns
                 cols_order = get_columns_order(sc)
-                available_cols = (
-                    ["Plot number", "Framework formula"]
-                    + [c for c in cols_order if c in sheet_df.columns]
-                )
+                available_cols = ["Plot number", "Framework formula"] + [
+                    c for c in cols_order if c in sheet_df.columns
+                ]
                 sheet_df = sheet_df[available_cols]
 
                 if not isinstance(combined[f"criterion {sc}"], pd.DataFrame):
@@ -899,9 +954,7 @@ def step4_create_combined_sheet(
                     [combined[f"criterion {sc}"], sheet_df],
                     ignore_index=True,
                 )
-                max_plot = int(
-                    combined[f"criterion {sc}"]["Plot number"].max()
-                )
+                max_plot = int(combined[f"criterion {sc}"]["Plot number"].max())
 
     # Save combined file
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -942,7 +995,7 @@ def run_intercalation_screening(
         Root output directory.  Defaults to
         ``"{element}_intercalation/"``.
     selection_criteria : list of int or None
-        Selection criteria to evaluate (default: 1-8).
+        Selection criteria to evaluate (default: 4).
     decomp_energy : float or None
         Decomposition energy threshold.  Default 0.3 eV.
     use_only_on_hull_phases : bool
@@ -992,13 +1045,19 @@ def run_intercalation_screening(
     # Step 1
     logger.info("=== Step 1: Creating unique composition sheets ===")
     filenames = step1_create_unique_composition_sheets(
-        input_path, composition_dir, element,
+        input_path,
+        composition_dir,
+        element,
     )
 
     # Step 2
     logger.info("=== Step 2: Creating structure subgroups ===")
     step2_create_subgroups(
-        composition_dir, element, mp_client, cache, element,
+        composition_dir,
+        element,
+        mp_client,
+        cache,
+        element,
         charged_struct_dir=charged_struct_dir,
         struct_dir=struct_dir,
         structure_cache_dir=structure_cache_dir,
@@ -1008,12 +1067,15 @@ def run_intercalation_screening(
     # Step 3
     logger.info("=== Step 3: Computing voltage plateaus ===")
     step3_create_voltage_plateau_sheets(
-        composition_dir, plateau_dir,
+        composition_dir,
+        plateau_dir,
         working_ion=element,
         working_ion_valency=working_ion_valency,
         working_ion_voltage_vs_SHE=working_ion_voltage_vs_SHE,
         working_ion_energies=working_ion_energies,
-        cache=cache, mp_client=mp_client, element_str=element,
+        cache=cache,
+        mp_client=mp_client,
+        element_str=element,
         selection_criteria=selection_criteria,
         use_only_on_hull_phases=use_only_on_hull_phases,
         save_plots=save_plots,
@@ -1023,13 +1085,16 @@ def run_intercalation_screening(
     # Step 4
     logger.info("=== Step 4: Creating combined sheet ===")
     combined = step4_create_combined_sheet(
-        plateau_dir, combined_path, selection_criteria,
+        plateau_dir,
+        combined_path,
+        selection_criteria,
     )
 
     elapsed = time.time() - start_time
     logger.info(
         "Intercalation screening completed in %.1f sec. Output: %s",
-        elapsed, output_dir,
+        elapsed,
+        output_dir,
     )
 
     return combined

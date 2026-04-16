@@ -37,16 +37,10 @@ from spices.dataframe_ops import update_seawater_metastability_columns_by_mp_id
 logger = logging.getLogger(__name__)
 
 # DataFrame column names added by Stage 2
+# For all 8 criteria, see spices.pourbaix.selection_criteria.SEAWATER_COLUMNS_ALL
 SEAWATER_COLUMNS = [
     "Seawater stability",
-    "Seawater metastability (Criterion 1)",
-    "Seawater metastability (Criterion 2)",
-    "Seawater metastability (Criterion 3)",
     "Seawater metastability (Criterion 4)",
-    "Seawater metastability (Criterion 5)",
-    "Seawater metastability (Criterion 6)",
-    "Seawater metastability (Criterion 7)",
-    "Seawater metastability (Criterion 8)",
 ]
 
 
@@ -61,7 +55,7 @@ def run_seawater_screening(
     voltage_grids=None,
     OER_shift=None,
     HER_shift=None,
-    metastability_points=False,
+    metastability_points=True,
     cache_dir=".",
     save_interval=100,
     max_retries=500,
@@ -123,6 +117,8 @@ def run_seawater_screening(
     pd.DataFrame
         Screening results with seawater columns added.
     """
+    # TODO: put process_logs in a seaparate direcotry
+
     if decomp_energy is None:
         decomp_energy = SEAWATER_DECOMP_ENERGY_THRESHOLD
     if pH_range is None:
@@ -144,7 +140,9 @@ def run_seawater_screening(
     df = pd.read_excel(input_path)
     df = df.dropna(subset=["MP id"]).reset_index(drop=True)
     logger.info(
-        "Read %d materials from %s", len(df), input_path,
+        "Read %d materials from %s",
+        len(df),
+        input_path,
     )
 
     # Remove pre-existing seawater columns (for re-runs)
@@ -185,12 +183,12 @@ def run_seawater_screening(
         # Parallel mode
         chunks = _split_dataframe(df, n_workers)
         logger.info(
-            "Splitting %d rows across %d workers", len(df), len(chunks),
+            "Splitting %d rows across %d workers",
+            len(df),
+            len(chunks),
         )
 
-        pool_args = [
-            (chunk, chunk_id) for chunk_id, chunk in enumerate(chunks)
-        ]
+        pool_args = [(chunk, chunk_id) for chunk_id, chunk in enumerate(chunks)]
 
         with Pool(n_workers) as pool:
             processed_chunks = pool.starmap(
@@ -206,7 +204,8 @@ def run_seawater_screening(
     elapsed = time.time() - start_time
     logger.info(
         "Seawater screening completed in %.1f sec. Saved to %s",
-        elapsed, output_path,
+        elapsed,
+        output_path,
     )
 
     return df
@@ -319,8 +318,11 @@ def _process_chunk(
         row = chunk_df.iloc[index]
         worker_logger.info(
             "[core %d] [%d/%d] %s (%s)",
-            chunk_id, index + 1, len(chunk_df),
-            row.get("Formula", "?"), row.get("MP id", "?"),
+            chunk_id,
+            index + 1,
+            len(chunk_df),
+            row.get("Formula", "?"),
+            row.get("MP id", "?"),
         )
 
         for attempt in range(max_retries):
@@ -341,18 +343,31 @@ def _process_chunk(
                 )
                 chunk_df.iloc[index] = updated_row
                 break
+            except (AttributeError, ImportError, TypeError) as e:
+                # Non-retryable errors (e.g. missing mpcontribs-client)
+                worker_logger.error(
+                    "[core %d] Non-retryable error for %s: %s",
+                    chunk_id,
+                    row.get("MP id", "?"),
+                    e,
+                )
+                break
             except Exception as e:
                 worker_logger.warning(
                     "[core %d] Attempt %d/%d for %s failed: %s",
-                    chunk_id, attempt + 1, max_retries,
-                    row.get("MP id", "?"), e,
+                    chunk_id,
+                    attempt + 1,
+                    max_retries,
+                    row.get("MP id", "?"),
+                    e,
                 )
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
         else:
             worker_logger.error(
                 "[core %d] Exhausted retries for %s, skipping.",
-                chunk_id, row.get("MP id", "?"),
+                chunk_id,
+                row.get("MP id", "?"),
             )
 
         # Periodic checkpoint
@@ -365,15 +380,20 @@ def _process_chunk(
             chunk_df.to_excel(ckpt_path, index=False)
             worker_logger.info(
                 "[core %d] Checkpoint: %d rows -> %s",
-                chunk_id, index + 1, ckpt_path,
+                chunk_id,
+                index + 1,
+                ckpt_path,
             )
 
     # Final per-worker checkpoint
     final_path = os.path.join(
-        runtime_dir, f"{element}_core{chunk_id}_final.xlsx",
+        runtime_dir,
+        f"{element}_core{chunk_id}_final.xlsx",
     )
     chunk_df.to_excel(final_path, index=False)
-    worker_logger.info("[core %d] Done. %d rows -> %s", chunk_id, len(chunk_df), final_path)
+    worker_logger.info(
+        "[core %d] Done. %d rows -> %s", chunk_id, len(chunk_df), final_path
+    )
 
     # Clean up handler
     worker_logger.removeHandler(file_handler)

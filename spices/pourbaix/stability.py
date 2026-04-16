@@ -65,14 +65,14 @@ def is_stable_in_water(formula_string, charge, pourbaix_diagram,
 
 def check_solid_entry(entry_object, reactant_entry=None, mp_id=None,
                       pbx_diag=None, working_ion=None,
-                      selection_criterion=2):
+                      selection_criterion=4):
     """
     Check whether a stable Pourbaix entry contains a solid phase.
 
     In the simple case (``mp_id=None``), returns True if any sub-entry
-    is a solid.  When ``mp_id`` is provided, applies stricter criteria
-    that check whether the decomposition-product solids contain specific
-    elements from the cathode.
+    is a solid.  When ``mp_id`` is provided, applies **Criterion 4** by
+    default: at least one solid decomposition product must contain a
+    non-working-ion cation *and* an anionic element.
 
     Parameters
     ----------
@@ -88,26 +88,14 @@ def check_solid_entry(entry_object, reactant_entry=None, mp_id=None,
     working_ion : Element or None
         The intercalating ion (Li, Na, K, Mg, Ca).
     selection_criterion : int
-        Criterion 1-9 for solid product selection. See notes.
+        Criterion for solid product selection (default 4).  For details
+        on all 8 criteria, see
+        ``spices.pourbaix.selection_criteria.check_solid_entry_all_criteria``.
 
     Returns
     -------
     bool or dict
         Boolean for criteria 1-8, dict of booleans for criterion 9.
-
-    Notes
-    -----
-    Selection criteria (only active when ``mp_id`` is provided):
-
-    1. At least one stable solid contains a cationic element of the cathode.
-    2. Same as 1, but the solid must also contain an anionic element.
-    3. At least one solid contains a non-working-ion cation.
-    4. Same as 3, plus the solid must contain an anionic element.
-    5. All non-working-ion elements (excl. H, O) appear in stable solids.
-    6. Same as 5, plus each solid must contain an anionic element.
-    7. At least one solid contains a non-working-ion element (excl. H, O).
-    8. Same as 7, plus an anionic element.
-    9. Returns a dict with results for criteria 1-8.
     """
     if mp_id is None:
         return _check_solid_entry_simple(entry_object)
@@ -134,12 +122,23 @@ def _check_solid_entry_simple(entry_object):
 
 
 def _check_solid_entry_strict(entry_object, reactant_entry, mp_id,
-                              pbx_diag, working_ion, selection_criterion):
-    """Strict solid-entry check with multiple selection criteria."""
-    from copy import deepcopy
-    from spices.config import ELEMENTS_HO
-    from spices.pourbaix.composition import rm_element
+                              pbx_diag, working_ion,
+                              selection_criterion=4):
+    """Strict solid-entry check.
 
+    Default fast path evaluates Criterion 4 only.  Other criteria are
+    delegated to ``spices.pourbaix.selection_criteria``.
+    """
+    if selection_criterion != 4:
+        from spices.pourbaix.selection_criteria import (
+            check_solid_entry_all_criteria,
+        )
+        return check_solid_entry_all_criteria(
+            entry_object, reactant_entry, mp_id, pbx_diag, working_ion,
+            selection_criterion,
+        )
+
+    # --- Criterion 4 fast path ---
     # Find element sets from the cathode mp_id
     for entry in pbx_diag.unprocessed_entries:
         if get_mp_id_from_pbx_entry_id(entry.entry_id) == mp_id:
@@ -147,14 +146,9 @@ def _check_solid_entry_strict(entry_object, reactant_entry, mp_id,
             non_working_ion_cations = (
                 cationic_elements - {working_ion} if working_ion else cationic_elements
             )
-            non_working_ion_elements_without_OH = (
-                set(entry.elements) - ({working_ion} if working_ion else set()) - ELEMENTS_HO
-            )
             break
     else:
         return False
-
-    SC = {str(i): False for i in range(1, 9)}
 
     # Get list of reactant mp_ids to exclude
     if isinstance(reactant_entry, MultiEntry):
@@ -163,10 +157,6 @@ def _check_solid_entry_strict(entry_object, reactant_entry, mp_id,
         ]
     else:
         reactant_mpids = [get_mp_id_from_pbx_entry_id(reactant_entry.entry_id)]
-
-    # Tracking sets for criteria 5 and 6
-    not_found_c5 = deepcopy(non_working_ion_elements_without_OH)
-    not_found_c6 = deepcopy(non_working_ion_elements_without_OH)
 
     entries = (
         entry_object.entry_list if isinstance(entry_object, MultiEntry)
@@ -179,56 +169,11 @@ def _check_solid_entry_strict(entry_object, reactant_entry, mp_id,
             continue
 
         elems = entry.elements
+        if (any(e in elems for e in non_working_ion_cations)
+                and any(e in elems for e in ANIONIC_ELEMENTS)):
+            return True
 
-        # Criterion 1
-        if not SC["1"] and any(e in elems for e in cationic_elements):
-            SC["1"] = True
-
-        # Criterion 2
-        if not SC["2"]:
-            if (any(e in elems for e in cationic_elements)
-                    and any(e in elems for e in ANIONIC_ELEMENTS)):
-                SC["2"] = True
-
-        # Criterion 3
-        if not SC["3"] and any(e in elems for e in non_working_ion_cations):
-            SC["3"] = True
-
-        # Criterion 4
-        if not SC["4"]:
-            if (any(e in elems for e in non_working_ion_cations)
-                    and any(e in elems for e in ANIONIC_ELEMENTS)):
-                SC["4"] = True
-
-        # Criterion 5
-        if not SC["5"]:
-            for elem in non_working_ion_elements_without_OH:
-                if elem in elems:
-                    not_found_c5.discard(elem)
-            if len(not_found_c5) == 0:
-                SC["5"] = True
-
-        # Criterion 6
-        if not SC["6"]:
-            for elem in non_working_ion_elements_without_OH:
-                if elem in elems and any(e in elems for e in ANIONIC_ELEMENTS):
-                    not_found_c6.discard(elem)
-            if len(not_found_c6) == 0:
-                SC["6"] = True
-
-        # Criterion 7
-        if not SC["7"] and any(e in elems for e in non_working_ion_elements_without_OH):
-            SC["7"] = True
-
-        # Criterion 8
-        if not SC["8"]:
-            if (any(e in elems for e in non_working_ion_elements_without_OH)
-                    and any(e in elems for e in ANIONIC_ELEMENTS)):
-                SC["8"] = True
-
-    if selection_criterion == 9:
-        return SC
-    return SC.get(str(selection_criterion), False)
+    return False
 
 
 def get_all_stable_compounds_from_pourbaix_diagram(pourbaix_diagram):

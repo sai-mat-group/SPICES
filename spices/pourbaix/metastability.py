@@ -9,7 +9,6 @@ from pymatgen.core import Composition
 
 from spices.pourbaix.geometry import (
     check_overlap_with_water_stability_lines,
-    check_overlap_with_extended_water_stability_lines,
 )
 from spices.pourbaix.decomposition import (
     get_decomposition_energy_from_mp_id,
@@ -170,11 +169,11 @@ def _is_metastable_phase_stable_in_seawater_search_by_mp_id(
     range_of_voltage=(-1.5, 2),
     OER_shift=0.5,
     HER_shift=-0.3,
-    selection_criterion=2,
+    selection_criterion=4,
     decomp_energy_for_metastability=0.5,
 ):
     """
-    Internal helper: check seawater metastability returning bool or dict.
+    Internal helper: check seawater metastability for a single criterion.
 
     Parameters
     ----------
@@ -192,15 +191,13 @@ def _is_metastable_phase_stable_in_seawater_search_by_mp_id(
     range_of_voltage : tuple of float
     OER_shift : float
     HER_shift : float
-    selection_criterion : int or str
-        1-8 for a single criterion, ``'all'`` for all 8.
+    selection_criterion : int
+        1-8 for a single criterion (default 4).
     decomp_energy_for_metastability : float
 
     Returns
     -------
-    bool or dict
-        ``bool`` for a single criterion; ``dict`` of ``{'1': bool, ...,
-        '8': bool}`` when ``selection_criterion='all'``.
+    bool
     """
     # Check mp_id exists in diagram
     mp_id_list = [
@@ -209,11 +206,7 @@ def _is_metastable_phase_stable_in_seawater_search_by_mp_id(
         if entry.phase_type == "Solid"
     ]
 
-    metastability_dict = {str(i): False for i in range(1, 9)}
-
     if mp_id not in mp_id_list:
-        if str(selection_criterion).lower() == "all":
-            return metastability_dict
         return False
 
     pH_range = np.linspace(range_of_pH[0], range_of_pH[1], pH_grids)
@@ -232,61 +225,25 @@ def _is_metastable_phase_stable_in_seawater_search_by_mp_id(
             stable_entry = sea_pourbaix_diagram.get_stable_entry(pH, voltage)
             reactant_entry = bare_seawater_pbx.get_stable_entry(pH, voltage)
 
-            if str(selection_criterion).lower() != "all":
-                if check_solid_entry(
-                    stable_entry,
-                    reactant_entry=reactant_entry,
-                    mp_id=mp_id,
-                    pbx_diag=sea_pourbaix_diagram,
-                    working_ion=working_ion,
-                    selection_criterion=selection_criterion,
-                ):
-                    decomposition_energy = (
-                        get_seawater_decomposition_energy_from_mp_id(
-                            mp_id=mp_id, pH=pH, voltage=voltage,
-                            sea_pourbaix_diagram=sea_pourbaix_diagram,
-                            bare_seawater_pbx=bare_seawater_pbx,
-                            decomp_energy_for_metastability=decomp_energy_for_metastability,
-                        )
+            if check_solid_entry(
+                stable_entry,
+                reactant_entry=reactant_entry,
+                mp_id=mp_id,
+                pbx_diag=sea_pourbaix_diagram,
+                working_ion=working_ion,
+                selection_criterion=selection_criterion,
+            ):
+                decomposition_energy = (
+                    get_seawater_decomposition_energy_from_mp_id(
+                        mp_id=mp_id, pH=pH, voltage=voltage,
+                        sea_pourbaix_diagram=sea_pourbaix_diagram,
+                        bare_seawater_pbx=bare_seawater_pbx,
+                        decomp_energy_for_metastability=decomp_energy_for_metastability,
                     )
-                    if decomposition_energy < decomp_energy_for_metastability:
-                        return True
-            else:
-                # All criteria mode — only check extended water region
-                for sc in range(1, 9):
-                    if metastability_dict[str(sc)]:
-                        continue
+                )
+                if decomposition_energy < decomp_energy_for_metastability:
+                    return True
 
-                    if not check_overlap_with_extended_water_stability_lines(
-                        pH, voltage,
-                        OER_shift=OER_shift, HER_shift=HER_shift,
-                    ):
-                        continue
-
-                    logger.debug(
-                        "Checking selection criterion %d", sc,
-                    )
-                    if check_solid_entry(
-                        stable_entry,
-                        reactant_entry=reactant_entry,
-                        mp_id=mp_id,
-                        pbx_diag=sea_pourbaix_diagram,
-                        working_ion=working_ion,
-                        selection_criterion=sc,
-                    ):
-                        decomposition_energy = (
-                            get_seawater_decomposition_energy_from_mp_id(
-                                mp_id=mp_id, pH=pH, voltage=voltage,
-                                sea_pourbaix_diagram=sea_pourbaix_diagram,
-                                bare_seawater_pbx=bare_seawater_pbx,
-                                decomp_energy_for_metastability=decomp_energy_for_metastability,
-                            )
-                        )
-                        if decomposition_energy < decomp_energy_for_metastability:
-                            metastability_dict[str(sc)] = True
-
-    if str(selection_criterion).lower() == "all":
-        return metastability_dict
     return False
 
 
@@ -302,7 +259,7 @@ def is_metastable_phase_stable_in_seawater_search_by_mp_id(
     range_of_voltage=(-1.5, 2),
     OER_shift=0.5,
     HER_shift=-0.3,
-    selection_criterion=2,
+    selection_criterion=4,
     decomp_energy_for_metastability=0.5,
 ):
     """
@@ -316,7 +273,7 @@ def is_metastable_phase_stable_in_seawater_search_by_mp_id(
     sea_pourbaix_diagram : PourbaixDiagram
         Seawater Pourbaix diagram (cathode + seawater elements).
     output_metastability_area : bool
-        If True, return lists of (pH, V) tuples instead of booleans.
+        If True, return a list of (pH, V) tuples instead of a boolean.
     bare_seawater_pbx : PourbaixDiagram or None
         Bare seawater diagram.  Required — raises ``ValueError`` if
         ``None``.
@@ -328,17 +285,15 @@ def is_metastable_phase_stable_in_seawater_search_by_mp_id(
     range_of_voltage : tuple of float
     OER_shift : float
     HER_shift : float
-    selection_criterion : int or str
-        1-8 for a single criterion, ``'all'`` for all 8.
+    selection_criterion : int
+        1-8 for a single criterion (default 4).
     decomp_energy_for_metastability : float
 
     Returns
     -------
-    bool or dict or list
-        - ``output_metastability_area=False``: ``bool`` (single
-          criterion) or ``dict`` of booleans (``'all'``).
-        - ``output_metastability_area=True``: ``list`` of (pH, V) tuples
-          (single criterion) or ``dict`` of lists (``'all'``).
+    bool or list
+        - ``output_metastability_area=False``: ``bool``.
+        - ``output_metastability_area=True``: ``list`` of (pH, V) tuples.
 
     Raises
     ------
@@ -374,17 +329,10 @@ def is_metastable_phase_stable_in_seawater_search_by_mp_id(
         if entry.phase_type == "Solid"
     ]
 
-    use_all = str(selection_criterion).lower() == "all"
-
-    if use_all:
-        metastability_dict = {str(i): [] for i in range(1, 9)}
-    else:
-        metastability_dict = {str(selection_criterion): []}
+    metastability_points = []
 
     if mp_id not in mp_id_list:
-        if use_all:
-            return metastability_dict
-        return metastability_dict[str(selection_criterion)]
+        return metastability_points
 
     pH_range = np.linspace(range_of_pH[0], range_of_pH[1], pH_grids)
     voltage_range = np.linspace(
@@ -401,37 +349,26 @@ def is_metastable_phase_stable_in_seawater_search_by_mp_id(
             stable_entry = sea_pourbaix_diagram.get_stable_entry(pH, voltage)
             reactant_entry = bare_seawater_pbx.get_stable_entry(pH, voltage)
 
-            criteria_to_check = range(1, 9) if use_all else [selection_criterion]
-
-            for sc in criteria_to_check:
-                # In all-criteria area mode, also check extended region
-                if use_all and not check_overlap_with_extended_water_stability_lines(
-                    pH, voltage, OER_shift=OER_shift, HER_shift=HER_shift,
-                ):
-                    continue
-
-                if check_solid_entry(
-                    stable_entry,
-                    reactant_entry=reactant_entry,
-                    mp_id=mp_id,
-                    pbx_diag=sea_pourbaix_diagram,
-                    working_ion=working_ion,
-                    selection_criterion=sc,
-                ):
-                    decomposition_energy = (
-                        get_seawater_decomposition_energy_from_mp_id(
-                            mp_id=mp_id, pH=pH, voltage=voltage,
-                            sea_pourbaix_diagram=sea_pourbaix_diagram,
-                            bare_seawater_pbx=bare_seawater_pbx,
-                            decomp_energy_for_metastability=decomp_energy_for_metastability,
-                        )
+            if check_solid_entry(
+                stable_entry,
+                reactant_entry=reactant_entry,
+                mp_id=mp_id,
+                pbx_diag=sea_pourbaix_diagram,
+                working_ion=working_ion,
+                selection_criterion=selection_criterion,
+            ):
+                decomposition_energy = (
+                    get_seawater_decomposition_energy_from_mp_id(
+                        mp_id=mp_id, pH=pH, voltage=voltage,
+                        sea_pourbaix_diagram=sea_pourbaix_diagram,
+                        bare_seawater_pbx=bare_seawater_pbx,
+                        decomp_energy_for_metastability=decomp_energy_for_metastability,
                     )
-                    if decomposition_energy < decomp_energy_for_metastability:
-                        metastability_dict[str(sc)].append((pH, voltage))
+                )
+                if decomposition_energy < decomp_energy_for_metastability:
+                    metastability_points.append((pH, voltage))
 
-    if use_all:
-        return metastability_dict
-    return metastability_dict[str(selection_criterion)]
+    return metastability_points
 
 
 # Backward-compatible alias (original had typo "seach")

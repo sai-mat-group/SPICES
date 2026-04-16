@@ -78,7 +78,7 @@ def count_phase_stabilities(
     stability_excel_path : str
         Path to Stage 2 seawater stability Excel file.
     criteria : list of int or None
-        Selection criteria to count (default: [1, 2, 3, 4, 5, 6]).
+        Selection criteria to count (default: [4]).
 
     Returns
     -------
@@ -86,7 +86,7 @@ def count_phase_stabilities(
         Counts per criterion plus seawater stability.
     """
     if criteria is None:
-        criteria = [1, 2, 3, 4, 5, 6]
+        criteria = [4]
 
     df = pd.read_excel(stability_excel_path)
 
@@ -412,11 +412,10 @@ def run_statistics(
             "total_phases": len(pd.read_excel(s2_path)),
             "seawater_stable": int(stability_counts.get("Seawater stability", 0)),
         }
-        for sc in [1, 2, 3, 4, 5, 6]:
-            key = f"Seawater metastability (Criterion {sc}) bool"
-            elem_summary[f"metastable_c{sc}"] = int(
-                stability_counts.get(key, 0)
-            )
+        key = f"Seawater metastability (Criterion {metastability_criterion}) bool"
+        elem_summary[f"metastable_c{metastability_criterion}"] = int(
+            stability_counts.get(key, 0)
+        )
 
         # Count voltage-stable phases
         if s3_dir:

@@ -121,7 +121,6 @@ def update_seawater_metastability_columns_by_mp_id(
     mp_client,
     element_str,
     check_stability=True,
-    all_selection_criteria=True,
     OER_shift=0.5,
     HER_shift=-0.3,
     range_of_pH=(7, 8.5),
@@ -134,9 +133,8 @@ def update_seawater_metastability_columns_by_mp_id(
     """
     Apply seawater stability and metastability checks to a DataFrame row.
 
-    Populates up to 9 columns: ``'Seawater stability'`` and
-    ``'Seawater metastability (Criterion 1)'`` through
-    ``'(Criterion 8)'``.
+    Populates ``'Seawater stability'`` and
+    ``'Seawater metastability (Criterion 4)'``.
 
     Parameters
     ----------
@@ -148,8 +146,6 @@ def update_seawater_metastability_columns_by_mp_id(
         Working ion element (e.g. ``"Ca"``).
     check_stability : bool
         Whether to check thermodynamic stability in seawater.
-    all_selection_criteria : bool
-        If True, evaluate all 8 selection criteria.
     OER_shift : float
     HER_shift : float
     range_of_pH : tuple of float
@@ -193,46 +189,24 @@ def update_seawater_metastability_columns_by_mp_id(
             row["Formula"], mp_id, seawater_stability,
         )
 
-    # Seawater metastability check
+    # Seawater metastability check (Criterion 4)
     if not seawater_stability or metastability_points:
         logger.info("Checking %s metastability in seawater", row["Formula"])
         working_ion = Element(element_str)
 
-        if all_selection_criteria:
-            sc_dict = is_metastable_phase_stable_in_seawater_search_by_mp_id(
+        row["Seawater metastability (Criterion 4)"] = (
+            is_metastable_phase_stable_in_seawater_search_by_mp_id(
                 mp_id=mp_id,
                 sea_pourbaix_diagram=sea_pourbaix_diagram,
                 output_metastability_area=metastability_points,
                 bare_seawater_pbx=bare_seawater_pbx,
                 working_ion=working_ion,
-                pH_grids=pH_grids,
-                voltage_grids=voltage_grids,
                 OER_shift=OER_shift,
                 HER_shift=HER_shift,
-                selection_criterion="all",
+                pH_grids=pH_grids,
+                voltage_grids=voltage_grids,
                 decomp_energy_for_metastability=decomp_energy_for_metastability,
             )
-            for i in range(1, 7):
-                row[f"Seawater metastability (Criterion {i})"] = sc_dict[str(i)]
-            # Criteria 7-8 only when overpotential shifts are applied
-            if HER_shift != 0 or OER_shift != 0:
-                row["Seawater metastability (Criterion 7)"] = sc_dict["7"]
-                row["Seawater metastability (Criterion 8)"] = sc_dict["8"]
-        else:
-            row["Seawater metastability (Criterion 2)"] = (
-                is_metastable_phase_stable_in_seawater_search_by_mp_id(
-                    mp_id=mp_id,
-                    sea_pourbaix_diagram=sea_pourbaix_diagram,
-                    output_metastability_area=metastability_points,
-                    bare_seawater_pbx=bare_seawater_pbx,
-                    working_ion=working_ion,
-                    OER_shift=OER_shift,
-                    HER_shift=HER_shift,
-                    pH_grids=pH_grids,
-                    voltage_grids=voltage_grids,
-                    selection_criterion=2,
-                    decomp_energy_for_metastability=decomp_energy_for_metastability,
-                )
-            )
+        )
 
     return row

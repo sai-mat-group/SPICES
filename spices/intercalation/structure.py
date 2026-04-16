@@ -429,17 +429,14 @@ def add_charged_struct_info(
                 )
                 stability_cache[mp_id] = new_row
 
-            # Add boolean columns for each criterion
-            for i in range(1, 9):
-                col = f"Seawater metastability (Criterion {i})"
-                if col in new_row.index:
+            # Add boolean columns for each criterion present in the data
+            for col in new_row.index:
+                if col.startswith("Seawater metastability (Criterion "):
                     val = new_row[col]
                     bool_val = bool(
                         isinstance(val, (list, tuple)) and len(val) > 0
                     )
-                else:
-                    bool_val = False
-                new_row[f"{col}_bool"] = bool_val
+                    new_row[f"{col}_bool"] = bool_val
 
             # Append to the subgroup sheet
             df_sheet = pd.concat(

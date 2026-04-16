@@ -69,12 +69,10 @@ class TestSplitDataframe:
 
 class TestSeawaterColumns:
     def test_column_count(self):
-        assert len(SEAWATER_COLUMNS) == 9
+        assert len(SEAWATER_COLUMNS) == 2
 
     def test_stability_column_present(self):
         assert "Seawater stability" in SEAWATER_COLUMNS
 
-    def test_all_criteria_present(self):
-        for i in range(1, 9):
-            col = f"Seawater metastability (Criterion {i})"
-            assert col in SEAWATER_COLUMNS
+    def test_criterion_4_present(self):
+        assert "Seawater metastability (Criterion 4)" in SEAWATER_COLUMNS

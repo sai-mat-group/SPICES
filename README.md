@@ -112,6 +112,41 @@ in_water = check_overlap_with_water_stability_lines(pH=7, voltage=0.5)
 # True
 ```
 
+## Selection Criteria
+
+Stages 2--3 evaluate whether decomposition products in seawater preserve the cathode structure. This is controlled by a **selection criterion** that defines what "preserved" means.
+
+By default, the pipeline uses **Criterion 4**: at least one solid decomposition product must contain a non-working-ion cation *and* an anionic element. This strikes a balance between being too permissive (e.g. Criterion 1, which accepts any cation) and too strict (e.g. Criterion 6, which requires all framework elements retained as compounds).
+
+### Advanced: exploring other criteria
+
+For users who want to explore all 8 selection criteria, an optional module is available:
+
+```python
+from spices.pourbaix.selection_criteria import (
+    check_solid_entry_all_criteria,
+    ALL_SELECTION_CRITERIA,       # [1, 2, 3, 4, 5, 6, 7, 8]
+    SEAWATER_COLUMNS_ALL,         # all 9 column names
+)
+
+# Evaluate a single alternative criterion
+result = check_solid_entry_all_criteria(entry, reactant, mp_id, pbx, ion,
+                                        selection_criterion=3)
+
+# Evaluate all 8 at once (returns dict of bools)
+result = check_solid_entry_all_criteria(entry, reactant, mp_id, pbx, ion,
+                                        selection_criterion=9)
+```
+
+The main pipeline functions also accept a `selection_criterion` parameter if you want to override the default:
+
+```bash
+# Stage 3 CLI: evaluate criteria 1, 2, 3, and 4
+python scripts/run_intercalation_screening.py Ca input.xlsx --selection-criteria 1,2,3,4
+```
+
+See the docstring in `spices/pourbaix/selection_criteria.py` for a full description of all 8 criteria.
+
 ## Package Structure
 
 ```
@@ -125,9 +160,10 @@ spices/
     pourbaix/                  # Core Pourbaix diagram analysis
         composition.py         # Chemical composition manipulation
         geometry.py            # Geometric overlap calculations
-        stability.py           # Thermodynamic stability checks
+        stability.py           # Thermodynamic stability checks (Criterion 4 default)
         decomposition.py       # Decomposition energy calculations
         metastability.py       # Grid-based metastability searches
+        selection_criteria.py  # Optional: all 8 selection criteria with docs
         cache.py               # Pourbaix entry/diagram caching (disk + memory)
         plotting.py            # Heat maps and phase region plots
         thermo.py              # XC functional and energy correction utilities

@@ -45,8 +45,8 @@ def main():
     )
     parser.add_argument(
         "--selection-criteria",
-        default="1,2,3,4,5,6,7,8",
-        help="Comma-separated selection criteria (default: 1,2,3,4,5,6,7,8)",
+        default="4",
+        help="Comma-separated selection criteria (default: 4). For all: 1,2,3,4,5,6,7,8",
     )
     parser.add_argument(
         "--decomp-energy",

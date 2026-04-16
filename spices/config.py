@@ -77,8 +77,9 @@ WORKING_ION_PARAMS = {
     "Na": {"valency": 1, "voltage_vs_SHE": -2.71},
 }
 
-# Default selection criteria for voltage plateau analysis
-DEFAULT_SELECTION_CRITERIA = [1, 2, 3, 4, 5, 6, 7, 8]
+# Default selection criteria for voltage plateau analysis.
+# For all 8 criteria, see spices.pourbaix.selection_criteria.ALL_SELECTION_CRITERIA
+DEFAULT_SELECTION_CRITERIA = [4]
 
 # Default decomposition energy for Stage 3 metastability checks
 INTERCALATION_DECOMP_ENERGY_THRESHOLD = 0.3
