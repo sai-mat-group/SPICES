@@ -223,21 +223,25 @@ def find_ph_range_at_voltage(
     poly_B = get_alpha_shape(points_B)
     intersection_region = poly_A.intersection(poly_B)
 
+    all_pH = [p for p, _ in list(points_A) + list(points_B)]
+    min_pH, max_pH = min(all_pH) - 1, max(all_pH) + 1
+    test_line = LineString([(min_pH, voltage), (max_pH, voltage)])
+    overlap_line = (
+        intersection_region.intersection(test_line)
+        if not intersection_region.is_empty
+        else None
+    )
+
     if save_plot:
         _plot_ph_range_intersection(
             poly_A, poly_B, intersection_region, voltage,
             OER_shift, HER_shift, save_plot_path, title,
             A_phase_name, B_phase_name,
+            test_line=test_line, overlap_line=overlap_line,
         )
 
     if intersection_region.is_empty:
         return ()
-
-    # Horizontal test line at the given voltage
-    all_pH = [p for p, _ in list(points_A) + list(points_B)]
-    min_pH, max_pH = min(all_pH) - 1, max(all_pH) + 1
-    test_line = LineString([(min_pH, voltage), (max_pH, voltage)])
-    overlap_line = intersection_region.intersection(test_line)
 
     # Extract pH coordinates from the overlap geometry
     segs = []
@@ -348,9 +352,11 @@ def _plot_ph_range_intersection(
     poly_A, poly_B, intersection_region, voltage,
     OER_shift, HER_shift, save_plot_path, title,
     A_phase_name, B_phase_name,
+    test_line=None, overlap_line=None,
 ):
     """Internal helper: plot the pH-range intersection diagram."""
     import matplotlib.pyplot as plt
+    from shapely.geometry import MultiLineString, GeometryCollection
 
     plt.figure(dpi=150, figsize=(6.4, 3.8))
     if title:
@@ -395,6 +401,45 @@ def _plot_ph_range_intersection(
     if not intersection_region.is_empty and isinstance(intersection_region, Polygon):
         xI, yI = intersection_region.exterior.xy
         plt.plot(xI, yI, "--", label="Intersection", color="k")
+
+    # Horizontal voltage-plateau line
+    if test_line is not None:
+        plt.plot(
+            *test_line.xy,
+            label=f"E = {round(voltage, 3)} V",
+            color="cadetblue",
+        )
+
+    # Highlighted pH overlap at the voltage
+    if overlap_line is not None and not overlap_line.is_empty:
+        if isinstance(overlap_line, LineString):
+            plt.plot(
+                *overlap_line.xy, linewidth=3,
+                label="pH overlap", color="royalblue",
+            )
+        elif isinstance(overlap_line, Point):
+            plt.scatter(
+                [overlap_line.x], [overlap_line.y], s=50,
+                label="pH touch",
+                color="royalblue", edgecolor="black", zorder=5,
+            )
+        elif isinstance(overlap_line, (MultiLineString, GeometryCollection)):
+            labeled = False
+            for g in overlap_line.geoms:
+                if isinstance(g, LineString):
+                    plt.plot(
+                        *g.xy, linewidth=3,
+                        label=None if labeled else "pH overlap",
+                        color="royalblue",
+                    )
+                    labeled = True
+                elif isinstance(g, Point) and not g.is_empty:
+                    plt.scatter(
+                        [g.x], [g.y], s=50,
+                        label=None if labeled else "pH touch",
+                        color="royalblue", edgecolor="black", zorder=5,
+                    )
+                    labeled = True
 
     plt.legend(
         loc="upper left", bbox_to_anchor=(1.05, 1),
