@@ -19,10 +19,13 @@ from spices.intercalation.structure import (
     generate_charged_struct_from_MP,
     read_or_generate_charged_struct,
     find_structures,
-    create_subgroups,
-    subgroups_to_excel_sheets,
-    add_charged_struct_info,
 )
+
+# NOTE: ``spices.intercalation.grouping`` depends on
+# ``spices.screening.framework_comparison`` which in turn imports
+# ``DEFAULT_MATCHER`` from this subpackage.  We therefore do NOT
+# re-export grouping symbols here — import them directly from
+# ``spices.intercalation.grouping`` to avoid a circular import.
 
 __all__ = [
     "calculate_intercalation_voltage",
@@ -33,7 +36,4 @@ __all__ = [
     "generate_charged_struct_from_MP",
     "read_or_generate_charged_struct",
     "find_structures",
-    "create_subgroups",
-    "subgroups_to_excel_sheets",
-    "add_charged_struct_info",
 ]

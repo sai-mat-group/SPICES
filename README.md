@@ -87,6 +87,11 @@ df_sea = run_seawater_screening(
 )
 
 # Stage 3: Run intercalation voltage screening on Stage 2 output
+# Per-composition sheets are partitioned into framework-matching
+# components via a graph built over StructureMatcher-equivalence
+# (spices.intercalation.grouping).  One PDF per connected component
+# is saved to {output_dir}/Voltage_plateau_data/{framework}/graphs/
+# unless save_component_graphs=False.
 from spices.screening.intercalation import run_intercalation_screening
 
 combined = run_intercalation_screening(
@@ -180,7 +185,8 @@ spices/
     intercalation/             # Intercalation voltage analysis
         voltage.py             # Voltage calculation from DFT energies
         hull.py                # Pseudo-binary convex hull filtering
-        structure.py           # Charged structure gen, StructureMatcher grouping
+        structure.py           # Charged-structure caching (3-level: memory/disk/MP)
+        grouping.py            # Graph-based framework partitioning and component plotting
 
     screening/                 # Pipeline stage modules
         mp_query.py            # Stage 0: Materials Project data query
@@ -209,6 +215,10 @@ python scripts/run_seawater_screening.py Ca input.xlsx -o output.xlsx -n 8
 
 # Stage 3: intercalation voltage screening
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/
+
+# Stage 3 with per-plateau pH-overlap PDFs, without component graphs
+python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ \
+    --save-plots --no-component-graphs
 
 # Stage 4: framework comparison (graph-based by default)
 python scripts/run_framework_comparison.py Ca --stage3-dir ./intercalation_results/

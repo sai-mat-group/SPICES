@@ -19,31 +19,31 @@ from spices.intercalation.structure import DEFAULT_MATCHER
 
 
 class TestFrameworkStructure:
-    def test_hash_by_framework_formula(self):
-        """Two structures with same framework formula should hash equally."""
+    def test_hash_by_mp_id(self):
+        """Hash is derived from mp_id; equality falls back to identity."""
         mock_struct = MagicMock()
         mock_struct.copy.return_value = mock_struct
         mock_struct.composition.reduced_formula = "CaFeO2"
         mock_struct.elements = []
         mock_struct.remove_oxidation_states = MagicMock()
 
-        fw = FrameworkStructure("mp-1", mock_struct, "Ca")
-        # Hash should be based on framework formula (with Ca removed)
-        assert isinstance(hash(fw), int)
+        fw = FrameworkStructure("mp-1", mock_struct, "Ca", is_expt=False)
+        assert hash(fw) == hash("mp-1")
 
     def test_uses_attempt_supercell_matcher(self):
         """Verify DEFAULT_MATCHER has attempt_supercell=True."""
         assert DEFAULT_MATCHER._supercell is True
 
-    def test_is_expt_default_false(self):
+    def test_is_expt_required(self):
+        """is_expt has no default; omitting it raises TypeError."""
         mock_struct = MagicMock()
         mock_struct.copy.return_value = mock_struct
         mock_struct.composition.reduced_formula = "FeO2"
         mock_struct.elements = []
         mock_struct.remove_oxidation_states = MagicMock()
 
-        fw = FrameworkStructure("mp-1", mock_struct, "Ca")
-        assert fw.is_expt is False
+        with pytest.raises(TypeError):
+            FrameworkStructure("mp-1", mock_struct, "Ca")
 
     def test_is_expt_set(self):
         mock_struct = MagicMock()
