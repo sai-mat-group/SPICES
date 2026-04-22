@@ -24,6 +24,12 @@ from mp_api.client import MPRester
 # for "live" and (snapshot_root, release) for "snapshot".
 _clients: dict = {}
 
+# Most recently created/returned client.  Used as a sticky default so a
+# top-level ``get_client(backend="snapshot", ...)`` call is picked up by
+# inner no-arg ``get_client()`` calls inside pipeline entry points like
+# ``run_mp_query`` — matches the pre-snapshot ``_default_client`` pattern.
+_last_client = None
+
 
 def get_client(
     api_key=None,
@@ -71,6 +77,18 @@ def get_client(
         If the live backend is selected but no API key can be found, or
         the snapshot backend is selected but no snapshot_root resolves.
     """
+    # Sticky-default fast path: truly no-arg inner calls (e.g. from
+    # ``run_mp_query``) pick up whatever client was last created at
+    # module/top level.  Only fires when nothing explicit is asked for —
+    # any arg, any env var, or no prior client disables the shortcut and
+    # we fall through to the usual resolution.
+    if (api_key is None and backend is None
+            and snapshot_root is None and release is None
+            and "SPICES_MP_BACKEND" not in os.environ
+            and "MP_API_KEY" not in os.environ
+            and _last_client is not None):
+        return _last_client
+
     if backend is None:
         backend = os.environ.get("SPICES_MP_BACKEND", "live").lower()
 
@@ -102,9 +120,11 @@ def _get_live_client(api_key):
             "explicitly."
         )
 
+    global _last_client
     key = ("live", api_key)
     if key not in _clients:
         _clients[key] = MPRester(api_key)
+    _last_client = _clients[key]
     return _clients[key]
 
 
@@ -125,9 +145,11 @@ def _get_snapshot_client(snapshot_root, release):
     # time — users on pure live-API setups never pay for boto3/etc.
     from spices.mp_snapshot.client import SnapshotMPRester
 
+    global _last_client
     key = ("snapshot", snapshot_root, release)
     if key not in _clients:
         _clients[key] = SnapshotMPRester(snapshot_root, release=release)
+    _last_client = _clients[key]
     return _clients[key]
 
 
