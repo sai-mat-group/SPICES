@@ -257,9 +257,17 @@ export MP_API_KEY=your_key_here
 
 # ~1.14 GB; threaded, takes a few minutes. Default release: 2025-06-09.
 python -m spices.mp_snapshot.download /path/to/MP_snapshots
+
+# List every release published on the public bucket
+python -m spices.mp_snapshot.download --list-releases
+
+# Pin to an older release (e.g. to reproduce a run that predates 2025-06-09)
+python -m spices.mp_snapshot.download /path/to/MP_snapshots --release 2024-11-14
 ```
 
-This downloads the `summary/`, `thermo/thermo_type=GGA_GGA+U/`, and `materials/` collections, freezes the MPContribs `ion_ref_data` project (needed for offline Pourbaix rebuild), and writes a `manifest.json` with provenance.
+This downloads the `summary/`, `thermo/thermo_type=GGA_GGA+U/`, `thermo/thermo_type=GGA_GGA+U_R2SCAN/`, and `materials/` collections, freezes the MPContribs `ion_ref_data` project (needed for offline Pourbaix rebuild), and writes a `manifest.json` with provenance.
+
+The `--release` value is validated against the public bucket before any download begins — a typo exits immediately with a `ValueError` listing the valid releases, rather than silently writing an empty snapshot. If a chosen older release does not publish one of the required prefixes (e.g. `GGA_GGA+U_R2SCAN` is absent on early releases), `download_collection` logs a warning and returns instead of failing the whole run.
 
 ### Using the snapshot backend
 
@@ -276,7 +284,9 @@ mp = get_client(
 # or: export SPICES_MP_BACKEND=snapshot SPICES_MP_SNAPSHOT_ROOT=/path/to/MP_snapshots
 ```
 
-`SnapshotMPRester` is **strict**: unsupported methods, unsupported thermo types (e.g. `R2SCAN`), and any network attempt raise `SnapshotBackendError` — preventing silent fallback that would mix data from two database eras in one run.
+`SnapshotMPRester` is **strict**: unsupported methods, unsupported thermo types (e.g. pure `R2SCAN`), and any network attempt raise `SnapshotBackendError` — preventing silent fallback that would mix data from two database eras in one run.
+
+The default `materials.thermo.search(...)` call (with `thermo_types=None`) returns **every** `(mp-id, thermo_type)` doc the snapshot ships, matching the current live `mp_api` behavior: an mp-id with both `GGA_GGA+U` and `GGA_GGA+U_R2SCAN` hulls produces two docs. SPICES' own dedup in `screening/mp_query.py` collapses these to one row per mp-id based on `(Base XC, Correction XC)`, so downstream step0 output is still one row per mp-id.
 
 ### Reusing earlier Pourbaix caches
 

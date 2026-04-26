@@ -43,6 +43,7 @@ BUCKET = "materialsproject-build"
 REQUIRED_PREFIXES = [
     "summary/",
     "thermo/thermo_type=GGA_GGA+U/",
+    "thermo/thermo_type=GGA_GGA+U_R2SCAN/",
     "materials/",
 ]
 
@@ -57,6 +58,40 @@ def _iter_keys(s3, bucket, prefix):
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents") or []:
             yield obj["Key"], obj["Size"]
+
+
+def list_releases(bucket=BUCKET):
+    """List MP release date strings published under ``collections/``.
+
+    Returns
+    -------
+    list of str
+        Release strings (e.g. ``"2025-06-09"``), sorted lexicographically.
+        Non-release folders (collection-type directories like ``summary/``
+        that coexist with date folders) are filtered out by requiring a
+        4-digit-year prefix.
+    """
+    s3 = _s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    releases = []
+    for page in paginator.paginate(
+        Bucket=bucket, Prefix="collections/", Delimiter="/"
+    ):
+        for cp in page.get("CommonPrefixes") or []:
+            name = cp["Prefix"][len("collections/"):].rstrip("/")
+            if name and name[:4].isdigit():
+                releases.append(name)
+    return sorted(releases)
+
+
+def validate_release(release):
+    """Raise ``ValueError`` if *release* is not published on the public bucket."""
+    available = list_releases()
+    if release not in available:
+        raise ValueError(
+            f"Release {release!r} not found under "
+            f"s3://{BUCKET}/collections/. Available: {available}"
+        )
 
 
 def _download_one(args):
@@ -99,6 +134,13 @@ def download_collection(
             continue
         local = os.path.join(local_base, rel)
         jobs.append((BUCKET, key, local, size, skip_existing))
+
+    if not jobs:
+        logger.warning(
+            "No objects under s3://%s/%s — this release may not publish "
+            "this prefix", BUCKET, s3_prefix,
+        )
+        return 0, 0, 0
 
     logger.info("Collection %s: %d objects to mirror", prefix, len(jobs))
 
@@ -235,6 +277,8 @@ def download_snapshot(
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    validate_release(release)
+
     for prefix in prefixes:
         download_collection(release, prefix, dest_root, skip_existing=True)
 
@@ -248,9 +292,11 @@ def _parse_argv(argv):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "dest_root",
+        nargs="?",
         help="Local snapshot root, e.g. "
         "/home/sougat/Desktop/sougat_desktop_files/Sougat/"
-        "fileserver_backup/Desalination/MP_snapshots",
+        "fileserver_backup/Desalination/MP_snapshots. "
+        "Not required when --list-releases is used.",
     )
     p.add_argument("--release", default=DEFAULT_RELEASE)
     p.add_argument(
@@ -264,11 +310,23 @@ def _parse_argv(argv):
         dest="prefixes",
         help="Override collection prefix list (can be given multiple times)",
     )
+    p.add_argument(
+        "--list-releases",
+        action="store_true",
+        help="Print available MP release strings on the public bucket and exit",
+    )
     return p.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = _parse_argv(sys.argv[1:])
+    if args.list_releases:
+        for r in list_releases():
+            print(r)
+        sys.exit(0)
+    if not args.dest_root:
+        print("error: dest_root is required unless --list-releases is given", file=sys.stderr)
+        sys.exit(2)
     download_snapshot(
         dest_root=args.dest_root,
         release=args.release,

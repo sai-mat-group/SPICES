@@ -23,7 +23,7 @@ from spices.mp_snapshot.loader import SnapshotLoader
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_THERMO_TYPE = "GGA_GGA+U"
+SUPPORTED_THERMO_TYPES = frozenset({"GGA_GGA+U", "GGA_GGA+U_R2SCAN"})
 
 
 class SnapshotBackendError(RuntimeError):
@@ -165,7 +165,7 @@ def _thermo_from_doc(d: dict) -> ThermoDoc:
         composition=Composition(d.get("composition") or {}),
         chemsys=d.get("chemsys", ""),
         formula_pretty=d.get("formula_pretty", ""),
-        thermo_type=_EnumLike(d.get("thermo_type", SUPPORTED_THERMO_TYPE)),
+        thermo_type=_EnumLike(d.get("thermo_type", "")),
         energy_type=d.get("energy_type", ""),
         entries=entries,
         energy_per_atom=d.get("energy_per_atom", float("nan")),
@@ -230,16 +230,18 @@ class _ThermoNS(_StrictNamespace):
         all_fields=False,
         fields=None,
     ):
-        # Strict thermo_type guard: 2025-06-09 snapshot only ships GGA_GGA+U.
+        # Strict thermo_type guard.  2025-06-09 snapshot ships two
+        # thermo prefixes (GGA_GGA+U and GGA_GGA+U_R2SCAN); both are
+        # part of the same release so combining them does NOT mix DB
+        # eras.  Any other thermo_type (e.g. R2SCAN-only) is rejected.
         if thermo_types is not None:
             requested = set(thermo_types)
-            if not requested.issubset({SUPPORTED_THERMO_TYPE}):
-                unsupported = requested - {SUPPORTED_THERMO_TYPE}
+            if not requested.issubset(SUPPORTED_THERMO_TYPES):
+                unsupported = requested - SUPPORTED_THERMO_TYPES
                 raise SnapshotBackendError(
-                    f"Snapshot backend only ships thermo_type='{SUPPORTED_THERMO_TYPE}'. "
-                    f"Requested unsupported types: {sorted(unsupported)}. "
-                    f"Mixing with later-added run types (e.g. R2SCAN) would "
-                    f"silently combine data from different DB eras."
+                    f"Snapshot backend ships thermo_types="
+                    f"{sorted(SUPPORTED_THERMO_TYPES)}. "
+                    f"Requested unsupported types: {sorted(unsupported)}."
                 )
 
         raw_docs = self._loader.search(
@@ -248,6 +250,10 @@ class _ThermoNS(_StrictNamespace):
             material_ids=material_ids,
         )
         out = [_thermo_from_doc(d) for d in raw_docs if d is not None]
+
+        if thermo_types is not None:
+            requested = set(thermo_types)
+            out = [e for e in out if e.thermo_type.value in requested]
 
         if is_stable is not None:
             out = [e for e in out if e.is_stable == bool(is_stable)]
