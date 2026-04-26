@@ -37,6 +37,7 @@ Thumbs.db
 
 # Original notebooks (large, 24 GB)
 3rd_Iteration/
+manual_tests/
 
 # Claude Code
 .claude/

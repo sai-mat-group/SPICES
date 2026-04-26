@@ -1,46 +1,107 @@
 """
-Centralized Materials Project API client management.
+Centralized Materials Project client management.
 
-Replaces hardcoded API keys and global ``mpi`` variables throughout
-the original codebase.  Every function that needs the API accepts an
-optional ``mp_client`` parameter; if *None*, the module-level default
-client is used.
+Two backends are supported:
+
+- ``"live"`` (default): the upstream ``mp_api.client.MPRester`` hitting
+  the current Materials Project database.
+- ``"snapshot"``: an offline :class:`spices.mp_snapshot.client.SnapshotMPRester`
+  serving a frozen release (e.g. ``2025-06-09``) from a local bulk dump.
+  Used to reproduce earlier iterations' results after MP's live DB has
+  moved on.
+
+Every SPICES function that queries MP accepts an ``mp_client`` parameter,
+so downstream code doesn't care which backend it got — switching is a
+single call-site change (or an env var).
 """
 
 import os
+
 from mp_api.client import MPRester
 
-_default_client = None
+# Cache keyed by (backend, identifier) so repeated get_client calls with
+# the same config reuse the same instance.  Identifier is the API key
+# for "live" and (snapshot_root, release) for "snapshot".
+_clients: dict = {}
+
+# Most recently created/returned client.  Used as a sticky default so a
+# top-level ``get_client(backend="snapshot", ...)`` call is picked up by
+# inner no-arg ``get_client()`` calls inside pipeline entry points like
+# ``run_mp_query`` — matches the pre-snapshot ``_default_client`` pattern.
+_last_client = None
 
 
-def get_client(api_key=None):
+def get_client(
+    api_key=None,
+    backend=None,
+    snapshot_root=None,
+    release=None,
+):
     """
-    Return an MPRester client instance.
+    Return an MP client — either live or a local snapshot backend.
 
-    Resolution order for the API key:
-      1. Explicit *api_key* argument
-      2. ``MP_API_KEY`` environment variable
-      3. ``.env`` file in the current working directory (via python-dotenv)
+    Backend resolution order:
+      1. Explicit ``backend`` argument.
+      2. ``SPICES_MP_BACKEND`` environment variable.
+      3. ``"live"`` (default).
 
-    The client is cached so repeated calls with the same key reuse
-    the connection.
+    For ``backend="live"``, API key resolution is:
+      1. Explicit ``api_key`` argument.
+      2. ``MP_API_KEY`` environment variable.
+      3. ``.env`` file in CWD (via python-dotenv if installed).
+
+    For ``backend="snapshot"``, snapshot location is:
+      1. Explicit ``snapshot_root`` argument (or ``SPICES_MP_SNAPSHOT_ROOT``).
+      2. Explicit ``release`` argument (or ``SPICES_MP_SNAPSHOT_RELEASE``,
+         default ``"2025-06-09"``).
 
     Parameters
     ----------
     api_key : str or None
-        Materials Project API key. If None, resolved from the environment.
+        Materials Project API key (live backend only).
+    backend : {"live", "snapshot"} or None
+        Which backend to use.  If None, resolved from the environment.
+    snapshot_root : str or None
+        Path to the local snapshot root (snapshot backend only).
+    release : str or None
+        Release label, e.g. ``"2025-06-09"`` (snapshot backend only).
 
     Returns
     -------
-    MPRester
+    MPRester or SnapshotMPRester
+        Both expose the subset of the MPRester surface that SPICES uses.
 
     Raises
     ------
     ValueError
-        If no API key can be found.
+        If the live backend is selected but no API key can be found, or
+        the snapshot backend is selected but no snapshot_root resolves.
     """
-    global _default_client
+    # Sticky-default fast path: truly no-arg inner calls (e.g. from
+    # ``run_mp_query``) pick up whatever client was last created at
+    # module/top level.  Only fires when nothing explicit is asked for —
+    # any arg, any env var, or no prior client disables the shortcut and
+    # we fall through to the usual resolution.
+    if (api_key is None and backend is None
+            and snapshot_root is None and release is None
+            and "SPICES_MP_BACKEND" not in os.environ
+            and "MP_API_KEY" not in os.environ
+            and _last_client is not None):
+        return _last_client
 
+    if backend is None:
+        backend = os.environ.get("SPICES_MP_BACKEND", "live").lower()
+
+    if backend == "live":
+        return _get_live_client(api_key)
+    if backend == "snapshot":
+        return _get_snapshot_client(snapshot_root, release)
+    raise ValueError(
+        f"Unknown backend '{backend}'. Use 'live' or 'snapshot'."
+    )
+
+
+def _get_live_client(api_key):
     if api_key is None:
         api_key = os.environ.get("MP_API_KEY")
 
@@ -59,21 +120,45 @@ def get_client(api_key=None):
             "explicitly."
         )
 
-    if _default_client is None:
-        _default_client = MPRester(api_key)
+    global _last_client
+    key = ("live", api_key)
+    if key not in _clients:
+        _clients[key] = MPRester(api_key)
+    _last_client = _clients[key]
+    return _clients[key]
 
-    return _default_client
+
+def _get_snapshot_client(snapshot_root, release):
+    if snapshot_root is None:
+        snapshot_root = os.environ.get("SPICES_MP_SNAPSHOT_ROOT")
+    if release is None:
+        release = os.environ.get("SPICES_MP_SNAPSHOT_RELEASE", "2025-06-09")
+
+    if snapshot_root is None:
+        raise ValueError(
+            "Snapshot backend selected but no snapshot_root given. Pass "
+            "snapshot_root= to get_client() or set "
+            "SPICES_MP_SNAPSHOT_ROOT in the environment."
+        )
+
+    # Local import so the snapshot subpackage stays optional at import
+    # time — users on pure live-API setups never pay for boto3/etc.
+    from spices.mp_snapshot.client import SnapshotMPRester
+
+    global _last_client
+    key = ("snapshot", snapshot_root, release)
+    if key not in _clients:
+        _clients[key] = SnapshotMPRester(snapshot_root, release=release)
+    _last_client = _clients[key]
+    return _clients[key]
 
 
 def set_api_key(api_key):
     """
     Set (or replace) the default API key for this session.
 
-    Parameters
-    ----------
-    api_key : str
-        Materials Project API key.
+    Only affects the live backend.  Snapshot instances cached for other
+    backends are untouched.
     """
-    global _default_client
     os.environ["MP_API_KEY"] = api_key
-    _default_client = MPRester(api_key)
+    _clients[("live", api_key)] = MPRester(api_key)

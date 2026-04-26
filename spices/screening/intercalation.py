@@ -17,7 +17,6 @@ import ast
 import logging
 import os
 import time
-import warnings
 from multiprocessing import Pool
 
 import numpy as np
@@ -42,10 +41,10 @@ from spices.intercalation.voltage import (
     get_energy_of_working_ion,
 )
 from spices.intercalation.hull import filter_df_to_get_on_hull_phases
-from spices.intercalation.structure import (
-    create_subgroups,
-    subgroups_to_excel_sheets,
-    add_charged_struct_info,
+from spices.intercalation.grouping import (
+    enrich_sheet_with_charged_mp_phases,
+    build_graph_components_from_sheet,
+    save_component_graphs,
 )
 from spices.dataframe_ops import update_seawater_metastability_columns_by_mp_id
 
@@ -150,73 +149,6 @@ def _convert_metastability_list_to_bool(x):
     elif isinstance(x, float) and np.isnan(x):
         return False
     return False
-
-
-def _intelligent_outer_merge(df1, df2):
-    """
-    Outer-merge two DataFrames, handling dtype mismatches by casting
-    conflicting columns to ``object``.
-    """
-    common_cols = set(df1.columns).intersection(set(df2.columns))
-    mismatched = [col for col in common_cols if df1[col].dtype != df2[col].dtype]
-    for col in mismatched:
-        df1[col] = df1[col].astype("object")
-        df2[col] = df2[col].astype("object")
-
-    if mismatched:
-        warnings.warn(f"Dtype mismatches fixed by converting to 'object': {mismatched}")
-
-    return df1.merge(df2, how="outer")
-
-
-def merge_subgroups(all_sheets):
-    """
-    Merge subgroup sheets that share common MP IDs via outer merge.
-
-    Parameters
-    ----------
-    all_sheets : dict
-        Mapping from sheet name to DataFrame.
-
-    Returns
-    -------
-    dict
-        Updated dict with ``'merged subgroup N'`` keys added.
-    """
-    subgroup_names = [name for name in all_sheets if name.startswith("subgroup")]
-
-    if not subgroup_names:
-        raise ValueError("all_sheets contains no 'subgroup' sheets")
-
-    already_merged = set()
-    merged_count = 1
-
-    for i in range(len(subgroup_names)):
-        if subgroup_names[i] in already_merged:
-            continue
-
-        sheet1 = all_sheets[subgroup_names[i]]
-
-        for j in range(i + 1, len(subgroup_names)):
-            if subgroup_names[j] in already_merged:
-                continue
-
-            sheet2 = all_sheets[subgroup_names[j]]
-
-            ids1 = set(sheet1["MP id"].tolist())
-            ids2 = set(sheet2["MP id"].tolist())
-
-            if not ids1.intersection(ids2):
-                continue
-
-            logger.debug("Merging subgroups %d and %d", i + 1, j + 1)
-            sheet1 = _intelligent_outer_merge(sheet1, sheet2)
-            already_merged.add(subgroup_names[j])
-
-        all_sheets[f"merged subgroup {merged_count}"] = sheet1
-        merged_count += 1
-
-    return all_sheets
 
 
 def _append_if_new(df, new_df):
@@ -692,7 +624,7 @@ def step1_create_unique_composition_sheets(
     return filenames
 
 
-def step2_create_subgroups(
+def step2_enrich_charged_composition_sheets(
     composition_dir,
     working_ion,
     mp_client,
@@ -704,9 +636,12 @@ def step2_create_subgroups(
     decomp_energy_for_metastability=0.3,
 ):
     """
-    Step 2: Group structures by similarity and add charged phase info.
+    Step 2: Enrich each per-composition sheet with fully-charged MP
+    phases and their seawater metastability.
 
-    Processes all composition Excel files in *composition_dir*.
+    Replaces the legacy subgroup-creation + merge flow.  The output is
+    a single-sheet xlsx per composition, ready for the graph-based
+    partition performed in step 3.
 
     Parameters
     ----------
@@ -720,7 +655,9 @@ def step2_create_subgroups(
     structure_cache_dir : str
     decomp_energy_for_metastability : float
     """
-    excel_files = [f for f in os.listdir(composition_dir) if f.endswith(".xlsx")]
+    excel_files = [
+        f for f in os.listdir(composition_dir) if f.endswith(".xlsx")
+    ]
     total = len(excel_files)
     cache_dict = {}
 
@@ -729,21 +666,8 @@ def step2_create_subgroups(
         path = os.path.join(composition_dir, fname)
 
         df = pd.read_excel(path)
-
-        # Create subgroups
-        subgroups = create_subgroups(
+        df_enriched = enrich_sheet_with_charged_mp_phases(
             df,
-            working_ion,
-            mp_client,
-            charged_struct_dir=charged_struct_dir,
-            struct_dir=struct_dir,
-            cache_dict=cache_dict,
-        )
-        sheets = subgroups_to_excel_sheets(df, subgroups)
-
-        # Add fully-charged phase info
-        sheets = add_charged_struct_info(
-            sheets,
             working_ion,
             mp_client,
             cache,
@@ -754,11 +678,7 @@ def step2_create_subgroups(
             cache_dict=cache_dict,
             decomp_energy_for_metastability=decomp_energy_for_metastability,
         )
-
-        # Write back
-        with pd.ExcelWriter(path, engine="openpyxl") as writer:
-            for name, sheet_df in sheets.items():
-                sheet_df.to_excel(writer, sheet_name=name, index=False)
+        df_enriched.to_excel(path, index=False)
 
 
 def step3_create_voltage_plateau_sheets(
@@ -774,15 +694,20 @@ def step3_create_voltage_plateau_sheets(
     selection_criteria=None,
     use_only_on_hull_phases=True,
     save_plots=False,
+    save_graphs=True,
+    charged_struct_dir="charged_structs",
+    struct_dir="structs",
+    structure_cache_dir="All_charged_structures",
     decomp_energy_for_metastability=0.3,
 ):
     """
-    Step 3: Compute voltage plateaus for all compositions.
+    Step 3: Partition each enriched sheet into graph-based components
+    and compute voltage plateaus per component per selection criterion.
 
     Parameters
     ----------
     composition_dir : str
-        Directory with per-composition Excel files (from Steps 1-2).
+        Directory with enriched per-composition Excel files (step 2).
     output_dir : str
         Directory for voltage plateau output.
     working_ion : str
@@ -795,6 +720,11 @@ def step3_create_voltage_plateau_sheets(
     selection_criteria : list of int or None
     use_only_on_hull_phases : bool
     save_plots : bool
+        Save pH-overlap PDFs (passed through to voltage computation).
+    save_graphs : bool
+        Save one ``component_{idx}.pdf`` per connected component to
+        ``{framework_dir}/graphs/``.  Default True.
+    charged_struct_dir, struct_dir, structure_cache_dir : str
     decomp_energy_for_metastability : float
     """
     if selection_criteria is None:
@@ -802,7 +732,9 @@ def step3_create_voltage_plateau_sheets(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    excel_files = [f for f in os.listdir(composition_dir) if f.endswith(".xlsx")]
+    excel_files = [
+        f for f in os.listdir(composition_dir) if f.endswith(".xlsx")
+    ]
     total = len(excel_files)
 
     for idx, fname in enumerate(excel_files):
@@ -813,26 +745,33 @@ def step3_create_voltage_plateau_sheets(
         os.makedirs(framework_dir, exist_ok=True)
 
         path = os.path.join(composition_dir, fname)
-        all_sheets = pd.read_excel(path, sheet_name=None)
+        df = pd.read_excel(path)
 
-        # Merge subgroups
-        all_sheets = merge_subgroups(all_sheets)
+        component_dfs, component_graphs = build_graph_components_from_sheet(
+            df,
+            working_ion=working_ion,
+            charged_struct_dir=charged_struct_dir,
+            struct_dir=struct_dir,
+            structure_cache_dir=structure_cache_dir,
+        )
 
-        # Get merged subgroup sheet names
-        merged_names = [name for name in all_sheets if "merged subgroup" in name]
+        if save_graphs:
+            save_component_graphs(
+                component_graphs,
+                os.path.join(framework_dir, "graphs"),
+            )
 
         voltage_results = {sc: {} for sc in selection_criteria}
 
-        for sheet_name in merged_names:
-            df_sheet = all_sheets[sheet_name]
-            logger.debug("Processing %s/%s", fname, sheet_name)
+        for i, comp_df in enumerate(component_dfs):
+            logger.debug("Processing %s/component_%d", fname, i)
 
             for sc in selection_criteria:
                 sc_dir = os.path.join(framework_dir, f"sc_{sc}")
                 os.makedirs(sc_dir, exist_ok=True)
 
                 plateau_dict = obtain_voltage_plateau_data_based_on_convex_hull(
-                    df_sheet,
+                    comp_df,
                     selection_criteria=[sc],
                     working_ion=working_ion,
                     working_ion_valency=working_ion_valency,
@@ -848,11 +787,10 @@ def step3_create_voltage_plateau_sheets(
                 )
 
                 if isinstance(plateau_dict.get(f"sc {sc}"), pd.DataFrame):
-                    voltage_results[sc][f"voltage_{sheet_name}"] = plateau_dict[
-                        f"sc {sc}"
-                    ]
+                    voltage_results[sc][
+                        f"voltage_component_{i}"
+                    ] = plateau_dict[f"sc {sc}"]
 
-        # Save voltage plateau sheets per criterion
         for sc in selection_criteria:
             if not voltage_results[sc]:
                 continue
@@ -979,6 +917,7 @@ def run_intercalation_screening(
     decomp_energy=None,
     use_only_on_hull_phases=True,
     save_plots=False,
+    save_component_graphs=True,
     cache_dir=".",
     api_key=None,
 ):
@@ -1001,6 +940,10 @@ def run_intercalation_screening(
     use_only_on_hull_phases : bool
     save_plots : bool
         If True, save pH-overlap PDF plots.
+    save_component_graphs : bool
+        If True (default), save one ``component_{idx}.pdf`` per
+        connected component under
+        ``Voltage_plateau_data/{framework}/graphs/``.
     cache_dir : str
         Directory for Pourbaix caches.
     api_key : str or None
@@ -1051,8 +994,8 @@ def run_intercalation_screening(
     )
 
     # Step 2
-    logger.info("=== Step 2: Creating structure subgroups ===")
-    step2_create_subgroups(
+    logger.info("=== Step 2: Enriching charged composition sheets ===")
+    step2_enrich_charged_composition_sheets(
         composition_dir,
         element,
         mp_client,
@@ -1079,6 +1022,10 @@ def run_intercalation_screening(
         selection_criteria=selection_criteria,
         use_only_on_hull_phases=use_only_on_hull_phases,
         save_plots=save_plots,
+        save_graphs=save_component_graphs,
+        charged_struct_dir=charged_struct_dir,
+        struct_dir=struct_dir,
+        structure_cache_dir=structure_cache_dir,
         decomp_energy_for_metastability=decomp_energy,
     )
 

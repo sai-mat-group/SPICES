@@ -65,6 +65,16 @@ def main():
         help="Save pH-overlap PDF plots",
     )
     parser.add_argument(
+        "--no-component-graphs",
+        dest="save_component_graphs",
+        action="store_false",
+        help=(
+            "Skip saving component-graph PDFs "
+            "(Voltage_plateau_data/{framework}/graphs/). Default: saved."
+        ),
+    )
+    parser.set_defaults(save_component_graphs=True)
+    parser.add_argument(
         "--api-key",
         default=None,
         help="Materials Project API key (default: from MP_API_KEY env var)",
@@ -83,6 +93,7 @@ def main():
         selection_criteria=criteria,
         decomp_energy=args.decomp_energy,
         save_plots=args.save_plots,
+        save_component_graphs=args.save_component_graphs,
         cache_dir=args.cache_dir,
         api_key=args.api_key,
     )

@@ -87,6 +87,11 @@ df_sea = run_seawater_screening(
 )
 
 # Stage 3: Run intercalation voltage screening on Stage 2 output
+# Per-composition sheets are partitioned into framework-matching
+# components via a graph built over StructureMatcher-equivalence
+# (spices.intercalation.grouping).  One PDF per connected component
+# is saved to {output_dir}/Voltage_plateau_data/{framework}/graphs/
+# unless save_component_graphs=False.
 from spices.screening.intercalation import run_intercalation_screening
 
 combined = run_intercalation_screening(
@@ -162,7 +167,7 @@ See the docstring in `spices/pourbaix/selection_criteria.py` for a full descript
 spices/
     __init__.py
     config.py                  # Constants and default parameters
-    mp_client.py               # Materials Project API client management
+    mp_client.py               # Materials Project API client (live + snapshot backends)
     dataframe_ops.py           # DataFrame-level stability update functions
     io.py                      # Logging configuration
 
@@ -180,7 +185,8 @@ spices/
     intercalation/             # Intercalation voltage analysis
         voltage.py             # Voltage calculation from DFT energies
         hull.py                # Pseudo-binary convex hull filtering
-        structure.py           # Charged structure gen, StructureMatcher grouping
+        structure.py           # Charged-structure caching (3-level: memory/disk/MP)
+        grouping.py            # Graph-based framework partitioning and component plotting
 
     screening/                 # Pipeline stage modules
         mp_query.py            # Stage 0: Materials Project data query
@@ -189,6 +195,12 @@ spices/
         intercalation.py       # Stage 3: intercalation voltage filtering
         framework_comparison.py # Stage 4: cross-element framework comparison
         statistics.py          # Stage 5: aggregate statistics and figures
+
+    mp_snapshot/               # Offline MP backend for reproducing frozen releases
+        download.py            # AWS OpenData S3 puller (threaded, ~1.14 GB for 2025-06-09)
+        loader.py              # Indexed reader over gz-JSONL shards
+        pourbaix.py            # Offline get_pourbaix_entries via MP's documented algorithm
+        client.py              # SnapshotMPRester — strict drop-in for MPRester
 
 scripts/                       # CLI wrappers and HPC submission templates
     run_seawater_screening.py  # CLI for Stage 2 (supports multiprocessing)
@@ -210,6 +222,10 @@ python scripts/run_seawater_screening.py Ca input.xlsx -o output.xlsx -n 8
 # Stage 3: intercalation voltage screening
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/
 
+# Stage 3 with per-plateau pH-overlap PDFs, without component graphs
+python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ \
+    --save-plots --no-component-graphs
+
 # Stage 4: framework comparison (graph-based by default)
 python scripts/run_framework_comparison.py Ca --stage3-dir ./intercalation_results/
 
@@ -230,9 +246,70 @@ conda activate MP_api_2026
 pytest tests/ -v
 ```
 
+## Reproducing earlier results against a frozen MP release
+
+The live Materials Project database updates continuously. To reproduce results from an earlier iteration (e.g. a submitted paper), SPICES ships an offline backend that serves queries from a bulk snapshot of a specific MP release on AWS OpenData (`s3://materialsproject-build/collections/<release>/`). The MP API itself does **not** support pinning to a historical database version, so the bulk snapshot is the only route.
+
+### One-time setup
+
+```bash
+export MP_API_KEY=your_key_here
+
+# ~1.14 GB; threaded, takes a few minutes. Default release: 2025-06-09.
+python -m spices.mp_snapshot.download /path/to/MP_snapshots
+
+# List every release published on the public bucket
+python -m spices.mp_snapshot.download --list-releases
+
+# Pin to an older release (e.g. to reproduce a run that predates 2025-06-09)
+python -m spices.mp_snapshot.download /path/to/MP_snapshots --release 2024-11-14
+```
+
+This downloads the `summary/`, `thermo/thermo_type=GGA_GGA+U/`, `thermo/thermo_type=GGA_GGA+U_R2SCAN/`, and `materials/` collections, freezes the MPContribs `ion_ref_data` project (needed for offline Pourbaix rebuild), and writes a `manifest.json` with provenance.
+
+The `--release` value is validated against the public bucket before any download begins — a typo exits immediately with a `ValueError` listing the valid releases, rather than silently writing an empty snapshot. If a chosen older release does not publish one of the required prefixes (e.g. `GGA_GGA+U_R2SCAN` is absent on early releases), `download_collection` logs a warning and returns instead of failing the whole run.
+
+### Using the snapshot backend
+
+Point SPICES at the snapshot either via the `get_client` kwargs or via environment variables — downstream pipeline code is unchanged because every SPICES function takes `mp_client` as a parameter.
+
+```python
+from spices.mp_client import get_client
+
+mp = get_client(
+    backend="snapshot",
+    snapshot_root="/path/to/MP_snapshots",
+    release="2025-06-09",
+)
+# or: export SPICES_MP_BACKEND=snapshot SPICES_MP_SNAPSHOT_ROOT=/path/to/MP_snapshots
+```
+
+`SnapshotMPRester` is **strict**: unsupported methods, unsupported thermo types (e.g. pure `R2SCAN`), and any network attempt raise `SnapshotBackendError` — preventing silent fallback that would mix data from two database eras in one run.
+
+The default `materials.thermo.search(...)` call (with `thermo_types=None`) returns **every** `(mp-id, thermo_type)` doc the snapshot ships, matching the current live `mp_api` behavior: an mp-id with both `GGA_GGA+U` and `GGA_GGA+U_R2SCAN` hulls produces two docs. SPICES' own dedup in `screening/mp_query.py` collapses these to one row per mp-id based on `(Base XC, Correction XC)`, so downstream step0 output is still one row per mp-id.
+
+### Reusing earlier Pourbaix caches
+
+The disk-backed `PourbaixCache` works identically with either backend. To pick up entries pickled during an earlier iteration, point it at the old cache dirs:
+
+```python
+from spices.pourbaix.cache import PourbaixCache
+
+cache = PourbaixCache(
+    entries_dir="/path/to/prior_iteration/saved_pbx_entries",
+    pbx_dir="/path/to/prior_iteration/saved_pbx",
+)
+```
+
+New chemsys queries (e.g. after adding anions like Si or C to `DEFAULT_ANIONS`) cache-miss and are rebuilt offline through `spices.mp_snapshot.pourbaix.build_pourbaix_entries`, then written to the cache alongside the existing pickles.
+
+### Caveat: ion_ref_data freeze date
+
+The MPContribs `ion_ref_data` project is not versioned alongside the bulk S3 dumps — it is a single live document. `download.py` freezes it at download time and records that date in `manifest.json`. In practice aqueous ion thermodynamics are empirical and rarely revised, but peer reviewers should be told the freeze date. If MPContribs was updated since the target release, offline Pourbaix results will differ slightly from live results on the same release.
+
 ## Data
 
-Cached Pourbaix diagram data files (pickle format, ~1.3 GB per stage) are archived on Zenodo for reproducibility. They are excluded from the git repository via `.gitignore`. To use existing caches, point the `PourbaixCache` to the directory containing your `saved_pbx/` and `saved_pbx_entries/` folders.
+Cached Pourbaix diagram data files (pickle format, ~1.3 GB per stage) are archived on Zenodo for reproducibility. They are excluded from the git repository via `.gitignore`. To use existing caches, point the `PourbaixCache` to the directory containing your `saved_pbx/` and `saved_pbx_entries/` folders (see the snapshot section above for the `backend="snapshot"` workflow).
 
 ## License
 

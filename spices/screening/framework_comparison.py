@@ -48,8 +48,7 @@ ION_COLORS = {
 class FrameworkStructure:
     """
     Structure wrapper that identifies a framework by removing the working
-    ion.  Hashable by reduced formula, equal by structural match using
-    ``StructureMatcher(attempt_supercell=True)``.
+    ion.  Hashable by ``mp_id``; equality falls back to Python identity.
 
     Parameters
     ----------
@@ -57,10 +56,10 @@ class FrameworkStructure:
     struct : Structure
     working_ion : str or Element
     is_expt : bool
-        Whether the structure is experimental.
+        Whether the structure is experimental.  Required.
     """
 
-    def __init__(self, mp_id, struct, working_ion, is_expt=False):
+    def __init__(self, mp_id, struct, working_ion, is_expt):
         self.mp_id = mp_id
         self.struct = struct.copy()
         self.struct_reduced_formula = struct.composition.reduced_formula
@@ -80,14 +79,7 @@ class FrameworkStructure:
         self.framework_reduced_formula = framework.composition.reduced_formula
 
     def __hash__(self):
-        return hash(self.framework_reduced_formula)
-
-    def __eq__(self, other):
-        if not isinstance(other, FrameworkStructure):
-            return NotImplemented
-        return DEFAULT_MATCHER.fit(
-            self.framework_struct, other.framework_struct,
-        )
+        return hash(self.mp_id)
 
     def __repr__(self):
         return (
@@ -103,19 +95,16 @@ class FrameworkStructure:
 # ====================================================================
 
 
-def collect_framework(mp_id, struct_dir, working_ion, is_expt=False):
-    """Load a CIF file as a ``FrameworkStructure``."""
+def collect_framework(mp_id, struct_dir, working_ion, is_expt):
+    """Load a CIF file as a ``FrameworkStructure``.
+
+    Only the exact ``{mp_id}.cif`` filename is accepted.  Substring
+    matching is rejected because mp-ids can share prefixes (e.g.
+    ``mp-123`` vs ``mp-1234``).
+    """
     cif_path = os.path.join(struct_dir, f"{mp_id}.cif")
     if not os.path.exists(cif_path):
-        # Search directory for partial match
-        for fname in os.listdir(struct_dir):
-            if mp_id in fname:
-                cif_path = os.path.join(struct_dir, fname)
-                break
-        else:
-            raise FileNotFoundError(
-                f"{mp_id}.cif not found in {struct_dir}"
-            )
+        raise FileNotFoundError(f"{mp_id}.cif not found in {struct_dir}")
 
     return FrameworkStructure(
         mp_id=mp_id,
@@ -132,37 +121,45 @@ def load_charged_frameworks(
     """
     Build a set of ``FrameworkStructure`` objects from charged-phase
     MP IDs in a voltage plateau Excel file.
+
+    The ``{mp_id}.cif`` is first looked up in ``discharged_struct_dir``
+    and, if absent, in ``{charged_struct_dir}/{Charged Formula}/``.
+    Missing structures raise ``FileNotFoundError`` rather than being
+    silently skipped.
     """
     df = pd.read_excel(excel_path, sheet_name=sheet_name)
-    charged_mpids = df["Charged MP id"].unique()
+    if "Charged Is experimental" not in df.columns:
+        raise KeyError(
+            f"'Charged Is experimental' column missing in {excel_path}",
+        )
 
-    discharged_files = (
-        os.listdir(discharged_struct_dir)
-        if os.path.exists(discharged_struct_dir) else []
-    )
+    charged_mpids = df["Charged MP id"].unique()
 
     frameworks = set()
     for mpid in charged_mpids:
-        is_expt = False
-        if "Charged Is experimental" in df.columns:
-            vals = df[df["Charged MP id"] == mpid]["Charged Is experimental"].unique()
-            if len(vals) == 1:
-                is_expt = bool(vals[0])
+        vals = df[df["Charged MP id"] == mpid][
+            "Charged Is experimental"
+        ].unique()
+        if len(vals) != 1:
+            raise ValueError(
+                f"{mpid} has {len(vals)} distinct is_expt values",
+            )
+        is_expt = bool(vals[0])
 
-        # Try discharged struct dir first
-        if any(mpid in f for f in discharged_files):
+        discharged_cif = os.path.join(
+            discharged_struct_dir, f"{mpid}.cif",
+        )
+        if os.path.exists(discharged_cif):
             fw = collect_framework(
                 mpid, discharged_struct_dir, working_ion, is_expt,
             )
             frameworks.add(fw)
             continue
 
-        # Fall back to formula-named subdirectory in charged struct dir
         formula = df[df["Charged MP id"] == mpid].iloc[0]["Charged Formula"]
         subdir = os.path.join(charged_struct_dir, formula)
-        if os.path.exists(subdir):
-            fw = collect_framework(mpid, subdir, working_ion, is_expt)
-            frameworks.add(fw)
+        fw = collect_framework(mpid, subdir, working_ion, is_expt)
+        frameworks.add(fw)
 
     logger.info(
         "Loaded %d distinct charged frameworks from %d MP IDs",
@@ -325,6 +322,7 @@ def build_adjacency_dict(all_frameworks, matcher=None):
             if matcher.fit(
                 all_frameworks[i].framework_struct,
                 all_frameworks[j].framework_struct,
+                symmetric=True,
             ):
                 adjacency[i].append(j)
                 adjacency[j].append(i)
@@ -453,7 +451,13 @@ def classify_edges(G, df_dict, pH_filter=(7, 8.5),
             pH_range = ast.literal_eval(str(pH_str))
             pH_min, pH_max = pH_range
 
-            if round(pH_max - pH_min, 1) == req_pH_range:
+            # Require full coverage of [pH_filter[0], pH_filter[1]]:
+            # range fully inside the window AND width equal to the span.
+            inside_window = (
+                pH_min >= pH_filter[0] and pH_max <= pH_filter[1]
+            )
+            full_width = round(pH_max - pH_min, 1) == req_pH_range
+            if inside_window and full_width:
                 pH_filtered.append((u, v))
                 remaining_same.remove((u, v))
 
@@ -484,6 +488,73 @@ def classify_edges(G, df_dict, pH_filter=(7, 8.5),
     }
 
 
+def _draw_nodes_and_labels(G, pos):
+    """Draw nodes (expt hex / theoretical circle, ion-colored), labels,
+    and the two shared legends (working-ion color, phase shape).
+
+    Shared between the stage-4 graph renderer and the step3 component
+    plotter.  Returns the current Axes.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.lines import Line2D
+    import networkx as nx
+
+    expt_nodes = [n for n in G.nodes if n.is_expt]
+    non_expt_nodes = [n for n in G.nodes if not n.is_expt]
+
+    expt_colors = [
+        ION_COLORS.get(n.working_ion.symbol, "gray")
+        for n in expt_nodes
+    ]
+    non_expt_colors = [
+        ION_COLORS.get(n.working_ion.symbol, "gray")
+        for n in non_expt_nodes
+    ]
+
+    nx.draw_networkx_nodes(
+        G, pos, nodelist=expt_nodes, node_size=2000,
+        node_color=expt_colors, node_shape="H",
+    )
+    nx.draw_networkx_nodes(
+        G, pos, nodelist=non_expt_nodes, node_size=2000,
+        node_color=non_expt_colors, node_shape="o",
+    )
+
+    labels = {
+        n: f"{formula_to_mathtext(n.struct_reduced_formula)}\n{n.mp_id}"
+        for n in G.nodes
+    }
+    nx.draw_networkx_labels(G, pos, labels=labels, font_size=6)
+
+    ax = plt.gca()
+    ion_handles = [
+        mpatches.Patch(color=c, label=ion)
+        for ion, c in ION_COLORS.items()
+    ]
+    leg1 = ax.legend(
+        handles=ion_handles, title="Working Ion",
+        loc="upper left", bbox_to_anchor=(1.01, 1.02), frameon=True,
+    )
+    ax.add_artist(leg1)
+
+    ms = (2000 ** 0.5) * 0.3
+    shape_handles = [
+        Line2D([0], [0], marker="H", linestyle="None",
+               fillstyle="none", markeredgecolor="black",
+               markersize=ms, label="Experimental"),
+        Line2D([0], [0], marker="o", linestyle="None",
+               fillstyle="none", markeredgecolor="black",
+               markersize=ms, label="Theoretical"),
+    ]
+    leg2 = ax.legend(
+        handles=shape_handles, title="Phase type",
+        loc="upper left", bbox_to_anchor=(1.01, 0.61), frameon=True,
+    )
+    ax.add_artist(leg2)
+    return ax
+
+
 def save_graph_figures(
     graphs, all_frameworks, df_dict,
     save_dir="./All_graphs",
@@ -493,7 +564,6 @@ def save_graph_figures(
 ):
     """Render and save graph PNGs organized by number of ions."""
     import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
     from matplotlib.lines import Line2D
     import networkx as nx
 
@@ -502,39 +572,13 @@ def save_graph_figures(
     for idx, G in enumerate(graphs):
         pos = nx.spring_layout(G)
 
-        expt_nodes = [n for n in G.nodes if n.is_expt]
-        non_expt_nodes = [n for n in G.nodes if not n.is_expt]
-
         framework_formulae = {
             n.framework_reduced_formula for n in G.nodes
         }
         framework_formula = list(framework_formulae)[0]
 
-        expt_colors = [
-            ION_COLORS.get(n.working_ion.symbol, "gray")
-            for n in expt_nodes
-        ]
-        non_expt_colors = [
-            ION_COLORS.get(n.working_ion.symbol, "gray")
-            for n in non_expt_nodes
-        ]
-
         plt.figure(figsize=(10, 8))
-
-        nx.draw_networkx_nodes(
-            G, pos, nodelist=expt_nodes, node_size=2000,
-            node_color=expt_colors, node_shape="H",
-        )
-        nx.draw_networkx_nodes(
-            G, pos, nodelist=non_expt_nodes, node_size=2000,
-            node_color=non_expt_colors, node_shape="o",
-        )
-
-        labels = {
-            n: f"{formula_to_mathtext(n.struct_reduced_formula)}\n{n.mp_id}"
-            for n in G.nodes
-        }
-        nx.draw_networkx_labels(G, pos, labels=labels, font_size=6)
+        ax = _draw_nodes_and_labels(G, pos)
 
         # Classify and draw edges
         edge_groups = classify_edges(
@@ -561,33 +605,6 @@ def save_graph_figures(
             G, pos, edgelist=edge_groups["pH_area_filtered"],
             edge_color="tab:blue", width=1.5, style="solid", alpha=1,
         )
-
-        # Legends
-        ax = plt.gca()
-        ion_handles = [
-            mpatches.Patch(color=c, label=ion)
-            for ion, c in ION_COLORS.items()
-        ]
-        leg1 = ax.legend(
-            handles=ion_handles, title="Working Ion",
-            loc="upper left", bbox_to_anchor=(1.01, 1.02), frameon=True,
-        )
-        ax.add_artist(leg1)
-
-        ms = (2000 ** 0.5) * 0.3
-        shape_handles = [
-            Line2D([0], [0], marker="H", linestyle="None",
-                   fillstyle="none", markeredgecolor="black",
-                   markersize=ms, label="Experimental"),
-            Line2D([0], [0], marker="o", linestyle="None",
-                   fillstyle="none", markeredgecolor="black",
-                   markersize=ms, label="Theoretical"),
-        ]
-        leg2 = ax.legend(
-            handles=shape_handles, title="Phase type",
-            loc="upper left", bbox_to_anchor=(1.01, 0.61), frameon=True,
-        )
-        ax.add_artist(leg2)
 
         edge_handles = [
             Line2D([0], [0], color="tab:gray", alpha=0.4, lw=1.5,
@@ -661,7 +678,10 @@ def filter_plateaus_by_pH_and_area(
             if isinstance(val, str):
                 val = ast.literal_eval(val)
             if isinstance(val, (list, tuple)) and len(val) == 2:
-                if round(val[1] - val[0], 1) != req_pH_width:
+                pH_min, pH_max = val
+                inside = pH_min >= pH_range[0] and pH_max <= pH_range[1]
+                full_width = round(pH_max - pH_min, 1) == req_pH_width
+                if not (inside and full_width):
                     return False
             else:
                 return False

@@ -217,6 +217,19 @@ def collect_mp_data_from_chemsys(
             continue
 
         # Handle duplicate entries (same mp_id, different XC)
+        # TODO: Dedup key is (Base XC, Correction XC) only — Thermo-type
+        # is intentionally NOT part of the key. When OLD (3rd_Iteration
+        # live, Mar 2025 MP release) and NEW (snapshot, MP 2025-06-09)
+        # step0 Excel files were diffed, ~6700 common mp-ids showed a
+        # flipped Thermo-type label but identical Base/Correction XC,
+        # almost certainly because MP changed the order in which it
+        # emits per-mp-id thermo_type docs between releases, so the
+        # "first-wins" pick here landed on a different label. The XC
+        # identification itself was stable. If a future run shows
+        # anomalous Base/Correction XC labels (not just Thermo-type),
+        # revisit this block — candidate tighteners: include Thermo-type
+        # in the key, or pick the R2SCAN-mixed doc explicitly rather
+        # than relying on arrival order.
         if remove_uncorrected_duplicates:
             req_index = -1
             for idx, existing in enumerate(return_list):
