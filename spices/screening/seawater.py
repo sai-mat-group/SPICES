@@ -65,7 +65,7 @@ def run_seawater_screening(
     retry_delay=10.0,
     n_workers=1,
     restart=False,
-    api_key=None,
+    mp_client=None,
 ):
     """
     Run the seawater stability screening for a single working ion.
@@ -118,13 +118,70 @@ def run_seawater_screening(
         checkpoint files from ``runtime_sheets/`` and any backup
         from a prior restart.  ``n_workers`` may differ from the
         original run.
-    api_key : str or None
-        Materials Project API key.
+    mp_client : MPRester or SnapshotMPRester or None
+        Materials Project client.  If None, resolved via
+        :func:`spices.mp_client.get_client` (sticky-default cache,
+        ``SPICES_MP_BACKEND``/``MP_API_KEY`` env vars, or live default).
+        See **Multiprocessing and backend resolution** below for the
+        ``n_workers > 1`` case.
 
     Returns
     -------
     pd.DataFrame
         Screening results with seawater columns added.
+
+    Notes
+    -----
+    **Multiprocessing and backend resolution**
+
+    The ``mp_client`` argument is honored *only* when ``n_workers == 1``
+    (single-process run).  When ``n_workers > 1``, work is dispatched to
+    a :class:`multiprocessing.Pool`; each worker is a separate Python
+    interpreter that does **not** share the parent's
+    :data:`spices.mp_client._last_client` cache.  Pickling a live
+    ``MPRester`` (HTTP session state) or a :class:`SnapshotMPRester`
+    (in-memory pickle indexes) across the process boundary is fragile,
+    so workers re-resolve their own client by calling
+    :func:`spices.mp_client.get_client` with no arguments.
+
+    Each worker therefore relies on **environment variables inherited
+    from the parent process** (Linux ``fork`` start method copies the
+    parent's ``os.environ``) to choose a backend:
+
+    * ``SPICES_MP_BACKEND`` — ``"snapshot"`` or ``"live"``
+      (default ``"live"``).
+    * ``SPICES_MP_SNAPSHOT_ROOT`` — path to the local snapshot tree
+      (snapshot backend only).
+    * ``SPICES_MP_SNAPSHOT_RELEASE`` — release label, e.g.
+      ``"2025-06-09"`` (snapshot backend only).
+    * ``MP_API_KEY`` — Materials Project API key (live backend only).
+
+    Concrete recipes:
+
+    * Snapshot multi-worker run::
+
+          export SPICES_MP_BACKEND=snapshot
+          export SPICES_MP_SNAPSHOT_ROOT=/path/to/MP_snapshots
+          export SPICES_MP_SNAPSHOT_RELEASE=2025-06-09
+          # then in Python:
+          run_seawater_screening(..., n_workers=8)
+
+      Passing ``mp_client=`` is also accepted (used for the parent's
+      pre-Pool work) but the env vars above are still required for
+      the workers.
+
+    * Live multi-worker run::
+
+          export MP_API_KEY=...
+          run_seawater_screening(..., n_workers=8)
+
+    Common pitfall: if you only pass ``mp_client=snapshot_client`` and
+    do *not* set ``SPICES_MP_BACKEND=snapshot`` in the environment,
+    workers silently fall back to the live backend and start hitting
+    ``api.materialsproject.org``.  The parent uses your snapshot
+    client, but every worker uses a live ``MPRester`` — and
+    inconsistent backends across workers will scramble downstream
+    results.
     """
 
     if decomp_energy is None:
@@ -215,11 +272,18 @@ def run_seawater_screening(
         for col in SEAWATER_COLUMNS:
             df[col] = None
 
+    # Resolve the parent's client up front so backend errors surface
+    # here rather than deep inside a worker process.  Workers in
+    # multi-worker mode rebuild their own clients from inherited env
+    # vars (see the docstring's "Multiprocessing and backend
+    # resolution" section).
+    if mp_client is None:
+        mp_client = get_client()
+
     # Common keyword args for the worker function
     worker_kwargs = dict(
         element=element,
         cache_dir=cache_dir,
-        api_key=api_key,
         output_dir=output_dir,
         OER_shift=OER_shift,
         HER_shift=HER_shift,
@@ -371,7 +435,6 @@ def _process_chunk(
     chunk_id,
     element,
     cache_dir,
-    api_key,
     output_dir,
     OER_shift,
     HER_shift,
@@ -389,9 +452,12 @@ def _process_chunk(
     """
     Process a DataFrame chunk for seawater screening.
 
-    Each worker creates its own ``PourbaixCache`` and ``MPRester``
-    to avoid shared state across processes.  Progress is logged to
-    a per-worker log file and checkpointed periodically.
+    Each worker creates its own ``PourbaixCache`` and MP client to
+    avoid shared state across processes.  The MP client is rebuilt
+    from environment variables inherited from the parent process —
+    see the ``run_seawater_screening`` docstring's "Multiprocessing
+    and backend resolution" section.  Progress is logged to a
+    per-worker log file and checkpointed periodically.
 
     Parameters
     ----------
@@ -400,7 +466,6 @@ def _process_chunk(
         Worker index (used in filenames and log messages).
     element : str
     cache_dir : str
-    api_key : str or None
     output_dir : str
     OER_shift, HER_shift : float
     pH_range, voltage_range : tuple of float
@@ -430,8 +495,10 @@ def _process_chunk(
     worker_logger.addHandler(file_handler)
     worker_logger.setLevel(logging.INFO)
 
-    # Each worker gets its own client and cache
-    mp_client = get_client(api_key)
+    # Each worker gets its own client and cache.  The no-arg
+    # get_client() resolves the backend from env vars inherited from
+    # the parent process — see run_seawater_screening's docstring.
+    mp_client = get_client()
     cache = PourbaixCache(
         entries_dir=f"{cache_dir}/saved_pbx_entries",
         pbx_dir=f"{cache_dir}/saved_pbx",

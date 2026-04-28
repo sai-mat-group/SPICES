@@ -912,7 +912,7 @@ def run_intercalation_screening(
     save_plots=False,
     save_component_graphs=True,
     cache_dir=".",
-    api_key=None,
+    mp_client=None,
 ):
     """
     Run the full intercalation voltage screening pipeline (Steps 1-4).
@@ -939,7 +939,10 @@ def run_intercalation_screening(
         ``Voltage_plateau_data/{framework}/graphs/``.
     cache_dir : str
         Directory for Pourbaix caches.
-    api_key : str or None
+    mp_client : MPRester or SnapshotMPRester or None
+        Materials Project client.  If None, resolved via
+        :func:`spices.mp_client.get_client` (sticky-default cache,
+        ``SPICES_MP_BACKEND``/``MP_API_KEY`` env vars, or live default).
 
     Returns
     -------
@@ -957,7 +960,8 @@ def run_intercalation_screening(
     working_ion_valency = params["valency"]
     working_ion_voltage_vs_SHE = params["voltage_vs_SHE"]
 
-    mp_client = get_client(api_key)
+    if mp_client is None:
+        mp_client = get_client()
     cache = PourbaixCache(
         entries_dir=os.path.join(cache_dir, "saved_pbx_entries"),
         pbx_dir=os.path.join(cache_dir, "saved_pbx"),

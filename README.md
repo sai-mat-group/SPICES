@@ -45,13 +45,13 @@ echo "MP_API_KEY=your_key_here" > .env
 ## Quick Start
 
 ```python
-from spices.mp_client import set_api_key
 from spices.screening.mp_query import run_mp_query
 from spices.screening.dilute_water import run_dilute_water_evaluation
 from spices.screening.seawater import run_seawater_screening
 
-# Set your API key
-set_api_key("your_api_key_here")
+# API key is read from MP_API_KEY (env var or .env file).  Each
+# pipeline entry point also accepts an explicit mp_client= built via
+# spices.mp_client.get_client() — see "Snapshot backend" below.
 
 # Stage 0: Query Materials Project data (mandatory)
 df_mp = run_mp_query(
@@ -280,16 +280,28 @@ Point SPICES at the snapshot either via the `get_client` kwargs or via environme
 
 ```python
 from spices.mp_client import get_client
+from spices.screening.mp_query import run_mp_query
 
 mp = get_client(
     backend="snapshot",
     snapshot_root="/path/to/MP_snapshots",
     release="2025-06-09",
 )
-# or: export SPICES_MP_BACKEND=snapshot SPICES_MP_SNAPSHOT_ROOT=/path/to/MP_snapshots
+df_step0 = run_mp_query(element="Ca", mp_client=mp)
+
+# or, equivalently, drop the mp_client= kwarg and let the inner
+# get_client() pick up the snapshot client via the sticky-default cache:
+run_mp_query(element="Ca")
+
+# or set env vars and skip the explicit get_client() call entirely:
+#   export SPICES_MP_BACKEND=snapshot
+#   export SPICES_MP_SNAPSHOT_ROOT=/path/to/MP_snapshots
+#   export SPICES_MP_SNAPSHOT_RELEASE=2025-06-09
 ```
 
 `SnapshotMPRester` is **strict**: unsupported methods, unsupported thermo types (anything other than `GGA_GGA+U` — including `GGA_GGA+U_R2SCAN` and pure `R2SCAN`), and any network attempt raise `SnapshotBackendError` — preventing silent fallback that would mix data from two database eras in one run.
+
+**Snapshot + multiprocessing** (`run_seawater_screening` with `n_workers > 1`): worker processes do not inherit the parent's sticky-default cache, so the snapshot env vars (`SPICES_MP_BACKEND`, `SPICES_MP_SNAPSHOT_ROOT`, `SPICES_MP_SNAPSHOT_RELEASE`) **must** be exported before launching the run. Passing `mp_client=` alone is not enough — see the `run_seawater_screening` docstring for the full recipe.
 
 The default `materials.thermo.search(...)` call returns one doc per mp-id under `thermo_type=GGA_GGA+U`. SPICES' upstream filter (`thermo_types=[THERMO_TYPE]`) and the snapshot loader's single-subroot indexing keep R2SCAN-corrected energies out of the entry stream entirely, so step-0 output is one row per mp-id with a single `XC Functional` value (`"GGA"` or `"GGA+U"`).
 

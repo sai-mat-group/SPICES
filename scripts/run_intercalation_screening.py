@@ -14,6 +14,7 @@ Usage examples:
 
 import argparse
 
+from spices.mp_client import get_client
 from spices.screening.intercalation import run_intercalation_screening
 from spices.io import setup_logging
 
@@ -86,6 +87,10 @@ def main():
 
     criteria = [int(x) for x in args.selection_criteria.split(",")]
 
+    mp_client = (
+        get_client(api_key=args.api_key) if args.api_key else get_client()
+    )
+
     combined = run_intercalation_screening(
         element=args.element,
         input_path=args.input_path,
@@ -95,7 +100,7 @@ def main():
         save_plots=args.save_plots,
         save_component_graphs=args.save_component_graphs,
         cache_dir=args.cache_dir,
-        api_key=args.api_key,
+        mp_client=mp_client,
     )
 
     total_plateaus = sum(

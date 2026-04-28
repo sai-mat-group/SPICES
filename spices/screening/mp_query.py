@@ -218,7 +218,7 @@ def run_mp_query(
     save_interval=1000,
     max_retries=500,
     retry_delay=10.0,
-    api_key=None,
+    mp_client=None,
 ):
     """
     Run the Materials Project data query for a single working ion element.
@@ -249,8 +249,10 @@ def run_mp_query(
         Maximum retries per chemsys on API failure.
     retry_delay : float
         Seconds to wait between retries.
-    api_key : str or None
-        Materials Project API key.
+    mp_client : MPRester or SnapshotMPRester or None
+        Materials Project client.  If None, resolved via
+        :func:`spices.mp_client.get_client` (sticky-default cache,
+        ``SPICES_MP_BACKEND``/``MP_API_KEY`` env vars, or live default).
 
     Returns
     -------
@@ -264,7 +266,8 @@ def run_mp_query(
     if output_path is None:
         output_path = f"{element}_cathodes_mp_data.xlsx"
 
-    mp_client = get_client(api_key)
+    if mp_client is None:
+        mp_client = get_client()
 
     # Generate all chemical system combinations
     chemsys_list = []

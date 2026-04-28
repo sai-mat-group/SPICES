@@ -27,7 +27,10 @@ _clients: dict = {}
 # Most recently created/returned client.  Used as a sticky default so a
 # top-level ``get_client(backend="snapshot", ...)`` call is picked up by
 # inner no-arg ``get_client()`` calls inside pipeline entry points like
-# ``run_mp_query`` — matches the pre-snapshot ``_default_client`` pattern.
+# ``run_mp_query``.  Reuse is decided purely from the call args — env
+# vars are only consulted when building a fresh client, never to
+# disable cache reuse (otherwise an exported ``MP_API_KEY`` silently
+# overrides a user's explicit snapshot choice).
 _last_client = None
 
 
@@ -79,13 +82,12 @@ def get_client(
     """
     # Sticky-default fast path: truly no-arg inner calls (e.g. from
     # ``run_mp_query``) pick up whatever client was last created at
-    # module/top level.  Only fires when nothing explicit is asked for —
-    # any arg, any env var, or no prior client disables the shortcut and
-    # we fall through to the usual resolution.
+    # module/top level.  Any explicit arg disables the shortcut and we
+    # fall through to the usual resolution; env vars are intentionally
+    # not part of the guard, since they only feed *resolution* of a
+    # fresh client, not the *cache-reuse* decision.
     if (api_key is None and backend is None
             and snapshot_root is None and release is None
-            and "SPICES_MP_BACKEND" not in os.environ
-            and "MP_API_KEY" not in os.environ
             and _last_client is not None):
         return _last_client
 
@@ -153,12 +155,3 @@ def _get_snapshot_client(snapshot_root, release):
     return _clients[key]
 
 
-def set_api_key(api_key):
-    """
-    Set (or replace) the default API key for this session.
-
-    Only affects the live backend.  Snapshot instances cached for other
-    backends are untouched.
-    """
-    os.environ["MP_API_KEY"] = api_key
-    _clients[("live", api_key)] = MPRester(api_key)

@@ -18,6 +18,7 @@ Usage examples:
 import argparse
 import sys
 
+from spices.mp_client import get_client
 from spices.screening.seawater import run_seawater_screening
 from spices.io import setup_logging
 
@@ -84,12 +85,21 @@ def main():
     parser.add_argument(
         "--api-key",
         default=None,
-        help="Materials Project API key (default: from MP_API_KEY env var)",
+        help=(
+            "Materials Project API key (default: from MP_API_KEY env var). "
+            "Used to build the parent's mp_client; with -n > 1, workers "
+            "still resolve their backend from env vars (SPICES_MP_BACKEND, "
+            "SPICES_MP_SNAPSHOT_ROOT, SPICES_MP_SNAPSHOT_RELEASE, MP_API_KEY)"
+        ),
     )
 
     args = parser.parse_args()
 
     setup_logging()
+
+    mp_client = (
+        get_client(api_key=args.api_key) if args.api_key else get_client()
+    )
 
     df = run_seawater_screening(
         element=args.element,
@@ -101,7 +111,7 @@ def main():
         save_interval=args.save_interval,
         max_retries=args.max_retries,
         metastability_points=args.metastability_points,
-        api_key=args.api_key,
+        mp_client=mp_client,
     )
 
     print(f"Done. {len(df)} materials processed.")

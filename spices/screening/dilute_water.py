@@ -42,7 +42,7 @@ def run_dilute_water_evaluation(
     save_interval=1000,
     max_retries=500,
     retry_delay=10.0,
-    api_key=None,
+    mp_client=None,
 ):
     """
     Evaluate dilute-water stability for materials in a Stage 0 dataset.
@@ -70,8 +70,10 @@ def run_dilute_water_evaluation(
         Maximum retries per row on API failure.
     retry_delay : float
         Seconds to wait between retries.
-    api_key : str or None
-        Materials Project API key.
+    mp_client : MPRester or SnapshotMPRester or None
+        Materials Project client.  If None, resolved via
+        :func:`spices.mp_client.get_client` (sticky-default cache,
+        ``SPICES_MP_BACKEND``/``MP_API_KEY`` env vars, or live default).
 
     Returns
     -------
@@ -86,7 +88,8 @@ def run_dilute_water_evaluation(
     else:
         df = input_data.copy()
 
-    mp_client = get_client(api_key)
+    if mp_client is None:
+        mp_client = get_client()
     cache = PourbaixCache(
         entries_dir=f"{cache_dir}/saved_pbx_entries",
         pbx_dir=f"{cache_dir}/saved_pbx",
