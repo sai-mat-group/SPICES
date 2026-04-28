@@ -52,16 +52,23 @@ def test_snapshot_imports_and_attributes(snapshot_client):
 
 def test_snapshot_thermo_unsupported_type_raises(snapshot_client):
     from spices.mp_snapshot.client import SnapshotBackendError
-    # R2SCAN-only hull is not shipped.
+    # SPICES restricts the snapshot to GGA_GGA+U only (parity with the
+    # live MP API's hardcoded Pourbaix thermo_type).  R2SCAN-only and
+    # GGA_GGA+U_R2SCAN must both be rejected.
     with pytest.raises(SnapshotBackendError):
         snapshot_client.materials.thermo.search(
             chemsys="Li-O",
             thermo_types=["R2SCAN"],
         )
-    # GGA_GGA+U_R2SCAN IS shipped — must not raise.
+    with pytest.raises(SnapshotBackendError):
+        snapshot_client.materials.thermo.search(
+            chemsys="Li-O",
+            thermo_types=["GGA_GGA+U_R2SCAN"],
+        )
+    # GGA_GGA+U IS shipped — must not raise.
     snapshot_client.materials.thermo.search(
         chemsys="Li-O",
-        thermo_types=["GGA_GGA+U_R2SCAN"],
+        thermo_types=["GGA_GGA+U"],
     )
 
 
@@ -72,7 +79,7 @@ def test_snapshot_thermo_returns_docs(snapshot_client):
     # Shape SPICES depends on:
     assert d0.material_id.string.startswith("mp-")
     assert d0.formula_pretty  # non-empty
-    assert d0.thermo_type.value in {"GGA_GGA+U", "GGA_GGA+U_R2SCAN"}
+    assert d0.thermo_type.value == "GGA_GGA+U"
     assert d0.symmetry is not None
     assert d0.symmetry.crystal_system.value  # e.g. "Cubic"
     assert d0.symmetry.symbol  # space group symbol
@@ -84,46 +91,28 @@ def test_snapshot_thermo_returns_docs(snapshot_client):
         assert "description" in a.as_dict()
 
 
-def test_snapshot_thermo_returns_both_thermo_types(snapshot_client):
-    """Li-Ti-O has many mp-ids with both GGA_GGA+U and GGA_GGA+U_R2SCAN hulls.
+def test_snapshot_thermo_returns_only_gga_gga_u(snapshot_client):
+    """SPICES restricts the snapshot to thermo_type=GGA_GGA+U.
 
-    Default search (thermo_types=None) matches live mp_api: it returns
-    every (mp-id, thermo_type) doc the loader has, so mp-ids with both
-    hulls produce two docs. The explicit dual-type call must return an
-    equivalent doc set.
+    The default search must return only that thermo_type, regardless of
+    whether the GGA_GGA+U_R2SCAN subroot still exists on disk from a
+    previous download — the loader's COLLECTIONS dict no longer indexes
+    the R2SCAN subroot.
     """
-    r2_prefix = os.path.join(
-        SNAPSHOT_ROOT, RELEASE, "thermo", "thermo_type=GGA_GGA+U_R2SCAN"
-    )
-    if not os.path.isdir(r2_prefix):
-        pytest.skip(
-            "R2SCAN-mixed thermo prefix not downloaded; rerun "
-            "`python -m spices.mp_snapshot.download <root>` to enable."
-        )
-    default_docs = snapshot_client.materials.thermo.search(chemsys="Li-Ti-O")
-    default_pairs = {(d.material_id.string, d.thermo_type.value) for d in default_docs}
-
-    # At least one mp-id must carry both hulls — this is the invariant
-    # that the default call previously collapsed (Fix 4) and now preserves.
-    per_mid_ttypes = {}
-    for mid, tt in default_pairs:
-        per_mid_ttypes.setdefault(mid, set()).add(tt)
-    mids_with_both = [
-        m for m, tts in per_mid_ttypes.items()
-        if tts == {"GGA_GGA+U", "GGA_GGA+U_R2SCAN"}
-    ]
-    assert mids_with_both, (
-        "Expected at least one Li-Ti-O mp-id with both GGA_GGA+U and "
-        "GGA_GGA+U_R2SCAN docs in the default call."
+    docs = snapshot_client.materials.thermo.search(chemsys="Li-Ti-O")
+    thermo_types_seen = {d.thermo_type.value for d in docs}
+    assert thermo_types_seen == {"GGA_GGA+U"}, (
+        f"Expected only GGA_GGA+U thermo_type, got {sorted(thermo_types_seen)}"
     )
 
-    # Explicit dual-type call must yield the same (mid, thermo_type) pairs.
-    both_docs = snapshot_client.materials.thermo.search(
+    # Explicit single-type call must yield the same set of mp-ids.
+    explicit_docs = snapshot_client.materials.thermo.search(
         chemsys="Li-Ti-O",
-        thermo_types=["GGA_GGA+U", "GGA_GGA+U_R2SCAN"],
+        thermo_types=["GGA_GGA+U"],
     )
-    both_pairs = {(d.material_id.string, d.thermo_type.value) for d in both_docs}
-    assert both_pairs == default_pairs
+    default_ids = {d.material_id.string for d in docs}
+    explicit_ids = {d.material_id.string for d in explicit_docs}
+    assert default_ids == explicit_ids
 
 
 def test_snapshot_materials_formula_reduction(snapshot_client):
@@ -140,10 +129,7 @@ def test_snapshot_materials_formula_reduction(snapshot_client):
 
 def test_snapshot_summary_theoretical(snapshot_client):
     docs = snapshot_client.materials.thermo.search(chemsys="Li-O")
-    # thermo.search emits one doc per (mp-id, thermo_type); dedupe to
-    # unique mp-ids before cross-checking against summary, which is
-    # one-doc-per-mp-id.
-    mids = list(dict.fromkeys(d.material_id.string for d in docs))[:10]
+    mids = [d.material_id.string for d in docs][:10]
     summaries = snapshot_client.materials.summary.search(material_ids=mids)
     assert len(summaries) == len(mids)
     for s in summaries:

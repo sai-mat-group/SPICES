@@ -58,12 +58,9 @@ TO_CHARGED = {
     "MP id": "Charged MP id",
     "Formula": "Charged Formula",
     "Pbx elements per formula": "Pbx elements per charged formula",
-    "Base XC Functional": "Charged base XC Functional",
-    "Correction XC functional": "Charged correction XC Functional",
-    "GGA(+U)/R2SCAN mixing adjustment": "Charged GGA(+U)/R2SCAN mixing adjustment",
+    "XC Functional": "Charged XC Functional",
     "E (eV/formula)": "Charged Structure E (eV/formula)",
     "Energy Above Hull (eV)": "Charged E above hull (eV)",
-    "Thermo-type": "Charged Thermo-type",
     "Crystal Structure": "Charged Crystal Structure",
     "Space Group": "Charged Space Group",
     "Structure stable in water": "Charged structure stable in water",
@@ -76,12 +73,9 @@ TO_DISCHARGED = {
     "MP id": "Discharged MP id",
     "Formula": "Discharged Formula",
     "Pbx elements per formula": "Pbx elements per discharged formula",
-    "Base XC Functional": "Discharged base XC Functional",
-    "Correction XC functional": "Discharged correction XC Functional",
-    "GGA(+U)/R2SCAN mixing adjustment": "Discharged GGA(+U)/R2SCAN mixing adjustment",
+    "XC Functional": "Discharged XC Functional",
     "E (eV/formula)": "Discharged Structure E (eV/formula)",
     "Energy Above Hull (eV)": "Discharged E above hull (eV)",
-    "Thermo-type": "Discharged Thermo-type",
     "Crystal Structure": "Discharged Crystal Structure",
     "Space Group": "Discharged Space Group",
     "Structure stable in water": "Discharged structure stable in water",
@@ -104,29 +98,23 @@ def get_columns_order(selection_criterion):
         "V vs SHE (V)",
         f"pH range metastability criterion {selection_criterion}",
         "Charged Structure E (eV/formula)",
-        "Charged base XC Functional",
-        "Charged correction XC Functional",
+        "Charged XC Functional",
         "Pbx elements per charged formula",
         "Charged E above hull (eV)",
-        "Charged Thermo-type",
         "Charged Crystal Structure",
         "Charged Space Group",
         "Charged structure stable in water",
         "Charged structure metastable in water",
-        "Charged GGA(+U)/R2SCAN mixing adjustment",
         "No of working ions per charged framework",
         "No of working ions per discharged framework",
         "Discharged Structure E (eV/formula)",
-        "Discharged base XC Functional",
-        "Discharged correction XC Functional",
+        "Discharged XC Functional",
         "Pbx elements per discharged formula",
         "Discharged E above hull (eV)",
-        "Discharged Thermo-type",
         "Discharged Crystal Structure",
         "Discharged Space Group",
         "Discharged structure stable in water",
         "Discharged structure metastable in water",
-        "Discharged GGA(+U)/R2SCAN mixing adjustment",
         "Charged Is experimental",
         "Discharged Is experimental",
         "Total metastability area fraction",
@@ -269,7 +257,7 @@ def _get_voltage_plateau_df(
     working_ion,
     working_ion_valency,
     working_ion_voltage_vs_SHE,
-    working_ion_energies,
+    working_ion_energy,
     stability_criterion=3,
     save_plot=False,
     save_plot_path="./",
@@ -322,10 +310,9 @@ def _get_voltage_plateau_df(
             discharged_energy_per_formula=discharged_row["E (eV/formula)"],
             charged_formula=charged_row["Formula"],
             charged_energy_per_formula=charged_row["E (eV/formula)"],
-            functional_string=charged_row["Base XC Functional"],
             working_ion=working_ion,
             working_ion_valency=working_ion_valency,
-            working_ion_energies=working_ion_energies,
+            working_ion_energy=working_ion_energy,
         )
         voltage_vs_SHE = voltage_vs_ion + working_ion_voltage_vs_SHE
 
@@ -413,7 +400,7 @@ def _get_voltage_plateau_df(
                 working_ion,
                 working_ion_valency,
                 working_ion_voltage_vs_SHE,
-                working_ion_energies,
+                working_ion_energy,
                 stability_criterion=stability_criterion,
                 save_plot=save_plot,
                 save_plot_path=save_plot_path,
@@ -431,7 +418,7 @@ def obtain_voltage_plateau_data_based_on_convex_hull(
     working_ion,
     working_ion_valency,
     working_ion_voltage_vs_SHE,
-    working_ion_energies,
+    working_ion_energy,
     cache,
     mp_client,
     element_str,
@@ -452,7 +439,8 @@ def obtain_voltage_plateau_data_based_on_convex_hull(
     working_ion : str
     working_ion_valency : int
     working_ion_voltage_vs_SHE : float
-    working_ion_energies : dict
+    working_ion_energy : float
+        GGA(+U) energy per atom of the stable elemental working-ion phase.
     cache : PourbaixCache
     mp_client : MPRester
     element_str : str
@@ -485,11 +473,15 @@ def obtain_voltage_plateau_data_based_on_convex_hull(
     if len(df_on_hull) < 2:
         return {f"sc {sc}": None for sc in selection_criteria}
 
-    # Verify single XC functional
-    if df_on_hull["Base XC Functional"].nunique() != 1:
+    # Verify single XC functional.
+    # TODO: remove this guard once trial runs confirm that
+    # thermo_type=GGA_GGA+U always yields a single XC Functional value
+    # per chemsys.  Until then, surface mixed values rather than silently
+    # mixing GGA and GGA+U entries on the hull.
+    if df_on_hull["XC Functional"].nunique() != 1:
         raise ValueError(
-            f"Multiple XC functionals: "
-            f"{df_on_hull['Base XC Functional'].unique().tolist()}"
+            f"Multiple XC functionals on hull: "
+            f"{df_on_hull['XC Functional'].unique().tolist()}"
         )
 
     result = {f"sc {sc}": None for sc in selection_criteria}
@@ -508,7 +500,7 @@ def obtain_voltage_plateau_data_based_on_convex_hull(
                 working_ion,
                 working_ion_valency,
                 working_ion_voltage_vs_SHE,
-                working_ion_energies,
+                working_ion_energy,
                 stability_criterion=sc,
                 save_plot=save_plot,
                 save_plot_path=save_plot_path,
@@ -687,7 +679,7 @@ def step3_create_voltage_plateau_sheets(
     working_ion,
     working_ion_valency,
     working_ion_voltage_vs_SHE,
-    working_ion_energies,
+    working_ion_energy,
     cache,
     mp_client,
     element_str,
@@ -713,7 +705,8 @@ def step3_create_voltage_plateau_sheets(
     working_ion : str
     working_ion_valency : int
     working_ion_voltage_vs_SHE : float
-    working_ion_energies : dict
+    working_ion_energy : float
+        GGA(+U) energy per atom of the stable elemental working-ion phase.
     cache : PourbaixCache
     mp_client : MPRester
     element_str : str
@@ -776,7 +769,7 @@ def step3_create_voltage_plateau_sheets(
                     working_ion=working_ion,
                     working_ion_valency=working_ion_valency,
                     working_ion_voltage_vs_SHE=working_ion_voltage_vs_SHE,
-                    working_ion_energies=working_ion_energies,
+                    working_ion_energy=working_ion_energy,
                     cache=cache,
                     mp_client=mp_client,
                     element_str=element_str,
@@ -970,9 +963,9 @@ def run_intercalation_screening(
         pbx_dir=os.path.join(cache_dir, "saved_pbx"),
     )
 
-    # Get working ion reference energies (once)
-    logger.info("Querying %s reference energies from MP", element)
-    working_ion_energies = get_energy_of_working_ion(element, mp_client)
+    # Get working ion reference energy (once)
+    logger.info("Querying %s reference energy from MP", element)
+    working_ion_energy = get_energy_of_working_ion(element, mp_client)
 
     # Directory structure
     composition_dir = os.path.join(output_dir, "unique_charged_composition_sheets")
@@ -1015,7 +1008,7 @@ def run_intercalation_screening(
         working_ion=element,
         working_ion_valency=working_ion_valency,
         working_ion_voltage_vs_SHE=working_ion_voltage_vs_SHE,
-        working_ion_energies=working_ion_energies,
+        working_ion_energy=working_ion_energy,
         cache=cache,
         mp_client=mp_client,
         element_str=element,

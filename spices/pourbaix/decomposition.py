@@ -14,7 +14,7 @@ def get_mp_id_from_pbx_entry_id(pbx_entry_id):
     """
     Extract the Materials Project ID from a Pourbaix entry ID.
 
-    Pourbaix entry IDs have the format ``"mp-12345-GGA_GGA+U_R2SCAN"``;
+    Pourbaix entry IDs have the format ``"mp-12345-GGA_GGA+U"``;
     this function returns ``"mp-12345"``.
 
     Parameters

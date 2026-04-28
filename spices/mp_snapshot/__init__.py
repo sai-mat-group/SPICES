@@ -16,6 +16,13 @@ method or argument it does not implement, so the pipeline cannot silently
 fall back to live MP and mix data from two database versions.
 """
 
+# Single source of truth for the MP thermo_type SPICES uses.  Step 1/2
+# Pourbaix diagrams are GGA(+U)-only by construction (live mp_api hardcodes
+# this thermo_type for get_pourbaix_entries); steps 0 / 2 / 3 follow suit
+# so the entire pipeline operates on one consistent functional family.
+THERMO_TYPE = "GGA_GGA+U"
+
+
 def __getattr__(name):
     # Lazy re-export so ``spices.mp_snapshot.download`` can be imported
     # (and run by the user) before the full client/loader modules exist.
@@ -28,4 +35,4 @@ def __getattr__(name):
     raise AttributeError(name)
 
 
-__all__ = ["SnapshotMPRester", "SnapshotBackendError"]
+__all__ = ["SnapshotMPRester", "SnapshotBackendError", "THERMO_TYPE"]

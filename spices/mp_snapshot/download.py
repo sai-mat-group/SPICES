@@ -25,6 +25,8 @@ import boto3
 from botocore import UNSIGNED
 from botocore.client import Config
 
+from spices.mp_snapshot import THERMO_TYPE
+
 logger = logging.getLogger(__name__)
 
 # Thread-local boto3 client so concurrent downloads don't serialize on a
@@ -42,8 +44,7 @@ BUCKET = "materialsproject-build"
 
 REQUIRED_PREFIXES = [
     "summary/",
-    "thermo/thermo_type=GGA_GGA+U/",
-    "thermo/thermo_type=GGA_GGA+U_R2SCAN/",
+    f"thermo/thermo_type={THERMO_TYPE}/",
     "materials/",
 ]
 

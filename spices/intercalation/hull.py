@@ -81,8 +81,7 @@ def filter_df_to_get_on_hull_phases(df, working_ion):
     ----------
     df : pd.DataFrame
         Must contain columns: ``'MP id'``, ``'Formula'``,
-        ``'E (eV/formula)'``, ``'Base XC Functional'``,
-        ``'Correction XC functional'``.
+        ``'E (eV/formula)'``, ``'XC Functional'``.
     working_ion : str
 
     Returns
@@ -92,32 +91,21 @@ def filter_df_to_get_on_hull_phases(df, working_ion):
         (ascending). Returns empty DataFrame if fewer than 2 distinct
         compositions exist.
     """
-    import pandas as pd
-
-    # Remove R2SCAN-base entries
-    df_copy = df[
-        df["Base XC Functional"].apply(lambda x: x.lower() != "r2scan")
-    ].copy()
+    # Deduplicate by MP id (keep first).  Under SPICES' single-thermo_type
+    # restriction we expect each MP id to appear at most once already; the
+    # warn-on-shrink check surfaces any unexpected duplicates rather than
+    # silently masking them.
+    df_copy = df.drop_duplicates(subset="MP id", keep="first").copy()
+    if len(df_copy) != len(df):
+        logger.warning(
+            "hull dedup dropped %d duplicate-MP-id row(s) for "
+            "working_ion=%s — investigate why duplicates exist after "
+            "the GGA(+U)-only thermo_type filter",
+            len(df) - len(df_copy), working_ion,
+        )
 
     if len(df_copy) == 0:
-        return df_copy
-
-    # Deduplicate by MP id: prefer R2SCAN-corrected entries
-    def pick_row(group):
-        mask = group["Correction XC functional"].str.contains(
-            "r2scan", case=False, na=False,
-        )
-        if mask.any():
-            return group.loc[mask].iloc[0]
-        return group.iloc[0]
-
-    cols = df_copy.columns.tolist()
-    df_copy = (
-        df_copy
-        .groupby("MP id", group_keys=False)[cols]
-        .apply(pick_row)
-        .reset_index(drop=True)
-    )
+        return df_copy.reset_index(drop=True)
 
     # Add working ions per framework column
     df_copy["No of working ions per framework"] = df_copy["Formula"].apply(

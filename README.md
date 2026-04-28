@@ -15,6 +15,10 @@ SPICES implements a 6-stage computational pipeline (Stages 0--5) for identifying
 4. **Framework comparison** -- Compare material frameworks across different working ions (Ca, K, Li, Mg, Na)
 5. **Statistical analysis** -- Generate aggregate statistics, Venn diagrams, and publication-ready figures
 
+### XC functional restriction
+
+Every MP query in SPICES is restricted to **`thermo_type=GGA_GGA+U`** (a single source of truth: `spices.mp_snapshot.THERMO_TYPE`). This matches the live MP API's hardcoded `get_pourbaix_entries` behavior, so step 0 / step 2 / step 3 use the same XC family that the Pourbaix diagrams in steps 1-2 are built from. R2SCAN-corrected entries are filtered out at the source — both backends — so they cannot leak into hull construction or voltage calculation. Step-0 output therefore carries a single `XC Functional` column (values: `"GGA"` or `"GGA+U"`) instead of the older Base/Correction/mixing-adjustment trio.
+
 ## Installation
 
 ### Prerequisites
@@ -180,7 +184,7 @@ spices/
         selection_criteria.py  # Optional: all 8 selection criteria with docs
         cache.py               # Pourbaix entry/diagram caching (disk + memory)
         plotting.py            # Heat maps and phase region plots
-        thermo.py              # XC functional and energy correction utilities
+        thermo.py              # find_correction (manual analysis helper) + is_most_stable
 
     intercalation/             # Intercalation voltage analysis
         voltage.py             # Voltage calculation from DFT energies
@@ -197,8 +201,9 @@ spices/
         statistics.py          # Stage 5: aggregate statistics and figures
 
     mp_snapshot/               # Offline MP backend for reproducing frozen releases
-        download.py            # AWS OpenData S3 puller (threaded, ~1.14 GB for 2025-06-09)
-        loader.py              # Indexed reader over gz-JSONL shards
+        __init__.py            # THERMO_TYPE = "GGA_GGA+U" (single source of truth)
+        download.py            # AWS OpenData S3 puller (threaded, ~0.6 GB for 2025-06-09)
+        loader.py              # Indexed reader over gz-JSONL shards (GGA_GGA+U subroot only)
         pourbaix.py            # Offline get_pourbaix_entries via MP's documented algorithm
         client.py              # SnapshotMPRester — strict drop-in for MPRester
 
@@ -255,7 +260,7 @@ The live Materials Project database updates continuously. To reproduce results f
 ```bash
 export MP_API_KEY=your_key_here
 
-# ~1.14 GB; threaded, takes a few minutes. Default release: 2025-06-09.
+# ~0.6 GB; threaded, takes a few minutes. Default release: 2025-06-09.
 python -m spices.mp_snapshot.download /path/to/MP_snapshots
 
 # List every release published on the public bucket
@@ -265,9 +270,9 @@ python -m spices.mp_snapshot.download --list-releases
 python -m spices.mp_snapshot.download /path/to/MP_snapshots --release 2024-11-14
 ```
 
-This downloads the `summary/`, `thermo/thermo_type=GGA_GGA+U/`, `thermo/thermo_type=GGA_GGA+U_R2SCAN/`, and `materials/` collections, freezes the MPContribs `ion_ref_data` project (needed for offline Pourbaix rebuild), and writes a `manifest.json` with provenance.
+This downloads the `summary/`, `thermo/thermo_type=GGA_GGA+U/`, and `materials/` collections, freezes the MPContribs `ion_ref_data` project (needed for offline Pourbaix rebuild), and writes a `manifest.json` with provenance. The `GGA_GGA+U_R2SCAN` subroot is **not** pulled — SPICES restricts every thermo query to `GGA_GGA+U` so the R2SCAN-mixed shards would be unused weight. If you have an older snapshot that pre-dates this restriction and want to reclaim disk, `rm -rf <release>/thermo/thermo_type=GGA_GGA+U_R2SCAN/` after upgrading.
 
-The `--release` value is validated against the public bucket before any download begins — a typo exits immediately with a `ValueError` listing the valid releases, rather than silently writing an empty snapshot. If a chosen older release does not publish one of the required prefixes (e.g. `GGA_GGA+U_R2SCAN` is absent on early releases), `download_collection` logs a warning and returns instead of failing the whole run.
+The `--release` value is validated against the public bucket before any download begins — a typo exits immediately with a `ValueError` listing the valid releases, rather than silently writing an empty snapshot. If a chosen older release does not publish the `GGA_GGA+U` prefix, `download_collection` logs a warning and returns instead of failing the whole run.
 
 ### Using the snapshot backend
 
@@ -284,9 +289,9 @@ mp = get_client(
 # or: export SPICES_MP_BACKEND=snapshot SPICES_MP_SNAPSHOT_ROOT=/path/to/MP_snapshots
 ```
 
-`SnapshotMPRester` is **strict**: unsupported methods, unsupported thermo types (e.g. pure `R2SCAN`), and any network attempt raise `SnapshotBackendError` — preventing silent fallback that would mix data from two database eras in one run.
+`SnapshotMPRester` is **strict**: unsupported methods, unsupported thermo types (anything other than `GGA_GGA+U` — including `GGA_GGA+U_R2SCAN` and pure `R2SCAN`), and any network attempt raise `SnapshotBackendError` — preventing silent fallback that would mix data from two database eras in one run.
 
-The default `materials.thermo.search(...)` call (with `thermo_types=None`) returns **every** `(mp-id, thermo_type)` doc the snapshot ships, matching the current live `mp_api` behavior: an mp-id with both `GGA_GGA+U` and `GGA_GGA+U_R2SCAN` hulls produces two docs. SPICES' own dedup in `screening/mp_query.py` collapses these to one row per mp-id based on `(Base XC, Correction XC)`, so downstream step0 output is still one row per mp-id.
+The default `materials.thermo.search(...)` call returns one doc per mp-id under `thermo_type=GGA_GGA+U`. SPICES' upstream filter (`thermo_types=[THERMO_TYPE]`) and the snapshot loader's single-subroot indexing keep R2SCAN-corrected energies out of the entry stream entirely, so step-0 output is one row per mp-id with a single `XC Functional` value (`"GGA"` or `"GGA+U"`).
 
 ### Reusing earlier Pourbaix caches
 

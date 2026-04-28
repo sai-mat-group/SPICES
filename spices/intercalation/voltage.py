@@ -7,13 +7,19 @@ import math
 
 from pymatgen.core import Composition
 
+from spices.mp_snapshot import THERMO_TYPE
+
 logger = logging.getLogger(__name__)
 
 
 def get_energy_of_working_ion(working_ion, mp_client):
     """
     Query the Materials Project for the stable elemental energy of the
-    working ion metal under different XC functionals.
+    working ion metal under the GGA(+U) thermo_type.
+
+    SPICES restricts to ``thermo_type=GGA_GGA+U`` everywhere so the
+    intercalation voltage is computed from a single self-consistent
+    functional family (matching the Pourbaix path).
 
     Parameters
     ----------
@@ -24,9 +30,9 @@ def get_energy_of_working_ion(working_ion, mp_client):
 
     Returns
     -------
-    dict
-        Mapping from functional label to energy_per_atom (eV).
-        Keys may include ``"GGA"``, ``"R2SCAN"``, ``"SCAN"``.
+    float
+        Energy per atom (eV) of the stable elemental phase under
+        GGA(+U).
 
     Raises
     ------
@@ -36,30 +42,22 @@ def get_energy_of_working_ion(working_ion, mp_client):
     entries = mp_client.materials.thermo.search(
         chemsys=working_ion,
         is_stable=True,
-        thermo_types=["GGA_GGA+U", "GGA_GGA+U_R2SCAN", "R2SCAN"],
+        thermo_types=[THERMO_TYPE],
     )
 
     if not entries:
         raise ValueError(
-            f"No stable thermo entries found for {working_ion}"
+            f"No stable thermo entries found for {working_ion} with "
+            f"thermo_types=[{THERMO_TYPE!r}]. MP may have renamed the "
+            f"thermo_type — check spices.mp_snapshot.THERMO_TYPE."
         )
 
-    energies = {}
-    for entry in entries:
-        key = entry.energy_type.upper()
-        if key in ("GGA", "GGA+U"):
-            energies["GGA"] = entry.energy_per_atom
-        elif key == "R2SCAN":
-            energies["R2SCAN"] = entry.energy_per_atom
-        elif key == "SCAN":
-            energies["SCAN"] = entry.energy_per_atom
-
-        logger.info(
-            "%s %s energy per atom = %.6f eV",
-            working_ion, entry.energy_type, entry.energy_per_atom,
-        )
-
-    return energies
+    entry = entries[0]
+    logger.info(
+        "%s %s energy per atom = %.6f eV",
+        working_ion, entry.energy_type, entry.energy_per_atom,
+    )
+    return entry.energy_per_atom
 
 
 def calculate_intercalation_voltage(
@@ -67,10 +65,9 @@ def calculate_intercalation_voltage(
     discharged_energy_per_formula,
     charged_formula,
     charged_energy_per_formula,
-    functional_string,
     working_ion,
     working_ion_valency,
-    working_ion_energies,
+    working_ion_energy,
 ):
     """
     Compute the intercalation voltage from DFT total energies.
@@ -92,16 +89,13 @@ def calculate_intercalation_voltage(
         Formula of the charged (de-intercalated) phase.
     charged_energy_per_formula : float
         DFT energy per formula unit of the charged phase (eV).
-    functional_string : str
-        XC functional label (``"GGA"``, ``"GGA+U"``, ``"GGA_U"``,
-        or ``"R2SCAN"``).
     working_ion : str
         Element symbol of the working ion (e.g. ``"Ca"``).
     working_ion_valency : int
         Charge state of the working ion.
-    working_ion_energies : dict
-        Mapping from functional label to energy_per_atom, as returned
-        by :func:`get_energy_of_working_ion`.
+    working_ion_energy : float
+        Energy per atom (eV) of the stable elemental working-ion phase
+        under GGA(+U), as returned by :func:`get_energy_of_working_ion`.
 
     Returns
     -------
@@ -130,18 +124,6 @@ def calculate_intercalation_voltage(
     ion_in_dis = discharged_comp.get(working_ion, 0) * lcm / n_dis
     ion_in_char = charged_comp.get(working_ion, 0) * lcm / n_char
     delta_working_ion = ion_in_dis - ion_in_char
-
-    # Select reference energy based on functional
-    func_upper = functional_string.upper().replace("_", "+")
-    if func_upper in ("GGA", "GGA+U"):
-        working_ion_energy = working_ion_energies["GGA"]
-    elif func_upper == "R2SCAN":
-        working_ion_energy = working_ion_energies["R2SCAN"]
-    else:
-        raise TypeError(
-            f"Incompatible functional '{functional_string}'. "
-            "Use GGA, GGA+U, GGA_U, or R2SCAN."
-        )
 
     voltage = -(
         E_discharged - E_charged - delta_working_ion * working_ion_energy

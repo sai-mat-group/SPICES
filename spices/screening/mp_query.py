@@ -3,8 +3,12 @@ Stage 0: Materials Project data query and metadata collection.
 
 This module queries the Materials Project for structural and thermodynamic
 data across chemical systems defined by combinations of transition metals,
-anions, and a working ion.  It produces a DataFrame with 15 columns that
-serves as the mandatory input for all downstream pipeline stages.
+anions, and a working ion.  It produces a DataFrame whose columns serve as
+the mandatory input for all downstream pipeline stages.
+
+SPICES restricts every thermo query to ``thermo_type=GGA_GGA+U`` so the
+entire pipeline operates on a single, self-consistent XC family
+(matching the live MP API's hardcoded Pourbaix path).
 """
 
 import logging
@@ -20,12 +24,12 @@ from spices.config import (
     DEFAULT_ANIONS,
 )
 from spices.mp_client import get_client
+from spices.mp_snapshot import THERMO_TYPE
 from spices.pourbaix.composition import (
     rm_element,
     make_chemsys_from_combinations,
     get_pourbaix_composition,
 )
-from spices.pourbaix.thermo import find_correction
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +38,7 @@ MP_QUERY_COLUMNS = [
     "MP id",
     "Formula",
     "Pbx elements per formula",
-    "Thermo-type",
-    "Base XC Functional",
-    "Correction XC functional",
-    "GGA(+U)/R2SCAN mixing adjustment",
+    "XC Functional",
     "E (eV/formula)",
     "Energy Above Hull (eV)",
     "Crystal Structure",
@@ -54,8 +55,6 @@ def collect_mp_data_from_chemsys(
     element_str,
     mp_client,
     material_ids=None,
-    remove_R2SCAN_base=True,
-    remove_uncorrected_duplicates=True,
     max_retries=500,
     retry_delay=10.0,
 ):
@@ -74,11 +73,6 @@ def collect_mp_data_from_chemsys(
         Materials Project API client.
     material_ids : str or list or None
         Restrict query to specific MP IDs.
-    remove_R2SCAN_base : bool
-        Skip entries whose base XC functional is R2SCAN.
-    remove_uncorrected_duplicates : bool
-        If an entry has both corrected and uncorrected versions, keep
-        only the R2SCAN-corrected one.
     max_retries : int
         Maximum retries for the summary endpoint query.
     retry_delay : float
@@ -92,15 +86,14 @@ def collect_mp_data_from_chemsys(
     thermo_list = mp_client.materials.thermo.search(
         chemsys=chemsys,
         material_ids=material_ids,
+        thermo_types=[THERMO_TYPE],
         all_fields=False,
         fields=[
             "material_id",
             "composition",
             "chemsys",
             "formula_pretty",
-            "thermo_type",
             "energy_type",
-            "entries",
             "energy_per_atom",
             "energy_above_hull",
             "symmetry",
@@ -151,47 +144,7 @@ def collect_mp_data_from_chemsys(
         data["Pbx elements per formula"] = len(
             get_pourbaix_composition(entry.composition).as_dict()
         )
-        data["Thermo-type"] = entry.thermo_type.value
-        data["Base XC Functional"] = entry.energy_type
-        data["Correction XC functional"] = entry.energy_type
-        data["GGA(+U)/R2SCAN mixing adjustment"] = np.nan
-
-        # Determine base and correction XC functionals
-        mixing_correction_found = False
-        for correction_dict in find_correction(entry):
-            if correction_dict["name"].upper() == "MP GGA(+U)/R2SCAN MIXING ADJUSTMENT":
-                desc = correction_dict["description"].strip()
-                # Normalize R2SCAN casing in stored description
-                desc_normalized = desc.replace("r2SCAN", "R2SCAN")
-                desc_upper = desc.upper()
-                mixing_correction_found = True
-
-                if desc_upper == "PLACE GGA(+U) ENERGY ONTO THE R2SCAN HULL":
-                    data["Base XC Functional"] = "R2SCAN"
-                    data["Correction XC functional"] = entry.energy_type
-                    data["GGA(+U)/R2SCAN mixing adjustment"] = desc_normalized
-
-                elif desc_upper in (
-                    "PLACE R2SCAN ENERGY ONTO THE GGA(+U) HULL",
-                    "REPLACE R2SCAN ENERGY WITH GGA(+U) ENERGY",
-                ):
-                    gga_types = [
-                        t.energy_type for t in thermo_list if "GGA" in t.energy_type
-                    ]
-                    data["Base XC Functional"] = (
-                        gga_types[0] if gga_types else entry.energy_type
-                    )
-                    data["Correction XC functional"] = entry.energy_type
-                    data["GGA(+U)/R2SCAN mixing adjustment"] = desc_normalized
-
-                else:
-                    data["Base XC Functional"] = entry.energy_type
-                    data["Correction XC functional"] = entry.energy_type
-                    data["GGA(+U)/R2SCAN mixing adjustment"] = desc_normalized
-
-        # Standalone R2SCAN entries (thermo_type=R2SCAN, no mixing corrections)
-        if not mixing_correction_found and entry.energy_type.upper() == "R2SCAN":
-            data["Base XC Functional"] = "R2SCAN"
+        data["XC Functional"] = entry.energy_type
 
         # Energy per formula unit
         atoms_per_formula = sum(
@@ -205,71 +158,6 @@ def collect_mp_data_from_chemsys(
         data["Is experimental"] = not theoretical_map.get(
             entry.material_id.string, True
         )
-
-        # Normalize R2SCAN casing in stored values for downstream consistency
-        if data["Base XC Functional"].upper() == "R2SCAN":
-            data["Base XC Functional"] = "R2SCAN"
-        if data["Correction XC functional"].upper() == "R2SCAN":
-            data["Correction XC functional"] = "R2SCAN"
-
-        # Skip R2SCAN base entries
-        if remove_R2SCAN_base and data["Base XC Functional"] == "R2SCAN":
-            continue
-
-        # Handle duplicate entries (same mp_id, different XC)
-        # TODO: Dedup key is (Base XC, Correction XC) only — Thermo-type
-        # is intentionally NOT part of the key. When OLD (3rd_Iteration
-        # live, Mar 2025 MP release) and NEW (snapshot, MP 2025-06-09)
-        # step0 Excel files were diffed, ~6700 common mp-ids showed a
-        # flipped Thermo-type label but identical Base/Correction XC,
-        # almost certainly because MP changed the order in which it
-        # emits per-mp-id thermo_type docs between releases, so the
-        # "first-wins" pick here landed on a different label. The XC
-        # identification itself was stable. If a future run shows
-        # anomalous Base/Correction XC labels (not just Thermo-type),
-        # revisit this block — candidate tighteners: include Thermo-type
-        # in the key, or pick the R2SCAN-mixed doc explicitly rather
-        # than relying on arrival order.
-        if remove_uncorrected_duplicates:
-            req_index = -1
-            for idx, existing in enumerate(return_list):
-                if existing["MP id"] == entry.material_id.string:
-                    req_index = idx
-                    break
-
-            if req_index > -1:
-                existing = return_list[req_index]
-                if existing["Base XC Functional"] == data["Base XC Functional"]:
-                    if (
-                        existing["Correction XC functional"]
-                        != data["Correction XC functional"]
-                    ):
-                        if (
-                            "GGA" in data["Correction XC functional"]
-                            and existing["Correction XC functional"] == "R2SCAN"
-                        ):
-                            continue
-                        elif (
-                            data["Correction XC functional"] == "R2SCAN"
-                            and "GGA" in existing["Correction XC functional"]
-                        ):
-                            # Replace existing with current (R2SCAN-corrected)
-                            data["Charged composition"] = existing.get(
-                                "Charged composition"
-                            )
-                            data["No. of charged structures present"] = existing.get(
-                                "No. of charged structures present"
-                            )
-                            data[
-                                "No. of charged structure with same crystal structure"
-                            ] = existing.get(
-                                "No. of charged structure with same crystal structure"
-                            )
-                            return_list.append(data)
-                            return_list.pop(req_index)
-                            continue
-                    else:
-                        continue
 
         # Charged (de-intercalated) structure search
         charged_formula = rm_element(entry.formula_pretty, element_str)
@@ -296,7 +184,26 @@ def collect_mp_data_from_chemsys(
 
         return_list.append(data)
 
-    return return_list
+    # Per-MP-id dedup with warn-on-shrink: under the single-thermo_type
+    # restriction we do not expect duplicates here.  If they appear the
+    # warning surfaces it without silently masking the upstream surprise.
+    deduped = []
+    seen_mp_ids = set()
+    for row in return_list:
+        mp_id = row["MP id"]
+        if mp_id in seen_mp_ids:
+            continue
+        seen_mp_ids.add(mp_id)
+        deduped.append(row)
+    if len(deduped) != len(return_list):
+        logger.warning(
+            "step-0 dedup dropped %d duplicate-MP-id row(s) for "
+            "chemsys=%s, material_ids=%s — investigate why duplicates "
+            "exist post-thermo_type filter",
+            len(return_list) - len(deduped), chemsys, material_ids,
+        )
+
+    return deduped
 
 
 def run_mp_query(
@@ -348,7 +255,7 @@ def run_mp_query(
     Returns
     -------
     pd.DataFrame
-        Query results with 15 columns (see ``MP_QUERY_COLUMNS``).
+        Query results with the columns listed in ``MP_QUERY_COLUMNS``.
     """
     if transition_metals is None:
         transition_metals = DEFAULT_TRANSITION_METALS

@@ -1,10 +1,14 @@
 """Tests for intercalation convex hull functions."""
 
+import logging
+
+import pandas as pd
 import pytest
 from pymatgen.core import Composition
 
 from spices.intercalation.hull import (
     create_pd_entry,
+    filter_df_to_get_on_hull_phases,
     get_working_ions_per_framework,
 )
 
@@ -53,3 +57,29 @@ class TestGetWorkingIonsPerFramework:
     def test_na_working_ion(self):
         result = get_working_ions_per_framework("Na2MnO3", "Na")
         assert abs(result - 2.0) < 1e-10
+
+
+class TestFilterDfDedupWarning:
+    def _df(self, mp_ids):
+        return pd.DataFrame({
+            "MP id": mp_ids,
+            "Formula": ["LiFeO2"] * len(mp_ids),
+            "E (eV/formula)": [-30.0] * len(mp_ids),
+            "XC Functional": ["GGA+U"] * len(mp_ids),
+        })
+
+    def test_warns_when_duplicates_present(self, caplog):
+        df = self._df(["mp-1", "mp-1", "mp-2"])
+        with caplog.at_level(logging.WARNING, logger="spices.intercalation.hull"):
+            filter_df_to_get_on_hull_phases(df, "Li")
+        assert any(
+            "hull dedup dropped" in rec.message for rec in caplog.records
+        )
+
+    def test_silent_when_unique(self, caplog):
+        df = self._df(["mp-1", "mp-2"])
+        with caplog.at_level(logging.WARNING, logger="spices.intercalation.hull"):
+            filter_df_to_get_on_hull_phases(df, "Li")
+        assert not any(
+            "hull dedup dropped" in rec.message for rec in caplog.records
+        )

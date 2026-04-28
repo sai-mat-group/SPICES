@@ -3,8 +3,8 @@ Indexed reader for a local Materials Project snapshot on disk.
 
 Exists to serve SnapshotMPRester.  Responsibilities:
 
-- Walk each collection's subtrees (``summary/``, the two ``thermo/
-  thermo_type=*/`` prefixes, ``materials/``) and build forward +
+- Walk each collection's subtree (``summary/``, ``thermo/
+  thermo_type=GGA_GGA+U/``, ``materials/``) and build forward +
   secondary indexes on first use; pickle them under ``<root>/indexes/``
   so subsequent runs are instant.
 - Given a query (material_id, chemsys, formula, crystal_system), locate
@@ -24,17 +24,16 @@ import pickle
 from collections import defaultdict
 from functools import lru_cache
 
+from spices.mp_snapshot import THERMO_TYPE
+
 logger = logging.getLogger(__name__)
 
-# Each collection maps to a list of subroots.  Thermo has two
-# (GGA_GGA+U and GGA_GGA+U_R2SCAN); the others have one.  Same mp-id
-# can appear in both thermo subroots — by_mid stores a list of locations.
+# Each collection maps to a list of subroots.  SPICES restricts thermo
+# reads to the single GGA_GGA+U subroot to stay consistent with the live
+# MP API's Pourbaix path (which hardcodes this thermo_type).
 COLLECTIONS = {
     "summary": ["summary"],
-    "thermo": [
-        "thermo/thermo_type=GGA_GGA+U",
-        "thermo/thermo_type=GGA_GGA+U_R2SCAN",
-    ],
+    "thermo": [f"thermo/thermo_type={THERMO_TYPE}"],
     "materials": ["materials"],
 }
 
@@ -58,7 +57,9 @@ class Index:
     ----------
     by_mid : dict[str, list[tuple[str, int]]]
         material_id -> [(shard_relpath, line_number_zero_based), ...]
-        List because thermo can have one entry per thermo_type.
+        List for forward-compat with multi-subroot indexing; the active
+        thermo collection has a single subroot (GGA_GGA+U), so each
+        mp-id appears once.
     by_chemsys : dict[str, list[str]]
         chemsys -> [material_id, ...]
     by_elemset : dict[frozenset, list[str]]
@@ -273,8 +274,9 @@ class SnapshotLoader:
         """
         Fetch the first doc matching *material_id* from *collection*.
 
-        Use :meth:`get_docs_for_mid` when an mp-id can map to multiple
-        docs (thermo collection, two thermo_types).
+        Use :meth:`get_docs_for_mid` when an mp-id could in principle map
+        to multiple docs (multi-subroot indexing).  With the active
+        single-subroot thermo collection this returns the same doc.
         """
         idx = self.get_index(collection)
         hits = idx.by_mid.get(material_id)
@@ -296,9 +298,9 @@ class SnapshotLoader:
 
     def get_docs(self, collection, material_ids):
         """
-        Batch fetch.  Returns one doc per (mp-id, location) pair, so an
-        mp-id present in two thermo subroots yields two docs.  Output is
-        flat; callers needing one-per-id should dedup themselves.
+        Batch fetch.  Returns one doc per (mp-id, location) pair.  Output
+        is flat; callers needing strict one-per-id should dedup
+        themselves.
         """
         idx = self.get_index(collection)
         # Group by shard to avoid reopening each file for every ID.

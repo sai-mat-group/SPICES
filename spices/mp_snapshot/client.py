@@ -19,11 +19,12 @@ from typing import Any, Optional
 
 from pymatgen.core import Composition, Structure
 
+from spices.mp_snapshot import THERMO_TYPE
 from spices.mp_snapshot.loader import SnapshotLoader
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_THERMO_TYPES = frozenset({"GGA_GGA+U", "GGA_GGA+U_R2SCAN"})
+SUPPORTED_THERMO_TYPES = frozenset({THERMO_TYPE})
 
 
 class SnapshotBackendError(RuntimeError):
@@ -230,10 +231,10 @@ class _ThermoNS(_StrictNamespace):
         all_fields=False,
         fields=None,
     ):
-        # Strict thermo_type guard.  2025-06-09 snapshot ships two
-        # thermo prefixes (GGA_GGA+U and GGA_GGA+U_R2SCAN); both are
-        # part of the same release so combining them does NOT mix DB
-        # eras.  Any other thermo_type (e.g. R2SCAN-only) is rejected.
+        # Strict thermo_type guard.  SPICES restricts the snapshot to
+        # the GGA_GGA+U thermo_type (matches the live MP API's hardcoded
+        # Pourbaix path).  Any other thermo_type is rejected so a stray
+        # request can't silently leak R2SCAN-corrected energies in.
         if thermo_types is not None:
             requested = set(thermo_types)
             if not requested.issubset(SUPPORTED_THERMO_TYPES):
