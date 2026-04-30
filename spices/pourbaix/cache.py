@@ -1,14 +1,26 @@
 """
 Caching layer for Pourbaix entries and diagrams.
 
-Replaces the original static-function-variable pattern
-(``func.cache = {}``) with a proper ``PourbaixCache`` class that
-manages both in-memory dictionaries and on-disk pickle files.
+Two-layer cache:
+
+* **On-disk pickle store** under ``entries_dir``/``pbx_dir`` is authoritative
+  and persists across runs.  Built once, read forever.
+* **In-memory LRU dicts** hold a bounded working set of fully-deserialized
+  Python objects so repeated lookups in the same process don't hit disk.
+  Capped via ``max_entries`` / ``max_diagrams`` / ``max_sea_diagrams`` to
+  keep multi-worker runs from accumulating multi-GB of `PourbaixDiagram`
+  references — eviction merely forces the next lookup to re-read the
+  existing on-disk pickle (~0.1–1 s) instead of rebuilding from MP entries.
+
+All disk writes go through :func:`_atomic_pickle_dump` (write to a
+PID-tagged temp file then ``os.replace``) so concurrent workers can't leave
+a truncated pickle that the next reader would hit as ``EOFError``.
 """
 
 import os
 import pickle
 import logging
+from collections import OrderedDict
 
 from pymatgen.core import Composition
 from pymatgen.analysis.pourbaix_diagram import PourbaixDiagram
@@ -22,6 +34,20 @@ from spices.pourbaix.composition import (
 logger = logging.getLogger(__name__)
 
 
+def _atomic_pickle_dump(obj, path, protocol=pickle.HIGHEST_PROTOCOL):
+    """Pickle *obj* to *path* via a PID-tagged temp file + ``os.replace``.
+
+    ``os.replace`` is atomic on POSIX, so concurrent readers either see the
+    old file or the fully-written new file — never a half-written one.
+    """
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "wb") as f:
+        pickle.dump(obj, f, protocol=protocol)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 class PourbaixCache:
     """
     In-memory + on-disk cache for Pourbaix entries and diagrams.
@@ -32,16 +58,43 @@ class PourbaixCache:
         Directory for pickled Pourbaix entry lists.
     pbx_dir : str
         Directory for pickled Pourbaix diagram objects.
+    max_entries : int
+        Max number of chemsys -> entries kept in memory (default 8).
+    max_diagrams : int
+        Max number of formula -> dilute-water ``PourbaixDiagram`` kept in
+        memory (default 8).
+    max_sea_diagrams : int
+        Max number of formula -> seawater ``PourbaixDiagram`` kept in
+        memory (default 8).
+
+    Notes
+    -----
+    The three caps bound per-worker RSS in multi-worker runs.  Each cached
+    diagram can be 50–200 MB; with 12 workers and unbounded growth the
+    OS will OOM-kill workers.  The on-disk pickle remains authoritative,
+    so eviction is cheap.
     """
 
-    def __init__(self, entries_dir="saved_pbx_entries", pbx_dir="saved_pbx"):
+    def __init__(self, entries_dir="saved_pbx_entries", pbx_dir="saved_pbx",
+                 max_entries=8, max_diagrams=8, max_sea_diagrams=8):
         self.entries_dir = entries_dir
         self.pbx_dir = pbx_dir
 
-        # In-memory caches
-        self._pourbaix_entries = {}
-        self._pourbaix_diagrams = {}
-        self._sea_pourbaix_diagrams = {}
+        self.max_entries = max_entries
+        self.max_diagrams = max_diagrams
+        self.max_sea_diagrams = max_sea_diagrams
+
+        # In-memory LRU caches.  Newest at the right end; evict from the
+        # left when len exceeds the cap.
+        self._pourbaix_entries = OrderedDict()
+        self._pourbaix_diagrams = OrderedDict()
+        self._sea_pourbaix_diagrams = OrderedDict()
+
+    @staticmethod
+    def _evict_to_size(d, max_size):
+        """Pop oldest items from *d* until ``len(d) <= max_size``."""
+        while len(d) > max_size:
+            d.popitem(last=False)
 
     # ------------------------------------------------------------------
     # Pourbaix entries
@@ -68,8 +121,11 @@ class PourbaixCache:
             self._pourbaix_entries[chemsys] = mp_client.get_pourbaix_entries(
                 chemsys=chemsys
             )
+            self._evict_to_size(self._pourbaix_entries, self.max_entries)
             if save:
                 self._save_entries(chemsys)
+        else:
+            self._pourbaix_entries.move_to_end(chemsys)
 
         return self._pourbaix_entries[chemsys]
 
@@ -97,6 +153,7 @@ class PourbaixCache:
                     with open(fpath, "rb") as f:
                         entries = pickle.load(f)
                     self._pourbaix_entries[chemsys] = entries
+                    self._evict_to_size(self._pourbaix_entries, self.max_entries)
                     return entries
         else:
             os.makedirs(self.entries_dir, exist_ok=True)
@@ -108,8 +165,7 @@ class PourbaixCache:
     def _save_entries(self, chemsys):
         os.makedirs(self.entries_dir, exist_ok=True)
         fpath = os.path.join(self.entries_dir, f"{chemsys}_pbxentry.pkl")
-        with open(fpath, "wb") as f:
-            pickle.dump(self._pourbaix_entries[chemsys], f)
+        _atomic_pickle_dump(self._pourbaix_entries[chemsys], fpath)
 
     # ------------------------------------------------------------------
     # Pourbaix diagrams (dilute / pure water)
@@ -164,8 +220,11 @@ class PourbaixCache:
             self._pourbaix_diagrams[key] = self.generate_pourbaix_diagram(
                 pbx_comp, mp_client, save_entries=save_entries,
             )
+            self._evict_to_size(self._pourbaix_diagrams, self.max_diagrams)
             if save_pbx:
                 self._save_diagram(pbx_comp, mp_id)
+        else:
+            self._pourbaix_diagrams.move_to_end(key)
 
         return self._pourbaix_diagrams[key]
 
@@ -197,6 +256,7 @@ class PourbaixCache:
                     with open(fpath, "rb") as f:
                         diag = pickle.load(f)
                     self._pourbaix_diagrams[pbx_comp.reduced_composition.formula] = diag
+                    self._evict_to_size(self._pourbaix_diagrams, self.max_diagrams)
                     return diag
         else:
             os.makedirs(self.pbx_dir, exist_ok=True)
@@ -215,8 +275,7 @@ class PourbaixCache:
             self.pbx_dir, f"{name.replace(' ', '_')}_pbx.pkl"
         )
         key = pbx_comp.reduced_composition.formula
-        with open(fpath, "wb") as f:
-            pickle.dump(self._pourbaix_diagrams[key], f)
+        _atomic_pickle_dump(self._pourbaix_diagrams[key], fpath)
 
     # ------------------------------------------------------------------
     # Seawater Pourbaix diagrams
@@ -268,6 +327,7 @@ class PourbaixCache:
                 num_of_sea_elements=num_of_sea_elements,
                 save_entries=save_entries,
             )
+            self._evict_to_size(self._sea_pourbaix_diagrams, self.max_sea_diagrams)
             if save_pbx:
                 os.makedirs(self.pbx_dir, exist_ok=True)
                 name = sea_comp.reduced_composition.formula
@@ -276,8 +336,9 @@ class PourbaixCache:
                 fpath = os.path.join(
                     self.pbx_dir, f"{name.replace(' ', '_')}_pbx.pkl"
                 )
-                with open(fpath, "wb") as f:
-                    pickle.dump(self._sea_pourbaix_diagrams[key], f)
+                _atomic_pickle_dump(self._sea_pourbaix_diagrams[key], fpath)
+        else:
+            self._sea_pourbaix_diagrams.move_to_end(key)
 
         return self._sea_pourbaix_diagrams[key]
 
@@ -298,6 +359,7 @@ class PourbaixCache:
                     with open(fpath, "rb") as f:
                         diag = pickle.load(f)
                     self._sea_pourbaix_diagrams[sea_comp.reduced_composition.formula] = diag
+                    self._evict_to_size(self._sea_pourbaix_diagrams, self.max_sea_diagrams)
                     return diag
         else:
             os.makedirs(self.pbx_dir, exist_ok=True)
@@ -367,8 +429,7 @@ class PourbaixCache:
             self.pbx_dir,
             f"{Composition(comp_dict).reduced_composition.formula.replace(' ', '_')}_pbx.pkl",
         )
-        with open(fpath, "wb") as f:
-            pickle.dump(bare_pbx, f)
+        _atomic_pickle_dump(bare_pbx, fpath)
 
         return bare_pbx
 

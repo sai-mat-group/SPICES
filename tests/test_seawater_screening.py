@@ -1,9 +1,17 @@
 """Tests for seawater screening runner functions."""
 
+import sys
+
 import pandas as pd
 import pytest
 
-from spices.screening.seawater import _split_dataframe, SEAWATER_COLUMNS
+from spices.pourbaix.cache import PourbaixCache
+from spices.screening.seawater import (
+    SEAWATER_COLUMNS,
+    _available_memory_gb,
+    _recover_chunk_for_core,
+    _split_dataframe,
+)
 
 
 class TestSplitDataframe:
@@ -76,3 +84,95 @@ class TestSeawaterColumns:
 
     def test_criterion_4_present(self):
         assert "Seawater metastability (Criterion 4)" in SEAWATER_COLUMNS
+
+
+class TestPourbaixCacheLRU:
+    def test_default_caps(self):
+        cache = PourbaixCache()
+        assert cache.max_entries == 8
+        assert cache.max_diagrams == 8
+        assert cache.max_sea_diagrams == 8
+
+    def test_custom_caps(self):
+        cache = PourbaixCache(max_entries=4, max_diagrams=2, max_sea_diagrams=1)
+        assert cache.max_entries == 4
+        assert cache.max_diagrams == 2
+        assert cache.max_sea_diagrams == 1
+
+    def test_evict_to_size_pops_oldest(self):
+        cache = PourbaixCache(max_diagrams=3)
+        for i in range(5):
+            cache._pourbaix_diagrams[f"k{i}"] = i
+            cache._evict_to_size(
+                cache._pourbaix_diagrams, cache.max_diagrams,
+            )
+        assert list(cache._pourbaix_diagrams.keys()) == ["k2", "k3", "k4"]
+
+    def test_move_to_end_protects_from_eviction(self):
+        cache = PourbaixCache(max_diagrams=3)
+        for i in range(3):
+            cache._pourbaix_diagrams[f"k{i}"] = i
+        # Touch k0 -> becomes most-recently-used.
+        cache._pourbaix_diagrams.move_to_end("k0")
+        cache._pourbaix_diagrams["k3"] = 3
+        cache._evict_to_size(cache._pourbaix_diagrams, cache.max_diagrams)
+        assert "k0" in cache._pourbaix_diagrams
+        assert "k1" not in cache._pourbaix_diagrams
+
+
+class TestRecoverChunkForCore:
+    def _df(self, mp_id):
+        return pd.DataFrame({"MP id": [mp_id], "Formula": ["X"]})
+
+    def test_returns_original_when_runtime_dir_missing(self, tmp_path):
+        original = self._df("mp-orig")
+        out = _recover_chunk_for_core(
+            str(tmp_path / "nope"), "K", 0, original,
+        )
+        pd.testing.assert_frame_equal(out, original)
+
+    def test_returns_original_when_no_matching_files(self, tmp_path):
+        original = self._df("mp-orig")
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        # Wrong element prefix.
+        self._df("mp-other").to_excel(
+            runtime / "Na_core0_final.xlsx", index=False,
+        )
+        out = _recover_chunk_for_core(str(runtime), "K", 0, original)
+        pd.testing.assert_frame_equal(out, original)
+
+    def test_prefers_final_over_part(self, tmp_path):
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        self._df("mp-part").to_excel(
+            runtime / "K_core0_part1.xlsx", index=False,
+        )
+        self._df("mp-final").to_excel(
+            runtime / "K_core0_final.xlsx", index=False,
+        )
+        out = _recover_chunk_for_core(
+            str(runtime), "K", 0, self._df("mp-orig"),
+        )
+        assert list(out["MP id"]) == ["mp-final"]
+
+    def test_picks_highest_part_when_no_final(self, tmp_path):
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        for n, mid in [(1, "mp-1"), (3, "mp-3"), (2, "mp-2")]:
+            self._df(mid).to_excel(
+                runtime / f"K_core0_part{n}.xlsx", index=False,
+            )
+        out = _recover_chunk_for_core(
+            str(runtime), "K", 0, self._df("mp-orig"),
+        )
+        assert list(out["MP id"]) == ["mp-3"]
+
+
+class TestAvailableMemoryGb:
+    def test_returns_positive_float_on_linux(self):
+        if not sys.platform.startswith("linux"):
+            pytest.skip("requires /proc/meminfo")
+        avail = _available_memory_gb()
+        assert avail is not None
+        assert avail > 0

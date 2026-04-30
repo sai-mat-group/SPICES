@@ -19,7 +19,8 @@ import os
 import re
 import shutil
 import time
-from multiprocessing import Pool
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
 import pandas as pd
@@ -45,6 +46,29 @@ SEAWATER_COLUMNS = [
     "Seawater stability",
     "Seawater metastability (Criterion 4)",
 ]
+
+# Per-worker RSS estimate used by the pre-flight RAM check.  Sized for
+# the default PourbaixCache caps (8/8/8) plus an 8-shard SnapshotLoader
+# cache, snapshot indexes, pymatgen baseline, and a typical
+# build_pourbaix_entries transient peak.
+EST_PER_WORKER_GB = 2.5
+
+
+def _available_memory_gb():
+    """Return MemAvailable from /proc/meminfo as float GB.
+
+    Returns ``None`` on platforms without ``/proc/meminfo`` (macOS,
+    Windows) so callers can skip the warning gracefully.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    kib = int(line.split()[1])
+                    return kib / (1024 * 1024)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    return None
 
 
 def run_seawater_screening(
@@ -280,6 +304,23 @@ def run_seawater_screening(
     if mp_client is None:
         mp_client = get_client()
 
+    # Pre-flight RAM check.  Each worker is sized for ~EST_PER_WORKER_GB;
+    # warn if the requested fan-out doesn't fit in 80% of available RAM,
+    # since OS OOM-kills here are silent (no Python traceback).
+    if n_workers > 1:
+        avail_gb = _available_memory_gb()
+        if avail_gb is not None:
+            need_gb = n_workers * EST_PER_WORKER_GB
+            if need_gb > 0.8 * avail_gb:
+                suggested = max(1, int(0.8 * avail_gb / EST_PER_WORKER_GB))
+                logger.warning(
+                    "n_workers=%d * ~%.1f GB/worker (~%.0f GB) exceeds 80%% "
+                    "of available memory (%.0f GB). Workers may be silently "
+                    "OOM-killed by the kernel. Consider n_workers=%d.",
+                    n_workers, EST_PER_WORKER_GB, need_gb,
+                    avail_gb, suggested,
+                )
+
     # Common keyword args for the worker function
     worker_kwargs = dict(
         element=element,
@@ -312,13 +353,59 @@ def run_seawater_screening(
         )
 
         pool_args = [(chunk, chunk_id) for chunk_id, chunk in enumerate(chunks)]
+        original_by_cid = {cid: chunk for chunk, cid in pool_args}
+        results_by_cid = {}
 
-        with Pool(n_workers) as pool:
-            processed_chunks = pool.starmap(
-                _process_chunk_wrapper,
-                [(chunk, cid, worker_kwargs) for chunk, cid in pool_args],
-            )
+        # ProcessPoolExecutor (vs. multiprocessing.Pool) raises
+        # BrokenProcessPool when a worker dies unexpectedly (OOM, segfault),
+        # so the parent recovers gracefully instead of hanging forever.
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            future_to_cid = {
+                pool.submit(
+                    _process_chunk_wrapper, chunk, cid, worker_kwargs,
+                ): cid
+                for chunk, cid in pool_args
+            }
+            try:
+                for fut in as_completed(future_to_cid):
+                    cid = future_to_cid[fut]
+                    try:
+                        results_by_cid[cid] = fut.result()
+                    except BrokenProcessPool:
+                        logger.error(
+                            "Worker %d died (likely OOM-killed). "
+                            "Recovering chunk from runtime_sheets/.",
+                            cid,
+                        )
+                        results_by_cid[cid] = _recover_chunk_for_core(
+                            runtime_dir, element, cid,
+                            original_by_cid[cid],
+                        )
+                    except Exception:
+                        logger.exception("Worker %d raised", cid)
+                        raise
+            except BrokenProcessPool:
+                # One dead worker breaks the whole pool; any pending
+                # futures will not return.  Fall through and recover
+                # them all from disk checkpoints below.
+                logger.error(
+                    "ProcessPool broken — recovering remaining chunks "
+                    "from runtime_sheets/."
+                )
 
+        # Anything that never returned: pull from checkpoints, else
+        # keep the original chunk so restart=True can finish it later.
+        for cid, chunk in original_by_cid.items():
+            if cid not in results_by_cid:
+                logger.error(
+                    "Chunk %d never returned. Recovering from checkpoint.",
+                    cid,
+                )
+                results_by_cid[cid] = _recover_chunk_for_core(
+                    runtime_dir, element, cid, chunk,
+                )
+
+        processed_chunks = [results_by_cid[cid] for cid in sorted(results_by_cid)]
         df = pd.concat(processed_chunks, ignore_index=True)
 
     # Final save
@@ -394,6 +481,36 @@ def _load_checkpoints(runtime_dir, element):
             dfs.append(pd.read_excel(parts[-1]))
 
     return dfs
+
+
+def _recover_chunk_for_core(runtime_dir, element, core_id, original_chunk):
+    """Return the best available DataFrame for *core_id* after a worker death.
+
+    Prefers ``{element}_core{core_id}_final.xlsx``, falls back to the
+    highest-numbered ``_partN.xlsx``, and finally returns *original_chunk*
+    unchanged (NaN seawater columns) so a subsequent ``restart=True`` run
+    can pick up where this one left off.
+    """
+    if not os.path.isdir(runtime_dir):
+        return original_chunk
+
+    pattern = os.path.join(
+        runtime_dir, f"{element}_core{core_id}_*.xlsx",
+    )
+    matches = _glob.glob(pattern)
+    if not matches:
+        return original_chunk
+
+    final = [f for f in matches if "_final." in f]
+    if final:
+        return pd.read_excel(final[0])
+
+    parts = [f for f in matches if "_part" in f]
+    if parts:
+        parts.sort(key=lambda f: int(re.search(r"_part(\d+)", f).group(1)))
+        return pd.read_excel(parts[-1])
+
+    return original_chunk
 
 
 def _split_dataframe(df, n_workers):

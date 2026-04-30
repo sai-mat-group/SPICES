@@ -21,8 +21,7 @@ import json
 import logging
 import os
 import pickle
-from collections import defaultdict
-from functools import lru_cache
+from collections import OrderedDict, defaultdict
 
 from spices.mp_snapshot import THERMO_TYPE
 
@@ -39,6 +38,28 @@ COLLECTIONS = {
 
 # Files we never want to index (partition-level manifests).
 SKIP_FILENAMES = {"manifest.jsonl.gz", "manifest.parquet"}
+
+# Default size for the per-instance shard LRU.  Overridable via
+# ``SPICES_SHARD_CACHE`` env var so multi-worker runs on tight-RAM
+# machines can shrink the cache; HPC users with abundant RAM can grow
+# it for batch jobs that hammer the same shards repeatedly.  Each cached
+# shard holds a fully parsed list of JSON docs (typical thermo shard
+# ~10–30 MB in memory).  Default 8 → ~80–240 MB ceiling per worker.
+DEFAULT_SHARD_CACHE_SIZE = 8
+
+
+def _atomic_pickle_dump(obj, path, protocol=pickle.HIGHEST_PROTOCOL):
+    """Pickle *obj* to *path* via a PID-tagged temp file + ``os.replace``.
+
+    Atomic on POSIX, so concurrent workers building the same index can't
+    leave a truncated pickle that the next reader hits as ``EOFError``.
+    """
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "wb") as f:
+        pickle.dump(obj, f, protocol=protocol)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 # Bumped when on-disk pickle format changes incompatibly.  v2 added
 # multi-subroot thermo and switched by_mid values from a single tuple
@@ -106,7 +127,8 @@ class SnapshotLoader:
         Release date string, e.g. ``"2025-06-09"``.
     """
 
-    def __init__(self, snapshot_root, release="2025-06-09"):
+    def __init__(self, snapshot_root, release="2025-06-09",
+                 shard_cache_size=None):
         self.snapshot_root = snapshot_root
         self.release = release
         self.release_root = os.path.join(snapshot_root, release)
@@ -120,6 +142,18 @@ class SnapshotLoader:
             )
 
         self._indexes = {}  # collection_name -> Index
+
+        # Per-instance LRU for parsed shards.  Size: explicit kwarg >
+        # SPICES_SHARD_CACHE env var > DEFAULT_SHARD_CACHE_SIZE.  After
+        # fork() each worker gets its own (process-private) cache, so
+        # the cap directly bounds per-worker RSS contribution from
+        # snapshot reads.
+        if shard_cache_size is None:
+            shard_cache_size = int(
+                os.environ.get("SPICES_SHARD_CACHE", DEFAULT_SHARD_CACHE_SIZE)
+            )
+        self._shard_cache_size = shard_cache_size
+        self._shard_cache = OrderedDict()  # shard_relpath -> list[dict]
 
     # ------------------------------------------------------------------
     # Index build + load
@@ -165,8 +199,7 @@ class SnapshotLoader:
         if idx is None:
             idx = self._build_index(collection)
             os.makedirs(self.index_dir, exist_ok=True)
-            with open(idx_path, "wb") as f:
-                pickle.dump(idx, f, protocol=pickle.HIGHEST_PROTOCOL)
+            _atomic_pickle_dump(idx, idx_path)
             logger.info("Wrote index %s", idx_path)
 
         self._indexes[collection] = idx
@@ -258,9 +291,17 @@ class SnapshotLoader:
     # Shard reads (with per-shard LRU cache)
     # ------------------------------------------------------------------
 
-    @lru_cache(maxsize=32)
     def _load_shard(self, shard_relpath):
-        """Parse an entire shard once; cache the list of dicts."""
+        """Parse an entire shard once; cache the list of dicts.
+
+        LRU-bounded by ``self._shard_cache_size`` (env var
+        ``SPICES_SHARD_CACHE``, default 8).  After fork() each worker
+        owns its own cache, so the cap directly limits per-worker RSS.
+        """
+        if shard_relpath in self._shard_cache:
+            self._shard_cache.move_to_end(shard_relpath)
+            return self._shard_cache[shard_relpath]
+
         full = os.path.join(self.release_root, shard_relpath)
         docs = []
         with gzip.open(full, "rt") as gz:
@@ -268,6 +309,10 @@ class SnapshotLoader:
                 if not line.strip():
                     continue
                 docs.append(json.loads(line))
+
+        self._shard_cache[shard_relpath] = docs
+        while len(self._shard_cache) > self._shard_cache_size:
+            self._shard_cache.popitem(last=False)
         return docs
 
     def get_doc(self, collection, material_id):
