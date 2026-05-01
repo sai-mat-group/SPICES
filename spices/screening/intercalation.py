@@ -17,7 +17,6 @@ import ast
 import logging
 import os
 import time
-from multiprocessing import Pool
 
 import numpy as np
 import pandas as pd
@@ -909,7 +908,7 @@ def run_intercalation_screening(
     selection_criteria=None,
     decomp_energy=None,
     use_only_on_hull_phases=True,
-    save_plots=False,
+    save_plots=True,
     save_component_graphs=True,
     cache_dir=".",
     mp_client=None,

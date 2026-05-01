@@ -7,9 +7,10 @@ CLI wrappers and HPC submission templates for running SPICES pipeline stages.
 | Script | Purpose |
 |--------|---------|
 | `run_seawater_screening.py` | CLI wrapper for Stage 2 seawater screening |
-| `run_intercalation_screening.py` | CLI wrapper for Stage 3 intercalation voltage screening |
+| `run_intercalation_screening.py` | CLI wrapper for Stage 3 intercalation voltage screening (single-core) |
 | `submit_seawater.sh` | SLURM template for Stage 2 |
-| `submit_intercalation.sh` | SLURM template for Stage 3 |
+
+Stage 3 runs as a single process and is intended to be launched directly on a workstation; no SLURM template is provided.
 
 ## Local Usage
 

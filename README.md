@@ -212,19 +212,18 @@ scripts/                       # CLI wrappers and HPC submission templates
     run_intercalation_screening.py  # CLI for Stage 3
     run_framework_comparison.py # CLI for Stage 4 (graph + optional set comparison)
     run_statistics.py          # CLI for Stage 5
-    submit_seawater.sh         # SLURM submission template
-    submit_intercalation.sh    # SLURM submission template
+    submit_seawater.sh         # SLURM submission template (Stage 2 only — Stage 3 runs single-core)
 ```
 
 ## HPC / Multiprocessing
 
-Stages 2-3 support HPC execution via CLI scripts:
+Only Stage 2 benefits from parallel execution — Stages 3-5 run as single processes and should be launched directly on a workstation rather than submitted to a SLURM queue.
 
 ```bash
 # Stage 2: seawater screening (parallel, 8 cores)
 python scripts/run_seawater_screening.py Ca input.xlsx -o output.xlsx -n 8
 
-# Stage 3: intercalation voltage screening
+# Stage 3: intercalation voltage screening (single-core)
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/
 
 # Stage 3 with per-plateau pH-overlap PDFs, without component graphs
@@ -237,9 +236,8 @@ python scripts/run_framework_comparison.py Ca --stage3-dir ./intercalation_resul
 # Stage 4 with optional set-based comparison
 python scripts/run_framework_comparison.py Ca --stage3-dir ./intercalation_results/ --sets
 
-# HPC submission (edit the .sh files first)
+# Stage 2 HPC submission (edit submit_seawater.sh first)
 sbatch scripts/submit_seawater.sh
-sbatch scripts/submit_intercalation.sh
 ```
 
 See `scripts/README.md` for details.
