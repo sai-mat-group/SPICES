@@ -65,27 +65,26 @@ def save_component_graphs(graphs, save_dir):
         logger.info("Saved component graph %d to %s", idx, out_path)
 
 
-def enrich_sheet_with_charged_mp_phases(
+def discover_new_charged_rows_for_file(
     df,
     working_ion,
     mp_client,
-    cache,
     element_str,
     charged_struct_dir="charged_structs",
     struct_dir="structs",
     structure_cache_dir="All_charged_structures",
     cache_dict=None,
     matcher=None,
-    decomp_energy_for_metastability=0.3,
 ):
-    """Append fully-charged MP phases to the composition sheet.
+    """Discover new charged MP phases for one composition sheet.
 
-    For each discharged row, look up every MP id whose charged framework
-    structurally matches via
-    :func:`spices.intercalation.structure.find_structures`.  Query MP
-    thermo data and compute seawater metastability for each new id, then
-    append as new rows.  Narrow candidate set: only MP ids that match at
-    least one discharged row's charged framework are added.
+    Phase 1 of the parallel step-2 pipeline: for each discharged row,
+    look up every MP id whose charged framework structurally matches
+    via :func:`spices.intercalation.structure.find_structures` and
+    fetch its MP thermo data.  Returns the new rows with NaN
+    placeholders in the seawater columns — Phase 2 fills them in by
+    calling :func:`update_seawater_metastability_columns_by_mp_id` per
+    row.
 
     Parameters
     ----------
@@ -93,28 +92,24 @@ def enrich_sheet_with_charged_mp_phases(
         Composition sheet (from step 1).  Must contain ``'MP id'``.
     working_ion : str
     mp_client : MPRester
-    cache : PourbaixCache
     element_str : str
     charged_struct_dir, struct_dir, structure_cache_dir : str
     cache_dict : dict or None
         Shared structure cache for
         :func:`read_or_generate_charged_struct`.
     matcher : StructureMatcher or None
-    decomp_energy_for_metastability : float
 
     Returns
     -------
     pd.DataFrame
-        Enriched frame with new rows appended (``ignore_index=True``).
+        New rows (one per newly discovered MP id) with seawater columns
+        as NaN.  Empty DataFrame if no new mp ids matched.
     """
     from spices.intercalation.structure import (
         read_or_generate_charged_struct,
         find_structures,
     )
     from spices.screening.mp_query import collect_mp_data_from_chemsys
-    from spices.dataframe_ops import (
-        update_seawater_metastability_columns_by_mp_id,
-    )
 
     if cache_dict is None:
         cache_dict = {}
@@ -143,9 +138,9 @@ def enrich_sheet_with_charged_mp_phases(
 
     if not new_mpids:
         logger.info("No new charged structures to add")
-        return df
+        return pd.DataFrame()
 
-    logger.info("Adding %d charged structures", len(new_mpids))
+    logger.info("Discovered %d new charged structures", len(new_mpids))
 
     data_dict_list = collect_mp_data_from_chemsys(
         chemsys=None,
@@ -157,28 +152,104 @@ def enrich_sheet_with_charged_mp_phases(
         d["Structure stable in water"] = np.nan
         d["Structure metastable in water"] = np.nan
 
-    new_rows_df = pd.DataFrame(data_dict_list)
+    return pd.DataFrame(data_dict_list)
 
-    out = df
+
+def add_seawater_metastability_bool_columns(df):
+    """Add ``{col}_bool`` columns alongside every Seawater metastability
+    criterion column.
+
+    For each column matching ``Seawater metastability (Criterion N)``,
+    creates a boolean companion ``Seawater metastability (Criterion
+    N)_bool`` whose value is True iff the cell is a non-empty
+    list/tuple.  Modifies *df* in place and also returns it.
+    """
+    crit_cols = [
+        c for c in df.columns
+        if c.startswith("Seawater metastability (Criterion ")
+        and not c.endswith("_bool")
+    ]
+    for col in crit_cols:
+        df[f"{col}_bool"] = df[col].apply(
+            lambda v: bool(isinstance(v, (list, tuple)) and len(v) > 0)
+        )
+    return df
+
+
+def enrich_sheet_with_charged_mp_phases(
+    df,
+    working_ion,
+    mp_client,
+    cache,
+    element_str,
+    charged_struct_dir="charged_structs",
+    struct_dir="structs",
+    structure_cache_dir="All_charged_structures",
+    cache_dict=None,
+    matcher=None,
+    decomp_energy_for_metastability=0.3,
+):
+    """Append fully-charged MP phases (with seawater metastability) to one sheet.
+
+    Sequential composition of :func:`discover_new_charged_rows_for_file`
+    and a per-row call to
+    :func:`update_seawater_metastability_columns_by_mp_id`, followed by
+    :func:`add_seawater_metastability_bool_columns`.  Used by the
+    sequential (``n_workers <= 1``) path of
+    :func:`spices.screening.intercalation.step2_enrich_charged_composition_sheets`.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Composition sheet (from step 1).  Must contain ``'MP id'``.
+    working_ion : str
+    mp_client : MPRester
+    cache : PourbaixCache
+    element_str : str
+    charged_struct_dir, struct_dir, structure_cache_dir : str
+    cache_dict : dict or None
+        Shared structure cache for
+        :func:`read_or_generate_charged_struct`.
+    matcher : StructureMatcher or None
+    decomp_energy_for_metastability : float
+
+    Returns
+    -------
+    pd.DataFrame
+        Enriched frame with new rows appended (``ignore_index=True``).
+    """
+    from spices.dataframe_ops import (
+        update_seawater_metastability_columns_by_mp_id,
+    )
+
+    new_rows_df = discover_new_charged_rows_for_file(
+        df,
+        working_ion=working_ion,
+        mp_client=mp_client,
+        element_str=element_str,
+        charged_struct_dir=charged_struct_dir,
+        struct_dir=struct_dir,
+        structure_cache_dir=structure_cache_dir,
+        cache_dict=cache_dict,
+        matcher=matcher,
+    )
+    if len(new_rows_df) == 0:
+        return df
+
+    enriched_rows = []
     for _, row in new_rows_df.iterrows():
-        new_row = update_seawater_metastability_columns_by_mp_id(
-            row, cache=cache, mp_client=mp_client,
-            element_str=element_str,
-            metastability_points=True,
-            decomp_energy_for_metastability=decomp_energy_for_metastability,
+        enriched_rows.append(
+            update_seawater_metastability_columns_by_mp_id(
+                row, cache=cache, mp_client=mp_client,
+                element_str=element_str,
+                metastability_points=True,
+                decomp_energy_for_metastability=decomp_energy_for_metastability,
+            )
         )
-        for col in new_row.index:
-            if col.startswith("Seawater metastability (Criterion "):
-                val = new_row[col]
-                new_row[f"{col}_bool"] = bool(
-                    isinstance(val, (list, tuple)) and len(val) > 0
-                )
+    enriched_df = pd.DataFrame(enriched_rows)
+    add_seawater_metastability_bool_columns(enriched_df)
 
-        out = pd.concat(
-            [out, new_row.to_frame().T], ignore_index=True,
-        )
-
-    return out
+    return pd.concat([df, enriched_df], ignore_index=True)
 
 
 def _load_row_struct(mp_id, formula, struct_dir, structure_cache_dir):

@@ -7,25 +7,30 @@ CLI wrappers and HPC submission templates for running SPICES pipeline stages.
 | Script | Purpose |
 |--------|---------|
 | `run_seawater_screening.py` | CLI wrapper for Stage 2 seawater screening |
-| `run_intercalation_screening.py` | CLI wrapper for Stage 3 intercalation voltage screening (single-core) |
+| `run_intercalation_screening.py` | CLI wrapper for Stage 3 intercalation voltage screening |
 | `submit_seawater.sh` | SLURM template for Stage 2 |
+| `submit_intercalation.sh` | SLURM template for Stage 3 |
 
-Stage 3 runs as a single process and is intended to be launched directly on a workstation; no SLURM template is provided.
+Stage 2 and Stage 3 sub-step 2 (sea-Pourbaix evaluation of newly discovered charged structures) parallelize via `-n N`.  Stage 3 sub-steps 1, 3, and 4 run sequentially in the parent.
 
 ## Local Usage
 
 ```bash
-# Sequential (single core)
+# Stage 2 — sequential (single core)
 python scripts/run_seawater_screening.py Ca stage1_results.xlsx -o seawater_results.xlsx
 
-# Parallel (8 cores)
+# Stage 2 — parallel (8 cores)
 python scripts/run_seawater_screening.py Ca stage1_results.xlsx -o seawater_results.xlsx -n 8
 
 # See all options
 python scripts/run_seawater_screening.py --help
 
-# Stage 3: Intercalation voltage screening
+# Stage 3 — sequential
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/
+
+# Stage 3 — parallel sub-step 2 (8 cores), resume from checkpoint
+python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ -n 8
+python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ -n 8 --restart
 
 # With plot saving
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ --save-plots
@@ -36,20 +41,22 @@ python scripts/run_intercalation_screening.py --help
 
 ## HPC Usage (SLURM)
 
-1. Edit `submit_seawater.sh`:
+1. Edit `submit_seawater.sh` or `submit_intercalation.sh`:
    - Set `CONDA_PATH` to your conda installation
    - Set `ENV_NAME` to the environment with SPICES installed
-   - Set `ELEMENT`, `INPUT`, `OUTPUT`, `NCORES`, etc.
+   - Set `ELEMENT`, `INPUT`, `OUTPUT`/`OUTPUT_DIR`, `NCORES`, etc.
 
 2. Submit:
    ```bash
    sbatch scripts/submit_seawater.sh
+   sbatch scripts/submit_intercalation.sh
    ```
 
 3. Monitor:
    ```bash
    squeue -u $USER
    tail -f spices_sea_*.log
+   tail -f spices_int_*.log
    ```
 
 ## Output Files
@@ -63,3 +70,5 @@ When running with multiple workers, intermediate files are saved to:
 - Final merged output at the path specified by `-o`
 
 Runtime sheets are automatically cleaned up after a successful run.
+
+For Stage 3 sub-step 2, the same `runtime_sheets/` and `process_logs/` directories are used (rooted at the intercalation `output_dir`).  The `--restart` flag resumes from per-row checkpoints.

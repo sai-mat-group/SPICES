@@ -209,26 +209,33 @@ spices/
 
 scripts/                       # CLI wrappers and HPC submission templates
     run_seawater_screening.py  # CLI for Stage 2 (supports multiprocessing)
-    run_intercalation_screening.py  # CLI for Stage 3
+    run_intercalation_screening.py  # CLI for Stage 3 (supports multiprocessing in sub-step 2)
     run_framework_comparison.py # CLI for Stage 4 (graph + optional set comparison)
     run_statistics.py          # CLI for Stage 5
-    submit_seawater.sh         # SLURM submission template (Stage 2 only — Stage 3 runs single-core)
+    submit_seawater.sh         # SLURM submission template for Stage 2
+    submit_intercalation.sh    # SLURM submission template for Stage 3
 ```
 
 ## HPC / Multiprocessing
 
-Only Stage 2 benefits from parallel execution — Stages 3-5 run as single processes and should be launched directly on a workstation rather than submitted to a SLURM queue.
+Stage 2 and Stage 3 sub-step 2 (sea-Pourbaix evaluation of newly discovered charged structures) both parallelize via `-n N`.  Stage 3 sub-steps 1, 3, and 4 run sequentially in the parent; Stages 4 and 5 are single-process and should be launched directly on a workstation.
+
+For multi-worker runs against the snapshot backend, export `SPICES_MP_BACKEND=snapshot` (and `SPICES_MP_SNAPSHOT_ROOT`, `SPICES_MP_SNAPSHOT_RELEASE`) so each forked worker resolves the same backend — see the `run_seawater_screening` docstring for the full caveat.
 
 ```bash
 # Stage 2: seawater screening (parallel, 8 cores)
 python scripts/run_seawater_screening.py Ca input.xlsx -o output.xlsx -n 8
 
-# Stage 3: intercalation voltage screening (single-core)
-python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/
+# Stage 3: intercalation voltage screening (parallel sub-step 2, 8 cores)
+python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ -n 8
 
 # Stage 3 with per-plateau pH-overlap PDFs, without component graphs
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ \
     --save-plots --no-component-graphs
+
+# Stage 3 — resume an interrupted multi-worker run from per-row checkpoints
+python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ \
+    -n 8 --restart
 
 # Stage 4: framework comparison (graph-based by default)
 python scripts/run_framework_comparison.py Ca --stage3-dir ./intercalation_results/
@@ -236,8 +243,9 @@ python scripts/run_framework_comparison.py Ca --stage3-dir ./intercalation_resul
 # Stage 4 with optional set-based comparison
 python scripts/run_framework_comparison.py Ca --stage3-dir ./intercalation_results/ --sets
 
-# Stage 2 HPC submission (edit submit_seawater.sh first)
+# HPC submission (edit the templates first)
 sbatch scripts/submit_seawater.sh
+sbatch scripts/submit_intercalation.sh
 ```
 
 See `scripts/README.md` for details.

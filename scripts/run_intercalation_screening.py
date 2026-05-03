@@ -10,6 +10,12 @@ Usage examples:
     # With custom output and plot saving
     python scripts/run_intercalation_screening.py Ca seawater_results.xlsx \
         -o Ca_intercalation/ --save-plots --cache-dir ./data
+
+    # Parallel sub-step 2 (8 workers); resume after a partial run
+    python scripts/run_intercalation_screening.py Ca seawater_results.xlsx \
+        -n 8
+    python scripts/run_intercalation_screening.py Ca seawater_results.xlsx \
+        -n 8 --restart
 """
 
 import argparse
@@ -80,6 +86,31 @@ def main():
         default=None,
         help="Materials Project API key (default: from MP_API_KEY env var)",
     )
+    parser.add_argument(
+        "-n", "--n-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of parallel workers for sub-step 2 sea-Pourbaix "
+            "evaluation (default: 1 = sequential).  Multi-worker mode "
+            "requires SPICES_MP_BACKEND env var when using the snapshot "
+            "backend."
+        ),
+    )
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help=(
+            "Resume sub-step 2 from per-row checkpoints in "
+            "{output_dir}/runtime_sheets/ (multi-worker mode only)."
+        ),
+    )
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=100,
+        help="Sub-step 2 worker checkpoint interval in rows (default: 100).",
+    )
 
     args = parser.parse_args()
 
@@ -101,6 +132,9 @@ def main():
         save_component_graphs=args.save_component_graphs,
         cache_dir=args.cache_dir,
         mp_client=mp_client,
+        n_workers=args.n_workers,
+        restart=args.restart,
+        save_interval=args.save_interval,
     )
 
     total_plateaus = sum(

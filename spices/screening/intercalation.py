@@ -14,9 +14,13 @@ parameterized implementation.
 """
 
 import ast
+import glob as _glob
 import logging
 import os
+import shutil
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
 import pandas as pd
@@ -26,6 +30,7 @@ from spices.config import (
     WORKING_ION_PARAMS,
     DEFAULT_SELECTION_CRITERIA,
     INTERCALATION_DECOMP_ENERGY_THRESHOLD,
+    SEAWATER_DECOMP_ENERGY_THRESHOLD,
     DEFAULT_OER_SHIFT,
     DEFAULT_HER_SHIFT,
 )
@@ -42,12 +47,26 @@ from spices.intercalation.voltage import (
 from spices.intercalation.hull import filter_df_to_get_on_hull_phases
 from spices.intercalation.grouping import (
     enrich_sheet_with_charged_mp_phases,
+    discover_new_charged_rows_for_file,
+    add_seawater_metastability_bool_columns,
     build_graph_components_from_sheet,
     save_component_graphs,
 )
 from spices.dataframe_ops import update_seawater_metastability_columns_by_mp_id
+from spices.screening.seawater import (
+    EST_PER_WORKER_GB,
+    _available_memory_gb,
+    _split_dataframe,
+    _load_checkpoints,
+    _recover_chunk_for_core,
+)
 
 logger = logging.getLogger(__name__)
+
+# Tag column added to flattened new-row DataFrame so Phase 3 can re-split
+# results back to their source composition xlsx.  Must survive every
+# checkpoint write/load cycle.
+SOURCE_FILE_COLUMN = "_source_file"
 
 # ====================================================================
 # Column name mappings
@@ -615,6 +634,318 @@ def step1_create_unique_composition_sheets(
     return filenames
 
 
+def _atomic_write_xlsx(df, path):
+    """Write *df* to *path* atomically via tmp + ``os.replace``.
+
+    Prevents a SIGKILLed worker from leaving a half-written xlsx that
+    a later read would interpret as corrupt.  PID-tagged tmp filename
+    avoids two writers clobbering each other.  Tmp suffix is
+    ``.tmp.<pid>.xlsx`` so pandas/openpyxl extension validation
+    accepts it.
+    """
+    tmp = f"{path}.tmp.{os.getpid()}.xlsx"
+    df.to_excel(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def _cleanup_orphan_tmp_xlsx(directory):
+    """Remove ``*.tmp.<pid>.xlsx`` left by SIGKILLed workers."""
+    if not os.path.isdir(directory):
+        return
+    for orphan in _glob.glob(os.path.join(directory, "*.xlsx.tmp.*.xlsx")):
+        try:
+            os.remove(orphan)
+            logger.info("Removed orphan tmp file: %s", orphan)
+        except OSError:
+            pass
+
+
+def _phase1_discover_all_files(
+    composition_dir,
+    working_ion,
+    mp_client,
+    element_str,
+    charged_struct_dir,
+    struct_dir,
+    structure_cache_dir,
+):
+    """Phase 1: sequentially scan every composition xlsx and tag new
+    charged rows with their source file.
+
+    Returns
+    -------
+    originals_by_file : dict[str, pd.DataFrame]
+        Original (unenriched) df keyed by filename.
+    all_new_rows_df : pd.DataFrame
+        Concatenation of every new row across all files, with a
+        :data:`SOURCE_FILE_COLUMN` column.  Empty DataFrame if no file
+        had any new mp ids.
+    """
+    excel_files = sorted(
+        f for f in os.listdir(composition_dir) if f.endswith(".xlsx")
+    )
+    total = len(excel_files)
+    cache_dict = {}
+    originals_by_file = {}
+    new_row_frames = []
+
+    t0 = time.time()
+    for idx, fname in enumerate(excel_files):
+        logger.info("[%d/%d] Phase 1 discovery: %s", idx + 1, total, fname)
+        path = os.path.join(composition_dir, fname)
+        df = pd.read_excel(path)
+        originals_by_file[fname] = df
+
+        new_rows_df = discover_new_charged_rows_for_file(
+            df,
+            working_ion=working_ion,
+            mp_client=mp_client,
+            element_str=element_str,
+            charged_struct_dir=charged_struct_dir,
+            struct_dir=struct_dir,
+            structure_cache_dir=structure_cache_dir,
+            cache_dict=cache_dict,
+        )
+        if len(new_rows_df) > 0:
+            new_rows_df = new_rows_df.copy()
+            new_rows_df[SOURCE_FILE_COLUMN] = fname
+            new_row_frames.append(new_rows_df)
+
+    if new_row_frames:
+        all_new_rows_df = pd.concat(new_row_frames, ignore_index=True)
+    else:
+        all_new_rows_df = pd.DataFrame()
+
+    logger.info(
+        "Phase 1 discovery: %.1fs, %d new rows across %d files",
+        time.time() - t0, len(all_new_rows_df), total,
+    )
+    return originals_by_file, all_new_rows_df
+
+
+def _seal_seawater_columns_for_evaluation(df):
+    """Insert empty Seawater stability / Criterion 4 columns if missing.
+
+    Worker logic uses NaN in ``Seawater stability`` to detect "not yet
+    evaluated".  Establish that placeholder up front so the restart
+    merge has somewhere to write.  Both columns are object dtype so
+    they can hold a mix of NaN, bool, and list cells.
+    """
+    if "Seawater stability" not in df.columns:
+        df["Seawater stability"] = np.nan
+    if "Seawater metastability (Criterion 4)" not in df.columns:
+        df["Seawater metastability (Criterion 4)"] = None
+    df["Seawater stability"] = df["Seawater stability"].astype(object)
+    df["Seawater metastability (Criterion 4)"] = df[
+        "Seawater metastability (Criterion 4)"
+    ].astype(object)
+    return df
+
+
+def _merge_evaluated_new_rows(target_df, source_df):
+    """Copy seawater columns from *source_df* into *target_df*.
+
+    Match on ``(SOURCE_FILE_COLUMN, MP id)``.  Only rows still NaN in
+    ``Seawater stability`` get updated.  Modifies *target_df* in place.
+    """
+    if source_df is None or len(source_df) == 0:
+        return
+    if SOURCE_FILE_COLUMN not in source_df.columns:
+        return
+    if "Seawater stability" not in source_df.columns:
+        return
+
+    eval_mask = source_df["Seawater stability"].notna()
+    if not eval_mask.any():
+        return
+
+    available = [
+        c for c in
+        ["Seawater stability", "Seawater metastability (Criterion 4)"]
+        if c in source_df.columns
+    ]
+    # Object dtype lets us write bool/list cells into the same column.
+    for col in available:
+        if col in target_df.columns:
+            target_df[col] = target_df[col].astype(object)
+
+    src_eval = source_df.loc[eval_mask].set_index(
+        [SOURCE_FILE_COLUMN, "MP id"],
+    )
+
+    for i in target_df.index:
+        if pd.notna(target_df.at[i, "Seawater stability"]):
+            continue
+        key = (
+            target_df.at[i, SOURCE_FILE_COLUMN],
+            target_df.at[i, "MP id"],
+        )
+        if key not in src_eval.index:
+            continue
+        for col in available:
+            target_df.at[i, col] = src_eval.at[key, col]
+
+
+def _process_chunk_wrapper_intercalation(chunk_df, chunk_id, kwargs):
+    """ProcessPoolExecutor entry point — unpacks kwargs."""
+    return _process_chunk_intercalation(chunk_df, chunk_id, **kwargs)
+
+
+def _process_chunk_intercalation(
+    chunk_df,
+    chunk_id,
+    element_str,
+    cache_dir,
+    runtime_dir,
+    log_dir,
+    decomp_energy_for_metastability,
+    save_interval,
+    max_retries,
+    retry_delay,
+    restart=False,
+):
+    """Per-worker body for the parallel sea-Pourbaix evaluation.
+
+    Iterates rows of *chunk_df* and calls
+    :func:`update_seawater_metastability_columns_by_mp_id` on each.
+    Skips rows with ``Seawater stability`` already non-NaN (restart
+    safety).  Writes ``runtime_dir/{element}_core{cid}_part{N}.xlsx``
+    every ``save_interval`` rows and a ``_final.xlsx`` at the end.
+
+    The :data:`SOURCE_FILE_COLUMN` column is preserved on every
+    checkpoint write so Phase 3 can re-split results back to the
+    source composition file.
+    """
+    if SOURCE_FILE_COLUMN not in chunk_df.columns:
+        raise AssertionError(
+            f"_source_file column missing from chunk {chunk_id} "
+            "— Phase 3 cannot re-split results without it."
+        )
+
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"process_log_core{chunk_id}.txt")
+    file_handler = logging.FileHandler(log_path, mode="a" if restart else "w")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    )
+    worker_logger = logging.getLogger(f"spices.intercalation.worker.{chunk_id}")
+    worker_logger.addHandler(file_handler)
+    worker_logger.setLevel(logging.INFO)
+
+    mp_client = get_client()
+    cache = PourbaixCache(
+        entries_dir=os.path.join(cache_dir, "saved_pbx_entries"),
+        pbx_dir=os.path.join(cache_dir, "saved_pbx"),
+    )
+    os.makedirs(runtime_dir, exist_ok=True)
+
+    for index in range(len(chunk_df)):
+        row = chunk_df.iloc[index]
+
+        if pd.notna(row.get("Seawater stability")):
+            worker_logger.info(
+                "[core %d] [%d/%d] %s (%s) — skipping (already evaluated)",
+                chunk_id, index + 1, len(chunk_df),
+                row.get("Formula", "?"), row.get("MP id", "?"),
+            )
+            continue
+
+        worker_logger.info(
+            "[core %d] [%d/%d] %s (%s) [src=%s]",
+            chunk_id, index + 1, len(chunk_df),
+            row.get("Formula", "?"), row.get("MP id", "?"),
+            row.get(SOURCE_FILE_COLUMN, "?"),
+        )
+
+        for attempt in range(max_retries):
+            try:
+                updated_row = update_seawater_metastability_columns_by_mp_id(
+                    row.copy(),
+                    cache=cache,
+                    mp_client=mp_client,
+                    element_str=element_str,
+                    metastability_points=True,
+                    decomp_energy_for_metastability=(
+                        decomp_energy_for_metastability
+                    ),
+                )
+                chunk_df.iloc[index] = updated_row
+                break
+            except (AttributeError, ImportError, TypeError) as e:
+                worker_logger.error(
+                    "[core %d] Non-retryable error for %s: %s",
+                    chunk_id, row.get("MP id", "?"), e,
+                )
+                break
+            except Exception as e:
+                worker_logger.warning(
+                    "[core %d] Attempt %d/%d for %s failed: %s",
+                    chunk_id, attempt + 1, max_retries,
+                    row.get("MP id", "?"), e,
+                )
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+        else:
+            worker_logger.error(
+                "[core %d] Exhausted retries for %s, skipping.",
+                chunk_id, row.get("MP id", "?"),
+            )
+
+        if save_interval and (index + 1) % save_interval == 0:
+            part = (index // save_interval) + 1
+            ckpt_path = os.path.join(
+                runtime_dir,
+                f"{element_str}_core{chunk_id}_part{part}.xlsx",
+            )
+            chunk_df.to_excel(ckpt_path, index=False)
+            worker_logger.info(
+                "[core %d] Checkpoint: %d rows -> %s",
+                chunk_id, index + 1, ckpt_path,
+            )
+
+    final_path = os.path.join(
+        runtime_dir, f"{element_str}_core{chunk_id}_final.xlsx",
+    )
+    chunk_df.to_excel(final_path, index=False)
+    worker_logger.info(
+        "[core %d] Done. %d rows -> %s",
+        chunk_id, len(chunk_df), final_path,
+    )
+
+    worker_logger.removeHandler(file_handler)
+    file_handler.close()
+    return chunk_df
+
+
+def _phase3_redistribute_and_write(
+    originals_by_file, enriched_new_rows_df, composition_dir,
+):
+    """Phase 3: split enriched rows by source file, concat with the
+    original df, and atomically write each composition xlsx.
+
+    Files in *originals_by_file* with no enriched rows are still
+    re-written so the post-condition ("every input file is touched")
+    holds — useful for invariants in downstream tests.
+    """
+    by_source = {}
+    if len(enriched_new_rows_df) > 0:
+        by_source = dict(tuple(
+            enriched_new_rows_df.groupby(SOURCE_FILE_COLUMN, sort=False)
+        ))
+
+    for fname, original_df in originals_by_file.items():
+        path = os.path.join(composition_dir, fname)
+        new_rows = by_source.get(fname)
+        if new_rows is None or len(new_rows) == 0:
+            _atomic_write_xlsx(original_df, path)
+            continue
+
+        new_rows = new_rows.drop(columns=[SOURCE_FILE_COLUMN])
+        add_seawater_metastability_bool_columns(new_rows)
+        out = pd.concat([original_df, new_rows], ignore_index=True)
+        _atomic_write_xlsx(out, path)
+
+
 def step2_enrich_charged_composition_sheets(
     composition_dir,
     working_ion,
@@ -624,52 +955,265 @@ def step2_enrich_charged_composition_sheets(
     charged_struct_dir="charged_structs",
     struct_dir="structs",
     structure_cache_dir="All_charged_structures",
-    decomp_energy_for_metastability=0.3,
+    decomp_energy_for_metastability=SEAWATER_DECOMP_ENERGY_THRESHOLD,
+    n_workers=1,
+    cache_dir=".",
+    restart=False,
+    save_interval=100,
+    max_retries=500,
+    retry_delay=10.0,
+    output_dir=None,
 ):
     """
     Step 2: Enrich each per-composition sheet with fully-charged MP
     phases and their seawater metastability.
 
-    Replaces the legacy subgroup-creation + merge flow.  The output is
-    a single-sheet xlsx per composition, ready for the graph-based
-    partition performed in step 3.
+    Three-phase pipeline so multi-worker mode can flatten new charged
+    structures across all sheets and keep every worker fed regardless
+    of per-sheet imbalance:
+
+    1. **Phase 1 (sequential, parent)** — for each xlsx in
+       ``composition_dir``, discover new charged mp ids and fetch their
+       MP thermo data.  Tag each new row with a ``_source_file``
+       column.  Discovery stays sequential because it is light I/O
+       (mostly disk reads) and benefits from a shared
+       ``cache_dict`` that avoids duplicate MP downloads across
+       sheets.
+    2. **Phase 2 (parallel, workers)** — flatten all new rows into one
+       global DataFrame, chunk row-wise round-robin, and dispatch to a
+       :class:`ProcessPoolExecutor`.  Each worker creates its own
+       ``mp_client`` and :class:`PourbaixCache` after fork.
+       :func:`update_seawater_metastability_columns_by_mp_id` is the
+       per-row work unit (same expensive sea-Pourbaix bottleneck as
+       Stage 2).
+    3. **Phase 3 (sequential, parent)** — split enriched rows by
+       ``_source_file``, drop the tag, add ``_bool`` companion columns,
+       concat with the original df, and atomically write each
+       composition xlsx.
+
+    When ``n_workers <= 1`` Phase 2 runs sequentially in the parent;
+    no checkpoints are written and ``restart`` is a no-op.
 
     Parameters
     ----------
     composition_dir : str
+        Directory of per-composition xlsx files (output of step 1).
     working_ion : str
     mp_client : MPRester
+        Used by Phase 1 (parent) for structure discovery.  In
+        multi-worker mode workers re-resolve their own client via
+        :func:`spices.mp_client.get_client` and rely on env vars.
     cache : PourbaixCache
+        Used by the sequential ``n_workers <= 1`` path.  Workers in
+        multi-worker mode build their own caches.
     element_str : str
-    charged_struct_dir : str
-    struct_dir : str
-    structure_cache_dir : str
+    charged_struct_dir, struct_dir, structure_cache_dir : str
     decomp_energy_for_metastability : float
+    n_workers : int
+        ``1`` (default) runs Phase 2 sequentially; ``>1`` uses
+        :class:`ProcessPoolExecutor` with ``BrokenProcessPool``
+        recovery.
+    cache_dir : str
+        Directory containing ``saved_pbx/`` and
+        ``saved_pbx_entries/`` (workers build their own
+        :class:`PourbaixCache` rooted here).
+    restart : bool
+        If True (and ``n_workers > 1``), load per-row checkpoints from
+        ``runtime_sheets/`` and dispatch only un-evaluated rows.
+    save_interval : int
+        Worker writes a part-checkpoint every N rows.  ``0`` disables
+        intermediate checkpoints (final-only).
+    max_retries : int
+    retry_delay : float
+    output_dir : str or None
+        Root directory for ``runtime_sheets/`` and ``process_logs/``.
+        Defaults to the parent of ``composition_dir``.
     """
-    excel_files = [
-        f for f in os.listdir(composition_dir) if f.endswith(".xlsx")
-    ]
-    total = len(excel_files)
-    cache_dict = {}
+    if output_dir is None:
+        output_dir = os.path.dirname(composition_dir.rstrip(os.sep)) or "."
+    runtime_dir = os.path.join(output_dir, "runtime_sheets")
+    log_dir = os.path.join(output_dir, "process_logs")
 
-    for idx, fname in enumerate(excel_files):
-        logger.info("[%d/%d] Step 2: %s", idx + 1, total, fname)
-        path = os.path.join(composition_dir, fname)
+    _cleanup_orphan_tmp_xlsx(composition_dir)
 
-        df = pd.read_excel(path)
-        df_enriched = enrich_sheet_with_charged_mp_phases(
-            df,
-            working_ion,
-            mp_client,
-            cache,
-            element_str,
-            charged_struct_dir=charged_struct_dir,
-            struct_dir=struct_dir,
-            structure_cache_dir=structure_cache_dir,
-            cache_dict=cache_dict,
-            decomp_energy_for_metastability=decomp_energy_for_metastability,
+    originals_by_file, all_new_rows_df = _phase1_discover_all_files(
+        composition_dir,
+        working_ion=working_ion,
+        mp_client=mp_client,
+        element_str=element_str,
+        charged_struct_dir=charged_struct_dir,
+        struct_dir=struct_dir,
+        structure_cache_dir=structure_cache_dir,
+    )
+
+    if len(all_new_rows_df) == 0:
+        logger.info("No new charged structures to evaluate; rewriting originals.")
+        _phase3_redistribute_and_write(
+            originals_by_file, all_new_rows_df, composition_dir,
         )
-        df_enriched.to_excel(path, index=False)
+        if os.path.isdir(runtime_dir):
+            shutil.rmtree(runtime_dir)
+        return
+
+    _seal_seawater_columns_for_evaluation(all_new_rows_df)
+
+    if restart and n_workers > 1 and os.path.isdir(runtime_dir):
+        ckpt_dfs = _load_checkpoints(runtime_dir, element_str)
+        if ckpt_dfs:
+            combined = pd.concat(ckpt_dfs, ignore_index=True)
+            _merge_evaluated_new_rows(all_new_rows_df, combined)
+            logger.info(
+                "Restart: merged %d evaluated rows from checkpoints",
+                combined["Seawater stability"].notna().sum()
+                if "Seawater stability" in combined.columns else 0,
+            )
+        if os.path.isdir(runtime_dir):
+            shutil.rmtree(runtime_dir)
+
+    pending_mask = all_new_rows_df["Seawater stability"].isna()
+    pending_df = all_new_rows_df.loc[pending_mask].reset_index(drop=True)
+    evaluated_df = all_new_rows_df.loc[~pending_mask].reset_index(drop=True)
+    logger.info(
+        "Phase 2 dispatch: %d pending, %d already evaluated",
+        len(pending_df), len(evaluated_df),
+    )
+
+    if n_workers <= 1:
+        # Sequential Phase 2 — runs in parent, no subprocess pool.
+        for index in range(len(pending_df)):
+            row = pending_df.iloc[index]
+            logger.info(
+                "[seq] [%d/%d] %s (%s) [src=%s]",
+                index + 1, len(pending_df),
+                row.get("Formula", "?"), row.get("MP id", "?"),
+                row.get(SOURCE_FILE_COLUMN, "?"),
+            )
+            for attempt in range(max_retries):
+                try:
+                    updated_row = update_seawater_metastability_columns_by_mp_id(
+                        row.copy(),
+                        cache=cache,
+                        mp_client=mp_client,
+                        element_str=element_str,
+                        metastability_points=True,
+                        decomp_energy_for_metastability=(
+                            decomp_energy_for_metastability
+                        ),
+                    )
+                    pending_df.iloc[index] = updated_row
+                    break
+                except (AttributeError, ImportError, TypeError) as e:
+                    logger.error(
+                        "[seq] Non-retryable error for %s: %s",
+                        row.get("MP id", "?"), e,
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(
+                        "[seq] Attempt %d/%d for %s failed: %s",
+                        attempt + 1, max_retries,
+                        row.get("MP id", "?"), e,
+                    )
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+            else:
+                logger.error(
+                    "[seq] Exhausted retries for %s, skipping.",
+                    row.get("MP id", "?"),
+                )
+        enriched_new_rows_df = pd.concat(
+            [evaluated_df, pending_df], ignore_index=True,
+        )
+    else:
+        avail_gb = _available_memory_gb()
+        if avail_gb is not None:
+            need_gb = n_workers * EST_PER_WORKER_GB
+            if need_gb > 0.8 * avail_gb:
+                suggested = max(1, int(0.8 * avail_gb / EST_PER_WORKER_GB))
+                logger.warning(
+                    "n_workers=%d * ~%.1f GB/worker (~%.0f GB) exceeds 80%% "
+                    "of available memory (%.0f GB). Workers may be silently "
+                    "OOM-killed by the kernel. Consider n_workers=%d.",
+                    n_workers, EST_PER_WORKER_GB, need_gb, avail_gb, suggested,
+                )
+
+        worker_kwargs = dict(
+            element_str=element_str,
+            cache_dir=cache_dir,
+            runtime_dir=runtime_dir,
+            log_dir=log_dir,
+            decomp_energy_for_metastability=decomp_energy_for_metastability,
+            save_interval=save_interval,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            restart=restart,
+        )
+
+        chunks = _split_dataframe(pending_df, n_workers)
+        logger.info(
+            "Phase 2 dispatch: %d pending rows across %d workers",
+            len(pending_df), len(chunks),
+        )
+        pool_args = [(chunk, cid) for cid, chunk in enumerate(chunks)]
+        original_by_cid = {cid: chunk for chunk, cid in pool_args}
+        results_by_cid = {}
+
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            future_to_cid = {
+                pool.submit(
+                    _process_chunk_wrapper_intercalation,
+                    chunk, cid, worker_kwargs,
+                ): cid
+                for chunk, cid in pool_args
+            }
+            try:
+                for fut in as_completed(future_to_cid):
+                    cid = future_to_cid[fut]
+                    try:
+                        results_by_cid[cid] = fut.result()
+                    except BrokenProcessPool:
+                        logger.error(
+                            "Worker %d died (likely OOM-killed). "
+                            "Recovering chunk from runtime_sheets/.",
+                            cid,
+                        )
+                        results_by_cid[cid] = _recover_chunk_for_core(
+                            runtime_dir, element_str, cid,
+                            original_by_cid[cid],
+                        )
+                    except Exception:
+                        logger.exception("Worker %d raised", cid)
+                        raise
+            except BrokenProcessPool:
+                logger.error(
+                    "ProcessPool broken — recovering remaining chunks "
+                    "from runtime_sheets/."
+                )
+
+        for cid, chunk in original_by_cid.items():
+            if cid not in results_by_cid:
+                logger.error(
+                    "Chunk %d never returned. Recovering from checkpoint.",
+                    cid,
+                )
+                results_by_cid[cid] = _recover_chunk_for_core(
+                    runtime_dir, element_str, cid, chunk,
+                )
+
+        processed_chunks = [
+            results_by_cid[cid] for cid in sorted(results_by_cid)
+        ]
+        enriched_new_rows_df = pd.concat(
+            [evaluated_df] + processed_chunks, ignore_index=True,
+        )
+
+    _phase3_redistribute_and_write(
+        originals_by_file, enriched_new_rows_df, composition_dir,
+    )
+
+    if os.path.isdir(runtime_dir):
+        shutil.rmtree(runtime_dir)
+        logger.info("Cleaned up %s", runtime_dir)
 
 
 def step3_create_voltage_plateau_sheets(
@@ -912,6 +1456,11 @@ def run_intercalation_screening(
     save_component_graphs=True,
     cache_dir=".",
     mp_client=None,
+    n_workers=1,
+    restart=False,
+    save_interval=100,
+    max_retries=500,
+    retry_delay=10.0,
 ):
     """
     Run the full intercalation voltage screening pipeline (Steps 1-4).
@@ -942,6 +1491,42 @@ def run_intercalation_screening(
         Materials Project client.  If None, resolved via
         :func:`spices.mp_client.get_client` (sticky-default cache,
         ``SPICES_MP_BACKEND``/``MP_API_KEY`` env vars, or live default).
+        See **Multiprocessing and backend resolution** below for the
+        ``n_workers > 1`` case.
+    n_workers : int
+        Number of parallel workers for sub-step 2's sea-Pourbaix
+        evaluation.  ``1`` (default) runs sequentially.  Values > 1
+        flatten new charged structures across all sheets and dispatch
+        them to a :class:`ProcessPoolExecutor`.
+    restart : bool
+        If True (and ``n_workers > 1``), resume sub-step 2 from
+        per-row checkpoints in ``output_dir/runtime_sheets/``.
+    save_interval : int
+        Sub-step 2 worker writes a part-checkpoint every N rows.
+    max_retries : int
+        Maximum retries per row on transient failure.
+    retry_delay : float
+        Seconds to wait between retries.
+
+    Notes
+    -----
+    **Multiprocessing and backend resolution**
+
+    The ``mp_client`` argument is honored for Phase-1 discovery and
+    for Steps 1, 3, 4 (all run in the parent).  In sub-step 2's
+    Phase 2 (``n_workers > 1``), each worker is a separate Python
+    interpreter and re-resolves its own client via
+    :func:`spices.mp_client.get_client` with no arguments.  Workers
+    therefore rely on **environment variables inherited from the
+    parent process** to choose a backend:
+
+    * ``SPICES_MP_BACKEND`` — ``"snapshot"`` or ``"live"``.
+    * ``SPICES_MP_SNAPSHOT_ROOT``, ``SPICES_MP_SNAPSHOT_RELEASE`` —
+      snapshot backend.
+    * ``MP_API_KEY`` — live backend.
+
+    See :func:`spices.screening.seawater.run_seawater_screening`'s
+    docstring for the full discussion (same caveats apply here).
 
     Returns
     -------
@@ -1001,6 +1586,13 @@ def run_intercalation_screening(
         struct_dir=struct_dir,
         structure_cache_dir=structure_cache_dir,
         decomp_energy_for_metastability=decomp_energy,
+        n_workers=n_workers,
+        cache_dir=cache_dir,
+        restart=restart,
+        save_interval=save_interval,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+        output_dir=output_dir,
     )
 
     # Step 3
