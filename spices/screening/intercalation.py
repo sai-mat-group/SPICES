@@ -16,8 +16,10 @@ parameterized implementation.
 import ast
 import glob as _glob
 import logging
+import multiprocessing as mp
 import os
 import shutil
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
@@ -67,6 +69,16 @@ logger = logging.getLogger(__name__)
 # results back to their source composition xlsx.  Must survive every
 # checkpoint write/load cycle.
 SOURCE_FILE_COLUMN = "_source_file"
+
+# Cadence (seconds) of the parent-side aggregate "M/N files complete"
+# log emitted while Phase 1 workers run.  Per-worker file logs in
+# process_logs/phase1_core{cid}.txt give the granular trace.
+PHASE1_PROGRESS_INTERVAL = 30.0
+
+# Per-worker shared progress counter, bound by _phase1_init().  Workers
+# atomically increment after each file; the parent's progress thread
+# reads it every PHASE1_PROGRESS_INTERVAL seconds.
+_PHASE1_COUNTER = None
 
 # ====================================================================
 # Column name mappings
@@ -660,42 +672,58 @@ def _cleanup_orphan_tmp_xlsx(directory):
             pass
 
 
-def _phase1_discover_all_files(
+def _phase1_init(counter):
+    """ProcessPoolExecutor initializer — bind shared progress counter
+    in the worker's module namespace so :func:`_phase1_process_files`
+    can increment it without an explicit argument.
+    """
+    global _PHASE1_COUNTER
+    _PHASE1_COUNTER = counter
+
+
+def _phase1_process_files(
+    file_chunk,
+    chunk_id,
     composition_dir,
     working_ion,
-    mp_client,
     element_str,
     charged_struct_dir,
     struct_dir,
     structure_cache_dir,
+    log_dir,
 ):
-    """Phase 1: sequentially scan every composition xlsx and tag new
-    charged rows with their source file.
+    """Per-worker Phase 1 body.
 
-    Returns
-    -------
-    originals_by_file : dict[str, pd.DataFrame]
-        Original (unenriched) df keyed by filename.
-    all_new_rows_df : pd.DataFrame
-        Concatenation of every new row across all files, with a
-        :data:`SOURCE_FILE_COLUMN` column.  Empty DataFrame if no file
-        had any new mp ids.
+    Re-reads each assigned xlsx, runs
+    :func:`discover_new_charged_rows_for_file` with a per-worker
+    ``cache_dict`` and per-worker ``mp_client`` (resolved post-fork),
+    tags new rows with :data:`SOURCE_FILE_COLUMN`, increments the
+    shared progress counter after each file, and returns the concat.
+    Per-worker logs go to ``log_dir/phase1_core{chunk_id}.txt``
+    (mirrors Phase 2).
     """
-    excel_files = sorted(
-        f for f in os.listdir(composition_dir) if f.endswith(".xlsx")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"phase1_core{chunk_id}.txt")
+    file_handler = logging.FileHandler(log_path, mode="w")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     )
-    total = len(excel_files)
+    worker_logger = logging.getLogger(
+        f"spices.intercalation.phase1.{chunk_id}"
+    )
+    worker_logger.addHandler(file_handler)
+    worker_logger.setLevel(logging.INFO)
+
+    mp_client = get_client()
     cache_dict = {}
-    originals_by_file = {}
     new_row_frames = []
 
-    t0 = time.time()
-    for idx, fname in enumerate(excel_files):
-        logger.info("[%d/%d] Phase 1 discovery: %s", idx + 1, total, fname)
+    for fname in file_chunk:
+        worker_logger.info(
+            "[core %d] Phase 1 discovery: %s", chunk_id, fname,
+        )
         path = os.path.join(composition_dir, fname)
         df = pd.read_excel(path)
-        originals_by_file[fname] = df
-
         new_rows_df = discover_new_charged_rows_for_file(
             df,
             working_ion=working_ion,
@@ -711,14 +739,254 @@ def _phase1_discover_all_files(
             new_rows_df[SOURCE_FILE_COLUMN] = fname
             new_row_frames.append(new_rows_df)
 
-    if new_row_frames:
-        all_new_rows_df = pd.concat(new_row_frames, ignore_index=True)
-    else:
-        all_new_rows_df = pd.DataFrame()
+        if _PHASE1_COUNTER is not None:
+            with _PHASE1_COUNTER.get_lock():
+                _PHASE1_COUNTER.value += 1
 
+    worker_logger.removeHandler(file_handler)
+    file_handler.close()
+
+    if new_row_frames:
+        return pd.concat(new_row_frames, ignore_index=True)
+    return pd.DataFrame()
+
+
+def _phase1_sequential_discover(
+    excel_files,
+    originals_by_file,
+    working_ion,
+    mp_client,
+    element_str,
+    charged_struct_dir,
+    struct_dir,
+    structure_cache_dir,
+    log_progress=True,
+):
+    """Sequential Phase 1 discovery loop.
+
+    Used for the ``n_workers <= 1`` path and as the fallback after a
+    :class:`BrokenProcessPool`.  Returns the list of tagged new-row
+    DataFrames; caller concats.
+    """
+    total = len(excel_files)
+    cache_dict = {}
+    new_row_frames = []
+    for idx, fname in enumerate(excel_files):
+        if log_progress:
+            logger.info(
+                "[%d/%d] Phase 1 discovery: %s", idx + 1, total, fname,
+            )
+        else:
+            logger.info("Phase 1 sequential recovery: %s", fname)
+        df = originals_by_file[fname]
+        new_rows_df = discover_new_charged_rows_for_file(
+            df,
+            working_ion=working_ion,
+            mp_client=mp_client,
+            element_str=element_str,
+            charged_struct_dir=charged_struct_dir,
+            struct_dir=struct_dir,
+            structure_cache_dir=structure_cache_dir,
+            cache_dict=cache_dict,
+        )
+        if len(new_rows_df) > 0:
+            new_rows_df = new_rows_df.copy()
+            new_rows_df[SOURCE_FILE_COLUMN] = fname
+            new_row_frames.append(new_rows_df)
+    return new_row_frames
+
+
+def _phase1_discover_all_files(
+    composition_dir,
+    working_ion,
+    mp_client,
+    element_str,
+    charged_struct_dir,
+    struct_dir,
+    structure_cache_dir,
+    n_workers=1,
+    log_dir=None,
+):
+    """Phase 1: scan every composition xlsx and tag new charged rows
+    with their source file.
+
+    ``n_workers <= 1`` runs the original sequential loop unchanged.
+    ``n_workers > 1`` splits the file list round-robin and dispatches
+    discovery to a :class:`ProcessPoolExecutor`; each worker has its
+    own ``cache_dict`` and ``mp_client`` (resolved post-fork via
+    :func:`spices.mp_client.get_client`).  A parent-side
+    :class:`threading.Thread` logs aggregate "M/N files complete"
+    every :data:`PHASE1_PROGRESS_INTERVAL` seconds while workers run;
+    per-worker per-file logs go to
+    ``{log_dir}/phase1_core{cid}.txt``.
+
+    On :class:`BrokenProcessPool`, any chunk whose worker died is
+    retried sequentially in the parent — Phase 1 has no checkpointing
+    by design, but the on-disk struct caches make sequential retry
+    fast.
+
+    Returns
+    -------
+    originals_by_file : dict[str, pd.DataFrame]
+        Original (unenriched) df keyed by filename.
+    all_new_rows_df : pd.DataFrame
+        Concatenation of every new row across all files, with a
+        :data:`SOURCE_FILE_COLUMN` column.  Empty DataFrame if no file
+        had any new mp ids.
+    """
+    excel_files = sorted(
+        f for f in os.listdir(composition_dir) if f.endswith(".xlsx")
+    )
+    total = len(excel_files)
+
+    # Sequential pre-pass: parent reads every xlsx for originals_by_file.
+    # Cheap (<1 s for ~500 small files) and avoids shipping DataFrames
+    # back from workers via IPC.
+    originals_by_file = {
+        fname: pd.read_excel(os.path.join(composition_dir, fname))
+        for fname in excel_files
+    }
+
+    t0 = time.time()
+
+    if n_workers <= 1 or total == 0:
+        new_row_frames = _phase1_sequential_discover(
+            excel_files,
+            originals_by_file,
+            working_ion=working_ion,
+            mp_client=mp_client,
+            element_str=element_str,
+            charged_struct_dir=charged_struct_dir,
+            struct_dir=struct_dir,
+            structure_cache_dir=structure_cache_dir,
+        )
+        all_new_rows_df = (
+            pd.concat(new_row_frames, ignore_index=True)
+            if new_row_frames else pd.DataFrame()
+        )
+        logger.info(
+            "Phase 1 discovery: %.1fs, %d new rows across %d files "
+            "(n_workers=1)",
+            time.time() - t0, len(all_new_rows_df), total,
+        )
+        return originals_by_file, all_new_rows_df
+
+    # Multi-worker path.
+    if log_dir is None:
+        log_dir = os.path.join(
+            os.path.dirname(composition_dir.rstrip(os.sep)) or ".",
+            "process_logs",
+        )
+
+    # Round-robin file split so per-worker chunks are roughly balanced
+    # in size.  Drop empty chunks when n_workers > total.
+    chunks = [excel_files[i::n_workers] for i in range(n_workers)]
+    chunks = [c for c in chunks if c]
+    n_active_workers = len(chunks)
+
+    worker_kwargs = dict(
+        composition_dir=composition_dir,
+        working_ion=working_ion,
+        element_str=element_str,
+        charged_struct_dir=charged_struct_dir,
+        struct_dir=struct_dir,
+        structure_cache_dir=structure_cache_dir,
+        log_dir=log_dir,
+    )
+
+    progress_counter = mp.Value("i", 0)
+    stop_progress = threading.Event()
+
+    def _progress_logger():
+        while not stop_progress.wait(PHASE1_PROGRESS_INTERVAL):
+            with progress_counter.get_lock():
+                done = progress_counter.value
+            logger.info(
+                "Phase 1 progress: %d/%d files complete (%.1fs elapsed)",
+                done, total, time.time() - t0,
+            )
+
+    progress_thread = threading.Thread(
+        target=_progress_logger, daemon=True,
+    )
+    progress_thread.start()
+
+    new_row_frames = []
+    recover_chunks = []
+    future_to_chunk = {}
+
+    try:
+        with ProcessPoolExecutor(
+            max_workers=n_active_workers,
+            initializer=_phase1_init,
+            initargs=(progress_counter,),
+        ) as pool:
+            future_to_chunk = {
+                pool.submit(
+                    _phase1_process_files,
+                    chunk, cid, **worker_kwargs,
+                ): (cid, chunk)
+                for cid, chunk in enumerate(chunks)
+            }
+            try:
+                for fut in as_completed(future_to_chunk):
+                    cid, chunk = future_to_chunk[fut]
+                    try:
+                        result = fut.result()
+                        if len(result) > 0:
+                            new_row_frames.append(result)
+                    except BrokenProcessPool:
+                        logger.error(
+                            "Phase 1 worker %d died (likely OOM-killed). "
+                            "Will retry sequentially.",
+                            cid,
+                        )
+                        recover_chunks.append(chunk)
+                    except Exception:
+                        logger.exception("Phase 1 worker %d raised", cid)
+                        raise
+            except BrokenProcessPool:
+                logger.error(
+                    "Phase 1 ProcessPool broken — retrying remaining "
+                    "chunks sequentially."
+                )
+    finally:
+        stop_progress.set()
+        progress_thread.join(timeout=2.0)
+
+    # Sweep any chunks whose futures never returned (broken-pool kills
+    # all pending futures).
+    for fut, (cid, chunk) in future_to_chunk.items():
+        if not fut.done() and chunk not in recover_chunks:
+            recover_chunks.append(chunk)
+
+    if recover_chunks:
+        flat_recover = [fname for chunk in recover_chunks for fname in chunk]
+        logger.info(
+            "Phase 1 sequential recovery: %d files across %d failed chunks",
+            len(flat_recover), len(recover_chunks),
+        )
+        recovered_frames = _phase1_sequential_discover(
+            flat_recover,
+            originals_by_file,
+            working_ion=working_ion,
+            mp_client=mp_client,
+            element_str=element_str,
+            charged_struct_dir=charged_struct_dir,
+            struct_dir=struct_dir,
+            structure_cache_dir=structure_cache_dir,
+            log_progress=False,
+        )
+        new_row_frames.extend(recovered_frames)
+
+    all_new_rows_df = (
+        pd.concat(new_row_frames, ignore_index=True)
+        if new_row_frames else pd.DataFrame()
+    )
     logger.info(
-        "Phase 1 discovery: %.1fs, %d new rows across %d files",
-        time.time() - t0, len(all_new_rows_df), total,
+        "Phase 1 discovery: %.1fs, %d new rows across %d files "
+        "(n_workers=%d)",
+        time.time() - t0, len(all_new_rows_df), total, n_workers,
     )
     return originals_by_file, all_new_rows_df
 
@@ -972,13 +1240,16 @@ def step2_enrich_charged_composition_sheets(
     structures across all sheets and keep every worker fed regardless
     of per-sheet imbalance:
 
-    1. **Phase 1 (sequential, parent)** — for each xlsx in
-       ``composition_dir``, discover new charged mp ids and fetch their
-       MP thermo data.  Tag each new row with a ``_source_file``
-       column.  Discovery stays sequential because it is light I/O
-       (mostly disk reads) and benefits from a shared
-       ``cache_dict`` that avoids duplicate MP downloads across
-       sheets.
+    1. **Phase 1 (parallel when ``n_workers > 1``, parent otherwise)**
+       — for each xlsx in ``composition_dir``, discover new charged mp
+       ids and fetch their MP thermo data.  Tag each new row with a
+       ``_source_file`` column.  Multi-worker Phase 1 splits the file
+       list round-robin and dispatches discovery to a
+       :class:`ProcessPoolExecutor`; each worker has its own
+       ``cache_dict`` and ``mp_client`` (resolved post-fork).  No
+       checkpointing — on :class:`BrokenProcessPool` the failed
+       chunks are retried sequentially in the parent (warm disk
+       caches make this fast).
     2. **Phase 2 (parallel, workers)** — flatten all new rows into one
        global DataFrame, chunk row-wise round-robin, and dispatch to a
        :class:`ProcessPoolExecutor`.  Each worker creates its own
@@ -1044,6 +1315,8 @@ def step2_enrich_charged_composition_sheets(
         charged_struct_dir=charged_struct_dir,
         struct_dir=struct_dir,
         structure_cache_dir=structure_cache_dir,
+        n_workers=n_workers,
+        log_dir=log_dir,
     )
 
     if len(all_new_rows_df) == 0:

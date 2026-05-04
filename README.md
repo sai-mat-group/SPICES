@@ -218,7 +218,9 @@ scripts/                       # CLI wrappers and HPC submission templates
 
 ## HPC / Multiprocessing
 
-Stage 2 and Stage 3 sub-step 2 (sea-Pourbaix evaluation of newly discovered charged structures) both parallelize via `-n N`.  Stage 3 sub-steps 1, 3, and 4 run sequentially in the parent; Stages 4 and 5 are single-process and should be launched directly on a workstation.
+Stage 2 and Stage 3 sub-step 2 both parallelize via `-n N`.  Sub-step 2 is internally a 3-phase pipeline: **Phase 1** (per-file discovery of new charged MP structures, including disk-cached CIF lookup and `find_structures` formula matching) and **Phase 2** (per-row sea-Pourbaix evaluation of those new rows) both use the worker pool — only Phase 3 (atomic xlsx rewrite) is single-threaded in the parent.  Stage 3 sub-steps 1, 3, and 4 run sequentially in the parent; Stages 4 and 5 are single-process and should be launched directly on a workstation.
+
+> **Linux/Unix only.**  The multi-worker code uses `fcntl.flock` (POSIX advisory file locks) for the cross-worker `find_structures` race fix and `os.fork`-based `ProcessPoolExecutor` for the worker pool.  Run multi-worker pipelines on Linux (workstation or HPC); on Windows / macOS use `n_workers=1`.
 
 For multi-worker runs against the snapshot backend, export `SPICES_MP_BACKEND=snapshot` (and `SPICES_MP_SNAPSHOT_ROOT`, `SPICES_MP_SNAPSHOT_RELEASE`) so each forked worker resolves the same backend — see the `run_seawater_screening` docstring for the full caveat.
 
@@ -249,6 +251,18 @@ sbatch scripts/submit_intercalation.sh
 ```
 
 See `scripts/README.md` for details.
+
+### Stage 3 structure caches
+
+Sub-step 2 of Stage 3 builds three CIF caches under `{output_dir}/` (e.g. `Ca_intercalation/`).  All three are populated lazily on first use and re-read on subsequent runs to skip MP queries.
+
+| Directory | Keying | Stores | Used by |
+|---|---|---|---|
+| `structs/` | `{mp_id}.cif` | The original (discharged) MP structure as downloaded — written by `generate_charged_struct_from_MP` *before* the working ion is removed. One CIF per discharged MP id processed. | Sub-step 3 graph rendering (`build_graph_components_from_sheet` → `_load_row_struct` primary path); Stage 4 framework comparison (`load_discharged_frameworks`). |
+| `charged_structs/` | `{mp_id}.cif` | The charged framework (working-ion-removed) for each discharged MP id, written *after* `Structure.remove_species`.  Acts as the per-mp-id memoization layer for `read_or_generate_charged_struct`. | Sub-step 2 Phase 1 only (`read_or_generate_charged_struct` disk-cache hit path).  Not consumed downstream — purely a re-run accelerator. |
+| `All_charged_structures/` | `{reduced_formula}/{mp_id}.cif` | All MP structures that share a given reduced formula, downloaded in bulk by `find_structures` the first time that formula is encountered.  Used to map a charged framework to every MP id whose composition + structure matches.  A `.populated` sentinel inside each subdir flags "fully populated" for the multi-worker fast path. | Sub-step 2 Phase 1 (`find_structures`); sub-step 3 fallback for newly-added charged rows (`_load_row_struct` fallback path); Stage 4 framework comparison (`load_charged_frameworks`). |
+
+`structs/` and `All_charged_structures/` are inputs to Stage 4; `charged_structs/` is internal to Stage 3.  All three are safe to delete to force a re-download on the next run, but doing so wastes time — they are reusable across iterations as long as the MP release pinned by `SPICES_MP_SNAPSHOT_RELEASE` is the same.
 
 ## Running Tests
 

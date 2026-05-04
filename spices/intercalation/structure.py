@@ -2,6 +2,7 @@
 Charged-structure caching utilities for intercalation voltage analysis.
 """
 
+import fcntl
 import logging
 import os
 
@@ -13,6 +14,11 @@ logger = logging.getLogger(__name__)
 # Default matcher with attempt_supercell=True to catch supercell matches
 # that the original notebooks missed (which used the default False).
 DEFAULT_MATCHER = StructureMatcher(attempt_supercell=True)
+
+# Sentinel filename created inside a populated formula dir.  Hot-path
+# match-only branch keys off this so partial state during a concurrent
+# populate is never read.
+POPULATE_SENTINEL = ".populated"
 
 
 def generate_charged_struct_from_MP(
@@ -132,6 +138,23 @@ def read_or_generate_charged_struct(
     return struct
 
 
+def _match_against_saved(structure, formula_dir, matcher):
+    """Match *structure* against every CIF in *formula_dir*."""
+    mp_id_list = []
+    for fname in os.listdir(formula_dir):
+        if not fname.endswith(".cif"):
+            continue
+        saved_struct = Structure.from_file(
+            os.path.join(formula_dir, fname),
+        )
+        saved_struct.remove_oxidation_states()
+        if matcher.fit(
+            struct1=structure, struct2=saved_struct, symmetric=True,
+        ):
+            mp_id_list.append(fname.split(".")[0])
+    return mp_id_list
+
+
 def find_structures(
     structure,
     mp_client,
@@ -144,6 +167,17 @@ def find_structures(
     Searches a disk cache of CIF files organized by reduced formula.
     If the cache directory for this formula doesn't exist, downloads
     all structures with that formula from MP and saves them.
+
+    Multi-worker safety: the cold populate branch is serialized by a
+    POSIX advisory file lock (:func:`fcntl.flock`) on
+    ``{structure_cache_dir}/.{formula}.lock`` so two workers
+    discovering the same formula concurrently do not race partial
+    writes.  A sentinel file :data:`POPULATE_SENTINEL` inside the
+    formula dir marks "fully populated" — the hot path checks the
+    sentinel without acquiring the lock.  Pre-existing dirs without a
+    sentinel (legacy data, manual population) are auto-recognized on
+    first access and the sentinel is written for future fast-path use.
+    Linux/Unix only.
 
     Parameters
     ----------
@@ -165,47 +199,61 @@ def find_structures(
         matcher = DEFAULT_MATCHER
 
     reduced_formula = structure.composition.reduced_formula
-    mp_id_list = []
-
     os.makedirs(structure_cache_dir, exist_ok=True)
     formula_dir = os.path.join(structure_cache_dir, reduced_formula)
+    sentinel = os.path.join(formula_dir, POPULATE_SENTINEL)
 
-    if os.path.exists(formula_dir):
-        # Match against saved structures
-        for fname in os.listdir(formula_dir):
-            if not fname.endswith(".cif"):
-                continue
-            saved_struct = Structure.from_file(
-                os.path.join(formula_dir, fname),
+    # Hot path: sentinel present → formula was fully populated.
+    if os.path.exists(sentinel):
+        return _match_against_saved(structure, formula_dir, matcher)
+
+    # Cold path or backward-compat: serialize via per-formula file lock.
+    lock_path = os.path.join(
+        structure_cache_dir, f".{reduced_formula}.lock",
+    )
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            # Re-check — another worker may have populated during our wait.
+            if os.path.exists(sentinel):
+                return _match_against_saved(structure, formula_dir, matcher)
+
+            # Backward-compat: pre-existing populated dir without
+            # sentinel.  No race possible (only manually-populated dirs
+            # reach this branch); write sentinel for future fast-path.
+            if (
+                os.path.exists(formula_dir)
+                and any(
+                    f.endswith(".cif") for f in os.listdir(formula_dir)
+                )
+            ):
+                open(sentinel, "a").close()
+                return _match_against_saved(structure, formula_dir, matcher)
+
+            downloaded = mp_client.materials.search(
+                formula=reduced_formula,
+                all_fields=False,
+                fields=["material_id", "structure"],
             )
-            saved_struct.remove_oxidation_states()
-            if matcher.fit(struct1=structure, struct2=saved_struct, symmetric=True):
-                mp_id_list.append(fname.split(".")[0])
 
-        return mp_id_list
+            os.makedirs(formula_dir, exist_ok=True)
+            if not downloaded:
+                # Empty MP result is also a populated state — sentinel
+                # short-circuits the next call.
+                open(sentinel, "a").close()
+                return []
 
-    # Download and cache all structures with this formula
-    downloaded = mp_client.materials.search(
-        formula=reduced_formula,
-        all_fields=False,
-        fields=["material_id", "structure"],
-    )
+            for entry in downloaded:
+                entry.structure.to_file(
+                    filename=os.path.join(
+                        formula_dir, f"{entry.material_id}.cif",
+                    ),
+                    fmt="cif",
+                )
+            open(sentinel, "a").close()
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
-    if not downloaded:
-        return mp_id_list
-
-    os.makedirs(formula_dir, exist_ok=True)
-    for entry in downloaded:
-        entry.structure.to_file(
-            filename=os.path.join(formula_dir, f"{entry.material_id}.cif"),
-            fmt="cif",
-        )
-
-    # Recurse to match against the newly saved structures
-    return find_structures(
-        structure, mp_client,
-        structure_cache_dir=structure_cache_dir,
-        matcher=matcher,
-    )
+    return _match_against_saved(structure, formula_dir, matcher)
 
 

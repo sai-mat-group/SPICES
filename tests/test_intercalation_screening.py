@@ -17,6 +17,7 @@ from spices.screening.intercalation import (
     _seal_seawater_columns_for_evaluation,
     step2_enrich_charged_composition_sheets,
 )
+from spices.screening import intercalation as intercalation_mod
 
 
 # --------------------------------------------------------------------
@@ -346,21 +347,28 @@ class TestStep2BrokenPoolRecovery:
         "spices.screening.intercalation._recover_chunk_for_core"
     )
     @patch(
-        "spices.screening.intercalation.discover_new_charged_rows_for_file"
+        "spices.screening.intercalation._phase1_discover_all_files"
     )
     def test_broken_pool_recovers_via_checkpoint(
-        self, mock_discover, mock_recover, mock_pool_cls, tmp_path,
+        self, mock_phase1, mock_recover, mock_pool_cls, tmp_path,
     ):
         comp_dir = self._setup_files(tmp_path)
 
-        mock_discover.side_effect = [
-            pd.DataFrame({
-                "MP id": ["mp-9"], "Formula": ["FeO2"], "Is experimental": [0],
-            }),
-            pd.DataFrame({
-                "MP id": ["mp-10"], "Formula": ["MnO2"], "Is experimental": [0],
-            }),
-        ]
+        # Bypass Phase 1 entirely — return the originals + the
+        # already-tagged new-rows DataFrame Phase 2 expects.  This keeps
+        # the test focused on Phase 2's BrokenProcessPool recovery and
+        # avoids consuming pool_inst.submit's side_effect for Phase 1.
+        originals = {
+            "FeO2.xlsx": pd.read_excel(comp_dir / "FeO2.xlsx"),
+            "MnO2.xlsx": pd.read_excel(comp_dir / "MnO2.xlsx"),
+        }
+        all_new_rows = pd.DataFrame({
+            "MP id": ["mp-9", "mp-10"],
+            "Formula": ["FeO2", "MnO2"],
+            "Is experimental": [0, 0],
+            SOURCE_FILE_COLUMN: ["FeO2.xlsx", "MnO2.xlsx"],
+        })
+        mock_phase1.return_value = (originals, all_new_rows)
 
         # Simulate one future raising BrokenProcessPool; recovery returns
         # a fully-populated chunk from disk.
@@ -436,3 +444,198 @@ class TestSourceFileColumnPreserved:
         roundtrip = pd.read_excel(path)
         assert SOURCE_FILE_COLUMN in roundtrip.columns
         assert list(roundtrip[SOURCE_FILE_COLUMN]) == ["FeO2.xlsx"]
+
+
+# --------------------------------------------------------------------
+# Phase 1 multi-worker dispatch + recovery
+# --------------------------------------------------------------------
+
+
+class TestPhase1MultiWorker:
+    """Validate the multi-worker Phase 1 path of
+    _phase1_discover_all_files.  ProcessPoolExecutor is mocked so
+    workers never actually fork — we just check the splitting,
+    dispatch, result aggregation, and BrokenProcessPool fallback.
+    """
+
+    def _write_sheet(self, path, mpid):
+        pd.DataFrame({
+            "MP id": [mpid],
+            "Formula": ["LiX"],
+            "Is experimental": [0],
+        }).to_excel(path, index=False)
+
+    def _setup_files(self, tmp_path, n=4):
+        comp_dir = tmp_path / "comp"
+        comp_dir.mkdir()
+        for i in range(n):
+            self._write_sheet(comp_dir / f"F{i}.xlsx", f"mp-{i}")
+        return comp_dir
+
+    @patch("spices.screening.intercalation.ProcessPoolExecutor")
+    def test_chunks_split_round_robin(self, mock_pool_cls, tmp_path):
+        comp_dir = self._setup_files(tmp_path, n=5)
+
+        # Pool returns futures whose results are empty DataFrames.
+        empty_future = MagicMock()
+        empty_future.result.return_value = pd.DataFrame()
+        empty_future.done.return_value = True
+
+        pool_inst = MagicMock()
+        pool_inst.__enter__ = MagicMock(return_value=pool_inst)
+        pool_inst.__exit__ = MagicMock(return_value=False)
+        pool_inst.submit.return_value = empty_future
+        mock_pool_cls.return_value = pool_inst
+
+        with patch(
+            "spices.screening.intercalation.as_completed",
+            lambda futs: list(futs),
+        ):
+            _phase1_discover_all_files(
+                str(comp_dir),
+                working_ion="Li", mp_client=MagicMock(),
+                element_str="Li",
+                charged_struct_dir="cs", struct_dir="s",
+                structure_cache_dir="acs",
+                n_workers=2,
+                log_dir=str(tmp_path / "logs"),
+            )
+
+        # Two chunks dispatched (one per worker).  Round-robin slicing
+        # gives chunk 0 = [F0, F2, F4], chunk 1 = [F1, F3].
+        assert pool_inst.submit.call_count == 2
+        chunk0 = pool_inst.submit.call_args_list[0][0][1]
+        chunk1 = pool_inst.submit.call_args_list[1][0][1]
+        assert chunk0 == ["F0.xlsx", "F2.xlsx", "F4.xlsx"]
+        assert chunk1 == ["F1.xlsx", "F3.xlsx"]
+
+    @patch("spices.screening.intercalation.ProcessPoolExecutor")
+    def test_aggregates_worker_results(self, mock_pool_cls, tmp_path):
+        comp_dir = self._setup_files(tmp_path, n=3)
+
+        # Two chunks → two futures returning two distinct new-rows DFs.
+        df_a = pd.DataFrame({
+            "MP id": ["mp-9"], "Formula": ["LiA"],
+            SOURCE_FILE_COLUMN: ["F0.xlsx"],
+        })
+        df_b = pd.DataFrame({
+            "MP id": ["mp-10"], "Formula": ["LiB"],
+            SOURCE_FILE_COLUMN: ["F1.xlsx"],
+        })
+        f_a = MagicMock()
+        f_a.result.return_value = df_a
+        f_a.done.return_value = True
+        f_b = MagicMock()
+        f_b.result.return_value = df_b
+        f_b.done.return_value = True
+
+        pool_inst = MagicMock()
+        pool_inst.__enter__ = MagicMock(return_value=pool_inst)
+        pool_inst.__exit__ = MagicMock(return_value=False)
+        pool_inst.submit.side_effect = [f_a, f_b]
+        mock_pool_cls.return_value = pool_inst
+
+        with patch(
+            "spices.screening.intercalation.as_completed",
+            lambda futs: [f_a, f_b],
+        ):
+            originals, all_new = _phase1_discover_all_files(
+                str(comp_dir),
+                working_ion="Li", mp_client=MagicMock(),
+                element_str="Li",
+                charged_struct_dir="cs", struct_dir="s",
+                structure_cache_dir="acs",
+                n_workers=2,
+                log_dir=str(tmp_path / "logs"),
+            )
+
+        assert set(originals.keys()) == {
+            "F0.xlsx", "F1.xlsx", "F2.xlsx",
+        }
+        assert set(all_new["MP id"]) == {"mp-9", "mp-10"}
+        assert set(all_new[SOURCE_FILE_COLUMN]) == {"F0.xlsx", "F1.xlsx"}
+
+    @patch(
+        "spices.screening.intercalation.discover_new_charged_rows_for_file"
+    )
+    @patch("spices.screening.intercalation.ProcessPoolExecutor")
+    def test_broken_pool_falls_back_to_sequential(
+        self, mock_pool_cls, mock_discover, tmp_path,
+    ):
+        comp_dir = self._setup_files(tmp_path, n=2)
+
+        # One future succeeds; the other raises BrokenProcessPool.
+        ok_df = pd.DataFrame({
+            "MP id": ["mp-9"], "Formula": ["LiA"],
+            SOURCE_FILE_COLUMN: ["F0.xlsx"],
+        })
+        f_ok = MagicMock()
+        f_ok.result.return_value = ok_df
+        f_ok.done.return_value = True
+
+        f_dead = MagicMock()
+        f_dead.result.side_effect = BrokenProcessPool
+        f_dead.done.return_value = True
+
+        pool_inst = MagicMock()
+        pool_inst.__enter__ = MagicMock(return_value=pool_inst)
+        pool_inst.__exit__ = MagicMock(return_value=False)
+        pool_inst.submit.side_effect = [f_ok, f_dead]
+        mock_pool_cls.return_value = pool_inst
+
+        # Sequential fallback uses the unmocked _phase1_sequential_discover,
+        # which calls discover_new_charged_rows_for_file once for the
+        # dead chunk's file (F1.xlsx).
+        mock_discover.return_value = pd.DataFrame({
+            "MP id": ["mp-fallback"], "Formula": ["LiB"],
+        })
+
+        with patch(
+            "spices.screening.intercalation.as_completed",
+            lambda futs: [f_ok, f_dead],
+        ):
+            originals, all_new = _phase1_discover_all_files(
+                str(comp_dir),
+                working_ion="Li", mp_client=MagicMock(),
+                element_str="Li",
+                charged_struct_dir="cs", struct_dir="s",
+                structure_cache_dir="acs",
+                n_workers=2,
+                log_dir=str(tmp_path / "logs"),
+            )
+
+        # Sequential recovery was invoked for the dead chunk's file.
+        mock_discover.assert_called_once()
+        # Both the OK worker's result and the recovered row appear.
+        assert set(all_new["MP id"]) == {"mp-9", "mp-fallback"}
+
+    def test_n_workers_one_takes_sequential_path(self, tmp_path):
+        """Sanity: n_workers=1 must NOT touch ProcessPoolExecutor."""
+        comp_dir = self._setup_files(tmp_path, n=2)
+        with patch(
+            "spices.screening.intercalation.ProcessPoolExecutor"
+        ) as mock_pool, patch(
+            "spices.screening.intercalation.discover_new_charged_rows_for_file"
+        ) as mock_discover:
+            mock_discover.return_value = pd.DataFrame()
+            _phase1_discover_all_files(
+                str(comp_dir),
+                working_ion="Li", mp_client=MagicMock(),
+                element_str="Li",
+                charged_struct_dir="cs", struct_dir="s",
+                structure_cache_dir="acs",
+                n_workers=1,
+            )
+            mock_pool.assert_not_called()
+
+
+class TestPhase1Init:
+    """The pool initializer wires the shared progress counter into the
+    worker module's global namespace.
+    """
+    def test_sets_module_global(self):
+        sentinel = MagicMock()
+        intercalation_mod._phase1_init(sentinel)
+        assert intercalation_mod._PHASE1_COUNTER is sentinel
+        # Restore for test isolation.
+        intercalation_mod._PHASE1_COUNTER = None
