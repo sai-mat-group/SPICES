@@ -16,6 +16,14 @@
 #   1. Edit the "User configuration" section below
 #   2. Submit: sbatch scripts/submit_seawater.sh
 #
+# Resuming an interrupted run:
+#   Add --restart to the python invocation below.  This skips
+#   chemsys/sea_comp keys whose Pourbaix pickles already exist on disk
+#   in Phase 1 and skips already-evaluated rows in Phase 2 — only the
+#   remaining unique builds + pending rows are distributed across all
+#   workers.  Without --restart, the script refuses to overwrite an
+#   output file that already has evaluated rows.
+#
 # Available QOS options (match --time accordingly):
 #   debug:  < 1 hour
 #   short:  < 6 hours

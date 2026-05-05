@@ -19,10 +19,19 @@ Stage 2 and Stage 3 sub-step 2 (sea-Pourbaix evaluation of newly discovered char
 # Stage 2 — sequential (single core)
 python scripts/run_seawater_screening.py Ca stage1_results.xlsx -o seawater_results.xlsx
 
-# Stage 2 — parallel (8 cores)
+# Stage 2 — parallel (8 cores).  Internally runs as Phase 1 (parallel
+# pre-build of unique Pourbaix entries + sea diagrams, no two workers
+# build the same diagram) + Phase 2 (per-row metastability eval, hits
+# the on-disk cache).
 python scripts/run_seawater_screening.py Ca stage1_results.xlsx -o seawater_results.xlsx -n 8
 
-# See all options
+# Stage 2 — resume an interrupted run.  Phase 1 skips chemsys/sea-comp
+# keys whose pickle already exists; Phase 2 skips already-evaluated rows.
+# Without --restart, the script refuses to overwrite an output xlsx
+# that already has evaluated rows.
+python scripts/run_seawater_screening.py Ca stage1_results.xlsx -o seawater_results.xlsx -n 8 --restart
+
+# See all options (incl. --phase1-max-retries / --phase1-retry-delay)
 python scripts/run_seawater_screening.py --help
 
 # Stage 3 — sequential

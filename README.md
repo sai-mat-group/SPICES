@@ -218,15 +218,36 @@ scripts/                       # CLI wrappers and HPC submission templates
 
 ## HPC / Multiprocessing
 
-Stage 2 and Stage 3 sub-step 2 both parallelize via `-n N`.  Sub-step 2 is internally a 3-phase pipeline: **Phase 1** (per-file discovery of new charged MP structures, including disk-cached CIF lookup and `find_structures` formula matching) and **Phase 2** (per-row sea-Pourbaix evaluation of those new rows) both use the worker pool — only Phase 3 (atomic xlsx rewrite) is single-threaded in the parent.  Stage 3 sub-steps 1, 3, and 4 run sequentially in the parent; Stages 4 and 5 are single-process and should be launched directly on a workstation.
+Stage 2 and Stage 3 sub-step 2 both parallelize via `-n N`.
+
+**Stage 2** is internally a two-phase pipeline:
+
+* **Phase 1** — pre-build all unique Pourbaix entries (Phase 1a, keyed by chemsys) and unique seawater Pourbaix diagrams (Phase 1b, keyed by reduced sea-comp formula).  The parent enumerates the unique build keys from the input dataframe, filters out keys whose pickle already exists on disk, and dispatches **one task per remaining unique key** to the worker pool.  No two workers ever build the same diagram, and no worker waits idle on a lock — every active worker is computing something different.  Each Phase 1 task retries up to `--phase1-max-retries` (default 5) on transient errors; if a task ultimately fails, the run aborts so the user can investigate.
+* **Phase 2** — per-row metastability evaluation, chunked round-robin across workers (existing behavior).  Phase 2 always hits the on-disk cache built in Phase 1, so duplicate Pourbaix builds across workers are eliminated.
+
+**Stage 3 sub-step 2** is a 3-phase pipeline: Phase 1 (per-file discovery of new charged MP structures, including disk-cached CIF lookup and `find_structures` formula matching) and Phase 2 (per-row sea-Pourbaix evaluation of those new rows) both use the worker pool — only Phase 3 (atomic xlsx rewrite) is single-threaded in the parent.  Stage 3 sub-steps 1, 3, and 4 run sequentially in the parent; Stages 4 and 5 are single-process and should be launched directly on a workstation.
 
 > **Linux/Unix only.**  The multi-worker code uses `fcntl.flock` (POSIX advisory file locks) for the cross-worker `find_structures` race fix and `os.fork`-based `ProcessPoolExecutor` for the worker pool.  Run multi-worker pipelines on Linux (workstation or HPC); on Windows / macOS use `n_workers=1`.
 
 For multi-worker runs against the snapshot backend, export `SPICES_MP_BACKEND=snapshot` (and `SPICES_MP_SNAPSHOT_ROOT`, `SPICES_MP_SNAPSHOT_RELEASE`) so each forked worker resolves the same backend — see the `run_seawater_screening` docstring for the full caveat.
 
+### Restart and crash safety (Stage 2)
+
+* **`--restart`** (Stage 2) resumes an interrupted run.  In Phase 1, only chemsys/sea-comp keys whose Pourbaix pickle is missing from disk are re-dispatched — if 8000 of 10000 unique diagrams already exist, the remaining 2000 are split across all workers.  In Phase 2, only rows whose `Seawater stability` is still NaN are re-evaluated, with checkpoint files from `runtime_sheets/` and `{element}_evaluated_backup.xlsx` merged in.
+* **Hard guard on `restart=False`** — if the output xlsx already contains evaluated rows and `--restart` is *not* passed, the run aborts with a clear error rather than silently overwriting prior progress.  Pass `--restart` to resume, or delete the file to start over.
+* **Atomic final write** — the output xlsx is written via `to_excel(<tmp>); os.replace(<tmp>, <final>)`.  A kill mid-write leaves either the previous file or the new one, never a corrupt half-written xlsx.  `runtime_sheets/` is cleaned up only after `os.replace` succeeds.
+* **Honest worker-death diagnostics** — when one worker dies, `ProcessPoolExecutor` cancels every pending future and each cancellation surfaces as `BrokenProcessPool`.  Stage 2 distinguishes the *first* (root-cause) failure from subsequent cascade cancellations in the log, then runs a post-mortem scan of `dmesg -T` and `journalctl --user` so the user can tell apart a real OOM (kernel SIGKILL of `python`), a SLURM cgroup time-limit kill, and a process-internal exception.
+
 ```bash
 # Stage 2: seawater screening (parallel, 8 cores)
 python scripts/run_seawater_screening.py Ca input.xlsx -o output.xlsx -n 8
+
+# Stage 2: resume after an interrupted multi-worker run
+python scripts/run_seawater_screening.py Ca input.xlsx -o output.xlsx -n 8 --restart
+
+# Stage 2: tune Phase 1 retry budget for flaky MP backends
+python scripts/run_seawater_screening.py Ca input.xlsx -o output.xlsx -n 8 \
+    --phase1-max-retries 10 --phase1-retry-delay 60
 
 # Stage 3: intercalation voltage screening (parallel sub-step 2, 8 cores)
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ -n 8

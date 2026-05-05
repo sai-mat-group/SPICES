@@ -1,6 +1,9 @@
 """Tests for seawater screening runner functions."""
 
+import os
+import pickle
 import sys
+from unittest.mock import patch, MagicMock
 
 import pandas as pd
 import pytest
@@ -9,8 +12,13 @@ from spices.pourbaix.cache import PourbaixCache
 from spices.screening.seawater import (
     SEAWATER_COLUMNS,
     _available_memory_gb,
+    _dispatch_phase1_tasks,
+    _filter_pending_chemsys,
+    _filter_pending_sea_keys,
+    _phase0_discover_unique_keys,
     _recover_chunk_for_core,
     _split_dataframe,
+    run_seawater_screening,
 )
 
 
@@ -176,3 +184,266 @@ class TestAvailableMemoryGb:
         avail = _available_memory_gb()
         assert avail is not None
         assert avail > 0
+
+
+class TestPhase0DiscoverUniqueKeys:
+    """Phase 0 should dedup chemsys and sea_comp keys across rows."""
+
+    def test_collapses_duplicate_formulas_to_one_key(self):
+        df = pd.DataFrame({
+            "Formula": ["LiFePO4", "LiFePO4", "LiFePO4"],
+            "MP id": ["mp-1", "mp-2", "mp-3"],
+        })
+        chemsys, sea_keys = _phase0_discover_unique_keys(df)
+        assert len(chemsys) == 1
+        assert len(sea_keys) == 1
+
+    def test_distinct_chemsys_emit_distinct_keys(self):
+        df = pd.DataFrame({
+            "Formula": ["LiFePO4", "LiCoO2"],
+            "MP id": ["mp-1", "mp-2"],
+        })
+        chemsys, sea_keys = _phase0_discover_unique_keys(df)
+        assert len(chemsys) == 2
+        assert len(sea_keys) == 2
+
+    def test_skips_invalid_formula(self):
+        df = pd.DataFrame({
+            "Formula": ["LiFePO4", "", None],
+            "MP id": ["mp-1", "mp-2", "mp-3"],
+        })
+        chemsys, sea_keys = _phase0_discover_unique_keys(df)
+        assert len(chemsys) == 1
+        assert len(sea_keys) == 1
+
+    def test_returns_representative_comp_dict(self):
+        df = pd.DataFrame({
+            "Formula": ["LiFePO4"],
+            "MP id": ["mp-1"],
+        })
+        _, sea_keys = _phase0_discover_unique_keys(df)
+        key, comp_dict = sea_keys[0]
+        assert isinstance(comp_dict, dict)
+        assert "Li" in comp_dict and "Fe" in comp_dict
+
+
+class TestFilterPendingChemsys:
+    def test_returns_all_when_dir_missing(self, tmp_path):
+        result = _filter_pending_chemsys(
+            ["Li-Fe-O", "Ca-Ti-O"],
+            str(tmp_path / "nope"),
+        )
+        assert result == ["Li-Fe-O", "Ca-Ti-O"]
+
+    def test_drops_chemsys_already_on_disk(self, tmp_path):
+        entries = tmp_path / "entries"
+        entries.mkdir()
+        (entries / "Li-Fe-O_pbxentry.pkl").write_bytes(b"x")
+        result = _filter_pending_chemsys(
+            ["Li-Fe-O", "Ca-Ti-O"], str(entries),
+        )
+        assert result == ["Ca-Ti-O"]
+
+    def test_ignores_unrelated_files(self, tmp_path):
+        entries = tmp_path / "entries"
+        entries.mkdir()
+        (entries / "README.txt").write_text("ignore me")
+        result = _filter_pending_chemsys(["Li-Fe-O"], str(entries))
+        assert result == ["Li-Fe-O"]
+
+
+class TestFilterPendingSeaKeys:
+    def test_returns_all_when_dir_missing(self, tmp_path):
+        keys = [("Li1 Fe1 P1", {"Li": 1}), ("Ca1 Ti1", {"Ca": 1})]
+        result = _filter_pending_sea_keys(keys, str(tmp_path / "nope"))
+        assert result == keys
+
+    def test_drops_keys_already_on_disk(self, tmp_path):
+        pbx = tmp_path / "pbx"
+        pbx.mkdir()
+        # Match by underscored reduced formula prefix
+        (pbx / "Li1_Fe1_P1_pbx.pkl").write_bytes(b"x")
+        keys = [
+            ("Li1 Fe1 P1", {"Li": 1}),
+            ("Ca1 Ti1", {"Ca": 1}),
+        ]
+        result = _filter_pending_sea_keys(keys, str(pbx))
+        assert [k for k, _ in result] == ["Ca1 Ti1"]
+
+    def test_handles_mp_id_suffixed_filenames(self, tmp_path):
+        pbx = tmp_path / "pbx"
+        pbx.mkdir()
+        (pbx / "Li1_Fe1_P1_mp-12345_pbx.pkl").write_bytes(b"x")
+        keys = [("Li1 Fe1 P1", {"Li": 1}), ("Ca1 Ti1", {"Ca": 1})]
+        result = _filter_pending_sea_keys(keys, str(pbx))
+        assert [k for k, _ in result] == ["Ca1 Ti1"]
+
+
+class TestDispatchPhase1Sequential:
+    """n_workers <= 1 path runs tasks inline; failures abort immediately."""
+
+    def test_runs_all_tasks_in_order(self):
+        seen = []
+
+        def worker(task):
+            seen.append(task)
+            return task
+
+        _dispatch_phase1_tasks(
+            "Phase X", n_workers=1,
+            tasks=["a", "b", "c"],
+            worker_fn=worker,
+            args_for_task=lambda t: (t,),
+        )
+        assert seen == ["a", "b", "c"]
+
+    def test_aborts_on_first_failure(self):
+        seen = []
+
+        def worker(task):
+            seen.append(task)
+            if task == "b":
+                raise RuntimeError("boom")
+            return task
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _dispatch_phase1_tasks(
+                "Phase X", n_workers=1,
+                tasks=["a", "b", "c"],
+                worker_fn=worker,
+                args_for_task=lambda t: (t,),
+            )
+        # 'c' should never run because 'b' failed
+        assert seen == ["a", "b"]
+
+    def test_empty_task_list_is_noop(self):
+        called = []
+
+        def worker(task):
+            called.append(task)
+
+        _dispatch_phase1_tasks(
+            "Phase X", n_workers=4,
+            tasks=[],
+            worker_fn=worker,
+            args_for_task=lambda t: (t,),
+        )
+        assert called == []
+
+
+class TestRestartHardGuard:
+    """restart=False must refuse to overwrite an output xlsx with progress."""
+
+    def test_refuses_to_overwrite_populated_output(self, tmp_path):
+        out_path = tmp_path / "out.xlsx"
+        # Pre-populate with one evaluated row
+        pd.DataFrame({
+            "MP id": ["mp-1"],
+            "Formula": ["LiFePO4"],
+            "Seawater stability": [True],
+            "Seawater metastability (Criterion 4)": [False],
+        }).to_excel(out_path, index=False)
+
+        in_path = tmp_path / "in.xlsx"
+        pd.DataFrame({
+            "MP id": ["mp-1"],
+            "Formula": ["LiFePO4"],
+        }).to_excel(in_path, index=False)
+
+        with pytest.raises(RuntimeError, match="already has"):
+            run_seawater_screening(
+                element="Li",
+                input_path=str(in_path),
+                output_path=str(out_path),
+                cache_dir=str(tmp_path),
+                n_workers=1,
+                restart=False,
+            )
+
+    def test_allows_overwrite_when_no_evaluated_rows(self, tmp_path):
+        """A stale output with all-NaN seawater columns should not block."""
+        out_path = tmp_path / "out.xlsx"
+        pd.DataFrame({
+            "MP id": ["mp-1"],
+            "Formula": ["LiFePO4"],
+            "Seawater stability": [None],
+            "Seawater metastability (Criterion 4)": [None],
+        }).to_excel(out_path, index=False)
+
+        in_path = tmp_path / "in.xlsx"
+        pd.DataFrame({"MP id": ["mp-1"], "Formula": ["LiFePO4"]}).to_excel(
+            in_path, index=False,
+        )
+
+        # Mock Phase 1 + Phase 2 to avoid actual MP calls
+        with patch(
+            "spices.screening.seawater._run_phase1",
+            MagicMock(return_value=None),
+        ), patch(
+            "spices.screening.seawater._process_chunk",
+            side_effect=lambda chunk, *a, **kw: chunk,
+        ), patch(
+            "spices.screening.seawater.get_client",
+            return_value=MagicMock(),
+        ):
+            # Should not raise
+            run_seawater_screening(
+                element="Li",
+                input_path=str(in_path),
+                output_path=str(out_path),
+                cache_dir=str(tmp_path),
+                n_workers=1,
+                restart=False,
+            )
+
+
+class TestAtomicFinalWrite:
+    """Final xlsx write must use tmp + os.replace; cleanup only on success."""
+
+    def test_runtime_dir_kept_when_write_fails(self, tmp_path):
+        in_path = tmp_path / "in.xlsx"
+        pd.DataFrame({"MP id": ["mp-1"], "Formula": ["LiFePO4"]}).to_excel(
+            in_path, index=False,
+        )
+        out_path = tmp_path / "out.xlsx"
+        runtime = tmp_path / "runtime_sheets"
+
+        # _process_chunk normally creates runtime_sheets/.  Simulate
+        # that, then trigger a write failure on the final to_excel call.
+        original_to_excel = pd.DataFrame.to_excel
+
+        def failing_to_excel(self_df, path, *a, **kw):
+            # Let the input file write succeed; fail only on the final
+            # output write (which targets a path under tmp_path).
+            if str(path).endswith(".tmp." + str(os.getpid()) + ".xlsx"):
+                raise OSError("simulated disk failure")
+            return original_to_excel(self_df, path, *a, **kw)
+
+        with patch(
+            "spices.screening.seawater._run_phase1",
+            MagicMock(return_value=None),
+        ), patch(
+            "spices.screening.seawater._process_chunk",
+            side_effect=lambda chunk, *a, **kw: (
+                runtime.mkdir(parents=True, exist_ok=True) or chunk
+            ),
+        ), patch(
+            "spices.screening.seawater.get_client",
+            return_value=MagicMock(),
+        ), patch.object(pd.DataFrame, "to_excel", failing_to_excel):
+            with pytest.raises(OSError, match="simulated"):
+                run_seawater_screening(
+                    element="Li",
+                    input_path=str(in_path),
+                    output_path=str(out_path),
+                    cache_dir=str(tmp_path),
+                    n_workers=1,
+                    restart=False,
+                )
+
+        # Even though we asked to clean up, runtime_sheets/ should still
+        # exist because the final write failed.
+        assert runtime.exists()
+        # The actual output file should NOT exist (atomic write protected
+        # against half-written output).
+        assert not out_path.exists()

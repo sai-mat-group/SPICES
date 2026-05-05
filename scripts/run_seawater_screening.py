@@ -83,6 +83,34 @@ def main():
         help="Store (pH, V) point lists instead of booleans",
     )
     parser.add_argument(
+        "--restart",
+        action="store_true",
+        help=(
+            "Resume an interrupted run.  Loads checkpoints from "
+            "runtime_sheets/ and any prior {element}_evaluated_backup.xlsx, "
+            "skips already-evaluated rows in Phase 2, and skips already-"
+            "built Pourbaix entries/diagrams in Phase 1."
+        ),
+    )
+    parser.add_argument(
+        "--phase1-max-retries",
+        type=int,
+        default=5,
+        help=(
+            "Max retries per Phase 1 build task (entry download or sea "
+            "diagram build).  After this many failures on a single task, "
+            "the run aborts.  Default: 5"
+        ),
+    )
+    parser.add_argument(
+        "--phase1-retry-delay",
+        type=float,
+        default=30.0,
+        help=(
+            "Seconds to wait between Phase 1 task retries.  Default: 30"
+        ),
+    )
+    parser.add_argument(
         "--api-key",
         default=None,
         help=(
@@ -111,6 +139,9 @@ def main():
         save_interval=args.save_interval,
         max_retries=args.max_retries,
         metastability_points=args.metastability_points,
+        restart=args.restart,
+        phase1_max_retries=args.phase1_max_retries,
+        phase1_retry_delay=args.phase1_retry_delay,
         mp_client=mp_client,
     )
 
