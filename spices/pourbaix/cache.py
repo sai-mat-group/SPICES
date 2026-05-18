@@ -186,8 +186,8 @@ class PourbaixCache:
         -------
         PourbaixDiagram
         """
-        entries = self.get_or_download_pourbaix_entries(
-            pbx_comp.chemical_system, mp_client, save=save_entries,
+        entries = self.read_or_download_pourbaix_entries(
+            pbx_comp.chemical_system, mp_client, save_new=save_entries,
         )
         logger.info("Generating Pourbaix Diagram for %s", pbx_comp)
         return PourbaixDiagram(entries, comp_dict=pbx_comp.as_dict())
@@ -302,9 +302,9 @@ class PourbaixCache:
         sea_comp_dict = get_sea_pourbaix_comp_dict(pbx_comp, num_of_sea_elements)
         sea_conc_dict = get_sea_pourbaix_conc_dict(pbx_comp, num_of_sea_elements)
 
-        entries = self.get_or_download_pourbaix_entries(
+        entries = self.read_or_download_pourbaix_entries(
             Composition(sea_comp_dict).chemical_system, mp_client,
-            save=save_entries,
+            save_new=save_entries,
         )
         logger.info("Generating sea Pourbaix Diagram for %s", Composition(sea_comp_dict))
         return PourbaixDiagram(
