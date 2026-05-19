@@ -20,6 +20,8 @@ a truncated pickle that the next reader would hit as ``EOFError``.
 import os
 import pickle
 import logging
+import threading
+import time
 from collections import OrderedDict
 
 from pymatgen.core import Composition
@@ -46,6 +48,69 @@ def _atomic_pickle_dump(obj, path, protocol=pickle.HIGHEST_PROTOCOL):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def _read_rss_gb():
+    """Return VmRSS in GB from ``/proc/self/status``; ``None`` on non-Linux."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / (1024 * 1024)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    return None
+
+
+def _read_vmpeak_gb():
+    """Return VmPeak (high-water virtual size) in GB; ``None`` on non-Linux."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmPeak:"):
+                    return float(line.split()[1]) / (1024 * 1024)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    return None
+
+
+class _RssSampler:
+    """Background thread that logs RSS every ``interval`` sec until stopped.
+
+    Used to track the memory ramp during long pymatgen ``PourbaixDiagram``
+    builds, where a SIGKILL leaves no Python-visible signal and the
+    process-final RSS isn't otherwise recorded.  Daemon thread, so a
+    cgroup-driven kill of the parent will tear it down cleanly.  Reads
+    ``/proc/self/status`` directly to avoid adding a ``psutil`` dependency,
+    which means it works inside forked ``ProcessPoolExecutor`` workers.
+    """
+
+    def __init__(self, label, interval=60):
+        self._label = label
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        t0 = time.time()
+        while not self._stop.wait(self._interval):
+            rss = _read_rss_gb()
+            peak = _read_vmpeak_gb()
+            logger.info(
+                "[%s] elapsed=%.0fs RSS=%.2fGB VmPeak=%.2fGB",
+                self._label, time.time() - t0,
+                rss if rss is not None else -1.0,
+                peak if peak is not None else -1.0,
+            )
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=2)
+        return False
 
 
 class PourbaixCache:
@@ -189,8 +254,21 @@ class PourbaixCache:
         entries = self.read_or_download_pourbaix_entries(
             pbx_comp.chemical_system, mp_client, save_new=save_entries,
         )
-        logger.info("Generating Pourbaix Diagram for %s", pbx_comp)
-        return PourbaixDiagram(entries, comp_dict=pbx_comp.as_dict())
+        rss0 = _read_rss_gb()
+        logger.info(
+            "Generating Pourbaix Diagram for %s (entries=%d, elements=%d, RSS=%.2fGB)",
+            pbx_comp, len(entries), len(pbx_comp.as_dict()),
+            rss0 if rss0 is not None else -1.0,
+        )
+        label = f"PourbaixDiagram {pbx_comp.chemical_system} (dilute)"
+        with _RssSampler(label, interval=60):
+            pbx = PourbaixDiagram(entries, comp_dict=pbx_comp.as_dict())
+        rss1 = _read_rss_gb()
+        logger.info(
+            "Built Pourbaix Diagram for %s (RSS=%.2fGB)",
+            pbx_comp, rss1 if rss1 is not None else -1.0,
+        )
+        return pbx
 
     def get_or_generate_pourbaix_diagram(self, composition_obj, mp_client,
                                          mp_id=None, save_pbx=False,
@@ -302,14 +380,28 @@ class PourbaixCache:
         sea_comp_dict = get_sea_pourbaix_comp_dict(pbx_comp, num_of_sea_elements)
         sea_conc_dict = get_sea_pourbaix_conc_dict(pbx_comp, num_of_sea_elements)
 
+        sea_comp = Composition(sea_comp_dict)
         entries = self.read_or_download_pourbaix_entries(
-            Composition(sea_comp_dict).chemical_system, mp_client,
+            sea_comp.chemical_system, mp_client,
             save_new=save_entries,
         )
-        logger.info("Generating sea Pourbaix Diagram for %s", Composition(sea_comp_dict))
-        return PourbaixDiagram(
-            entries, comp_dict=sea_comp_dict, conc_dict=sea_conc_dict,
+        rss0 = _read_rss_gb()
+        logger.info(
+            "Generating sea Pourbaix Diagram for %s (entries=%d, elements=%d, RSS=%.2fGB)",
+            sea_comp, len(entries), len(sea_comp_dict),
+            rss0 if rss0 is not None else -1.0,
         )
+        label = f"PourbaixDiagram {sea_comp.chemical_system}"
+        with _RssSampler(label, interval=60):
+            pbx = PourbaixDiagram(
+                entries, comp_dict=sea_comp_dict, conc_dict=sea_conc_dict,
+            )
+        rss1 = _read_rss_gb()
+        logger.info(
+            "Built sea Pourbaix Diagram for %s (RSS=%.2fGB)",
+            sea_comp, rss1 if rss1 is not None else -1.0,
+        )
+        return pbx
 
     def get_or_generate_sea_pourbaix_diagram(self, composition_obj, mp_client,
                                               mp_id=None,
