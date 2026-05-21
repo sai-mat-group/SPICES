@@ -114,3 +114,19 @@ class TestCollectMpDataFromChemsys:
         assert not any(
             "step-0 dedup dropped" in rec.message for rec in caplog.records
         )
+
+    def test_empty_thermo_list_returns_empty(self, caplog):
+        """Empty thermo.search result returns [] (not a NaN sentinel row)."""
+        client = _stub_mp_client([])
+        with caplog.at_level(logging.WARNING, logger="spices.screening.mp_query"):
+            rows = collect_mp_data_from_chemsys(
+                chemsys=None,
+                element_str="Li",
+                mp_client=client,
+                material_ids=["mp-nonexistent"],
+            )
+        assert rows == []
+        assert any(
+            "thermo.search returned 0 results" in rec.message
+            for rec in caplog.records
+        )

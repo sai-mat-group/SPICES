@@ -1,5 +1,6 @@
 """Tests for spices.intercalation.grouping."""
 
+import logging
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -139,6 +140,44 @@ class TestBuildGraphComponentsFromSheet:
             grouping.build_graph_components_from_sheet(
                 df, working_ion="Mg",
             )
+
+    @patch("spices.intercalation.grouping.make_networkx_graph")
+    @patch("spices.intercalation.grouping.bfs_components")
+    @patch("spices.intercalation.grouping.build_adjacency_dict")
+    @patch("spices.intercalation.grouping.FrameworkStructure")
+    @patch("spices.intercalation.grouping._load_row_struct")
+    def test_skips_nan_rows_with_warning(
+        self, mock_load, mock_fw, mock_adj,
+        mock_bfs, mock_make_graph, caplog,
+    ):
+        """NaN MP id / Formula rows are dropped before _load_row_struct."""
+        mock_load.return_value = MagicMock(name="struct")
+        mock_fw.return_value = MagicMock(name="fw")
+        mock_adj.return_value = {0: []}
+        mock_bfs.return_value = [[0]]
+        mock_make_graph.return_value = MagicMock(name="G")
+
+        df = pd.DataFrame({
+            "MP id": ["mp-a", np.nan],
+            "Formula": ["FeO2", np.nan],
+            "Is experimental": [0, np.nan],
+        })
+
+        with caplog.at_level(
+            logging.WARNING, logger="spices.intercalation.grouping",
+        ):
+            dfs, graphs = grouping.build_graph_components_from_sheet(
+                df, working_ion="Mg",
+            )
+
+        assert mock_load.call_count == 1
+        mock_load.assert_called_with("mp-a", "FeO2", "structs", "All_charged_structures")
+        assert any(
+            "Skipping 1 row(s) with NaN" in rec.message
+            for rec in caplog.records
+        )
+        assert len(dfs) == 1
+        assert set(dfs[0]["MP id"]) == {"mp-a"}
 
 
 # --------------------------------------------------------------------

@@ -15,7 +15,6 @@ import logging
 import time
 from itertools import combinations
 
-import numpy as np
 import pandas as pd
 from pymatgen.core import Composition
 
@@ -134,8 +133,12 @@ def collect_mp_data_from_chemsys(
     return_list = []
 
     if not thermo_list:
-        data = {col: np.nan for col in MP_QUERY_COLUMNS}
-        return [data]
+        logger.warning(
+            "thermo.search returned 0 results for "
+            "chemsys=%s, material_ids=%s — returning empty list",
+            chemsys, material_ids,
+        )
+        return []
 
     for entry in thermo_list:
         data = {}

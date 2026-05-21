@@ -314,6 +314,13 @@ def build_graph_components_from_sheet(
     if "Formula" not in df_enriched.columns:
         raise KeyError("'Formula' column missing from enriched sheet")
 
+    nan_mask = df_enriched["MP id"].isna() | df_enriched["Formula"].isna()
+    if nan_mask.any():
+        logger.warning(
+            "Skipping %d row(s) with NaN MP id / Formula", int(nan_mask.sum()),
+        )
+        df_enriched = df_enriched.loc[~nan_mask].reset_index(drop=True)
+
     all_frameworks = []
     row_mp_ids = []
     for _, row in df_enriched.iterrows():
