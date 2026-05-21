@@ -91,8 +91,9 @@ def main():
         type=int,
         default=1,
         help=(
-            "Number of parallel workers for sub-step 2 sea-Pourbaix "
-            "evaluation (default: 1 = sequential).  Multi-worker mode "
+            "Parallel workers for sub-step 2 (per-row sea-Pourbaix) "
+            "and sub-step 3 (per-composition graph build + voltage "
+            "plateau).  Default 1 = sequential.  Multi-worker mode "
             "requires SPICES_MP_BACKEND env var when using the snapshot "
             "backend."
         ),
@@ -102,7 +103,10 @@ def main():
         action="store_true",
         help=(
             "Resume sub-step 2 from per-row checkpoints in "
-            "{output_dir}/runtime_sheets/ (multi-worker mode only)."
+            "{output_dir}/runtime_sheets/ and skip sub-step 3 "
+            "compositions whose sc_N/{composition}.xlsx already exists "
+            "for every requested selection criterion.  Sub-step 3's "
+            "adjacency cache (output_dir/adjacency_cache/) is always-on."
         ),
     )
     parser.add_argument(

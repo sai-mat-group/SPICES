@@ -230,3 +230,222 @@ class TestLoadRowStruct:
                 str(tmp_path / "structs"),
                 str(tmp_path / "All_charged_structures"),
             )
+
+
+# --------------------------------------------------------------------
+# Adjacency cache (step-3)
+# --------------------------------------------------------------------
+
+
+class TestAdjacencyCache:
+    """Cache layer for ``build_graph_components_from_sheet`` adjacency dict.
+
+    All cases mock out structure loading / framework construction / BFS /
+    networkx so they isolate the cache path.
+    """
+
+    def _df(self):
+        return pd.DataFrame({
+            "MP id": ["mp-c", "mp-a", "mp-b"],   # intentionally unsorted
+            "Formula": ["FeO2", "FeO2", "FeO2"],
+            "Is experimental": [0, 1, 0],
+        })
+
+    def _patch_internals(self, adjacency_row=None):
+        if adjacency_row is None:
+            adjacency_row = {0: [1], 1: [0, 2], 2: [1]}
+        load = patch("spices.intercalation.grouping._load_row_struct").start()
+        fw = patch("spices.intercalation.grouping.FrameworkStructure").start()
+        adj = patch(
+            "spices.intercalation.grouping.build_adjacency_dict"
+        ).start()
+        bfs = patch("spices.intercalation.grouping.bfs_components").start()
+        graph = patch(
+            "spices.intercalation.grouping.make_networkx_graph"
+        ).start()
+        load.return_value = MagicMock(name="struct")
+        fw.side_effect = lambda **kw: MagicMock(name=f"fw_{kw['mp_id']}")
+        adj.return_value = adjacency_row
+        bfs.return_value = [list(adjacency_row.keys())]
+        graph.return_value = MagicMock(name="G")
+        return load, fw, adj, bfs, graph
+
+    def test_first_call_writes_pickle(self, tmp_path):
+        import pickle
+        cache_path = tmp_path / "FeO2.pkl"
+        try:
+            self._patch_internals()
+            grouping.build_graph_components_from_sheet(
+                self._df(),
+                working_ion="Mg",
+                adjacency_cache_path=str(cache_path),
+            )
+        finally:
+            patch.stopall()
+
+        assert cache_path.exists()
+        with open(cache_path, "rb") as f:
+            payload = pickle.load(f)
+        assert payload["schema_version"] == grouping.ADJACENCY_CACHE_SCHEMA_VERSION
+        assert payload["mp_ids"] == ("mp-a", "mp-b", "mp-c")
+        assert "adjacency" in payload
+        assert "matcher_kwargs" in payload
+
+    def test_second_call_loads_skips_build(self, tmp_path):
+        cache_path = tmp_path / "FeO2.pkl"
+
+        try:
+            _, _, adj1, _, _ = self._patch_internals()
+            grouping.build_graph_components_from_sheet(
+                self._df(),
+                working_ion="Mg",
+                adjacency_cache_path=str(cache_path),
+            )
+            assert adj1.call_count == 1
+        finally:
+            patch.stopall()
+
+        try:
+            _, _, adj2, _, _ = self._patch_internals()
+            adj2.side_effect = AssertionError(
+                "build_adjacency_dict should not be called on cache hit",
+            )
+            grouping.build_graph_components_from_sheet(
+                self._df(),
+                working_ion="Mg",
+                adjacency_cache_path=str(cache_path),
+            )
+            adj2.assert_not_called()
+        finally:
+            patch.stopall()
+
+    def test_mp_ids_mismatch_rebuilds(self, tmp_path, caplog):
+        import pickle
+        cache_path = tmp_path / "FeO2.pkl"
+        cache_path.write_bytes(pickle.dumps({
+            "schema_version": grouping.ADJACENCY_CACHE_SCHEMA_VERSION,
+            "mp_ids": ("mp-x", "mp-y", "mp-z"),    # stale
+            "matcher_kwargs": grouping._matcher_signature(
+                grouping.DEFAULT_MATCHER,
+            ),
+            "adjacency": {0: [], 1: [], 2: []},
+        }))
+
+        try:
+            _, _, adj, _, _ = self._patch_internals()
+            with caplog.at_level(
+                logging.WARNING, logger="spices.intercalation.grouping",
+            ):
+                grouping.build_graph_components_from_sheet(
+                    self._df(),
+                    working_ion="Mg",
+                    adjacency_cache_path=str(cache_path),
+                )
+            adj.assert_called_once()
+        finally:
+            patch.stopall()
+
+        assert any(
+            "mp_ids mismatch" in rec.message for rec in caplog.records
+        )
+        with open(cache_path, "rb") as f:
+            payload = pickle.load(f)
+        assert payload["mp_ids"] == ("mp-a", "mp-b", "mp-c")
+
+    def test_matcher_kwargs_mismatch_rebuilds(self, tmp_path, caplog):
+        import pickle
+        cache_path = tmp_path / "FeO2.pkl"
+        cache_path.write_bytes(pickle.dumps({
+            "schema_version": grouping.ADJACENCY_CACHE_SCHEMA_VERSION,
+            "mp_ids": ("mp-a", "mp-b", "mp-c"),
+            "matcher_kwargs": {"stale": True},
+            "adjacency": {0: [], 1: [], 2: []},
+        }))
+
+        try:
+            _, _, adj, _, _ = self._patch_internals()
+            with caplog.at_level(
+                logging.WARNING, logger="spices.intercalation.grouping",
+            ):
+                grouping.build_graph_components_from_sheet(
+                    self._df(),
+                    working_ion="Mg",
+                    adjacency_cache_path=str(cache_path),
+                )
+            adj.assert_called_once()
+        finally:
+            patch.stopall()
+
+        assert any(
+            "matcher_kwargs mismatch" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_corrupt_pickle_rebuilds(self, tmp_path, caplog):
+        cache_path = tmp_path / "FeO2.pkl"
+        cache_path.write_bytes(b"not a valid pickle")
+
+        try:
+            _, _, adj, _, _ = self._patch_internals()
+            with caplog.at_level(
+                logging.WARNING, logger="spices.intercalation.grouping",
+            ):
+                grouping.build_graph_components_from_sheet(
+                    self._df(),
+                    working_ion="Mg",
+                    adjacency_cache_path=str(cache_path),
+                )
+            adj.assert_called_once()
+        finally:
+            patch.stopall()
+
+        assert any("unreadable" in rec.message for rec in caplog.records)
+
+    def test_remap_sorted_to_row_order(self, tmp_path):
+        """Shuffled row order produces row-indexed adjacency on load.
+
+        Sorted mp_ids → (mp-a, mp-b, mp-c).  Cached adjacency in sorted
+        index form: {0: [1], 1: [0, 2], 2: [1]} (a connects to b; b
+        connects to a, c; c connects to b).  Row order in the df is
+        (mp-c, mp-a, mp-b) → row indices 0=mp-c, 1=mp-a, 2=mp-b.  After
+        remap, row-indexed adjacency should be {0: [2], 1: [2], 2: [1, 0]}.
+        """
+        import pickle
+        cache_path = tmp_path / "FeO2.pkl"
+        # Use the production signature so kwargs match on load.
+        cache_path.write_bytes(pickle.dumps({
+            "schema_version": grouping.ADJACENCY_CACHE_SCHEMA_VERSION,
+            "mp_ids": ("mp-a", "mp-b", "mp-c"),
+            "matcher_kwargs": grouping._matcher_signature(
+                grouping.DEFAULT_MATCHER,
+            ),
+            "adjacency": {0: [1], 1: [0, 2], 2: [1]},
+        }))
+
+        captured = {}
+
+        def _capture_bfs(adjacency, n):
+            captured["adjacency"] = adjacency
+            captured["n"] = n
+            return [[0, 1, 2]]
+
+        try:
+            self._patch_internals()
+            patch(
+                "spices.intercalation.grouping.bfs_components",
+                side_effect=_capture_bfs,
+            ).start()
+            grouping.build_graph_components_from_sheet(
+                self._df(),
+                working_ion="Mg",
+                adjacency_cache_path=str(cache_path),
+            )
+        finally:
+            patch.stopall()
+
+        # mp-c -> row 0, mp-a -> row 1, mp-b -> row 2.
+        # Sorted edges (mp-a, mp-b) → row edge (1, 2);
+        # (mp-b, mp-c) → row edge (2, 0).
+        assert sorted(captured["adjacency"][0]) == [2]
+        assert sorted(captured["adjacency"][1]) == [2]
+        assert sorted(captured["adjacency"][2]) == [0, 1]

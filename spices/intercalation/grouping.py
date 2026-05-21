@@ -9,11 +9,14 @@ chain.
 
 import logging
 import os
+import pickle
 
 import numpy as np
 import pandas as pd
 from pymatgen.core import Structure
 
+from spices.intercalation.structure import DEFAULT_MATCHER
+from spices.pourbaix.cache import _atomic_pickle_dump
 from spices.screening.framework_comparison import (
     FrameworkStructure,
     build_adjacency_dict,
@@ -22,6 +25,133 @@ from spices.screening.framework_comparison import (
 )
 
 logger = logging.getLogger(__name__)
+
+ADJACENCY_CACHE_SCHEMA_VERSION = 1
+
+
+def _matcher_signature(matcher):
+    """Extract canonical kwargs from a ``StructureMatcher`` for cache keying.
+
+    Pulls the constructor arguments that affect ``fit`` behavior.  The cache
+    auto-invalidates when any of these change in
+    :data:`spices.intercalation.structure.DEFAULT_MATCHER`.
+
+    Attribute access tolerates both the public name (modern pymatgen) and
+    the underscore-prefixed private name (older versions).
+    """
+    def _get(attr_public, attr_private):
+        return getattr(
+            matcher,
+            attr_public,
+            getattr(matcher, attr_private, None),
+        )
+
+    ignored = _get("ignored_species", "_ignored_species") or ()
+    return {
+        "ltol": getattr(matcher, "ltol", None),
+        "stol": getattr(matcher, "stol", None),
+        "angle_tol": getattr(matcher, "angle_tol", None),
+        "primitive_cell": _get("primitive_cell", "_primitive_cell"),
+        "attempt_supercell": _get("attempt_supercell", "_attempt_supercell"),
+        "allow_subset": _get("allow_subset", "_allow_subset"),
+        "supercell_size": _get("supercell_size", "_supercell_size"),
+        "ignored_species": tuple(ignored),
+        "comparator": type(_get("comparator", "_comparator")).__name__,
+    }
+
+
+def _load_adjacency_cache(path, row_mp_ids, matcher):
+    """Load and validate the adjacency cache, remapping to row order.
+
+    Returns the row-indexed adjacency ``dict[int, list[int]]`` on a valid
+    cache hit, or ``None`` if the cache is missing, unreadable, or stale
+    (schema/mp_ids/matcher mismatch).  Logs a warning on every mismatch
+    branch so the user sees *why* a rebuild happened.
+    """
+    try:
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+    except (EOFError, pickle.UnpicklingError, OSError, AttributeError) as e:
+        logger.warning(
+            "Adjacency cache %s unreadable (%s); rebuilding", path, e,
+        )
+        return None
+
+    if not isinstance(payload, dict):
+        logger.warning(
+            "Adjacency cache %s has unexpected payload type %s; rebuilding",
+            path, type(payload).__name__,
+        )
+        return None
+
+    if payload.get("schema_version") != ADJACENCY_CACHE_SCHEMA_VERSION:
+        logger.warning(
+            "Adjacency cache %s schema_version=%r != %d; rebuilding",
+            path, payload.get("schema_version"),
+            ADJACENCY_CACHE_SCHEMA_VERSION,
+        )
+        return None
+
+    cached_mp_ids = payload.get("mp_ids")
+    current_mp_ids_sorted = tuple(sorted(row_mp_ids))
+    if cached_mp_ids != current_mp_ids_sorted:
+        logger.warning(
+            "Adjacency cache %s mp_ids mismatch "
+            "(cache=%d, current=%d); rebuilding",
+            path,
+            len(cached_mp_ids) if cached_mp_ids else 0,
+            len(current_mp_ids_sorted),
+        )
+        return None
+
+    current_sig = _matcher_signature(matcher)
+    if payload.get("matcher_kwargs") != current_sig:
+        logger.warning(
+            "Adjacency cache %s matcher_kwargs mismatch; rebuilding", path,
+        )
+        return None
+
+    # Remap sorted-mp_id index → row-order index.
+    sorted_idx_of_mp_id = {mp: i for i, mp in enumerate(current_mp_ids_sorted)}
+    sorted_of_row = [sorted_idx_of_mp_id[mp] for mp in row_mp_ids]
+    row_of_sorted = [0] * len(row_mp_ids)
+    for row_i, sorted_i in enumerate(sorted_of_row):
+        row_of_sorted[sorted_i] = row_i
+
+    cached_adjacency = payload.get("adjacency") or {}
+    adjacency = {i: [] for i in range(len(row_mp_ids))}
+    for sorted_i, neighbors in cached_adjacency.items():
+        row_i = row_of_sorted[sorted_i]
+        adjacency[row_i] = [row_of_sorted[s] for s in neighbors]
+
+    logger.info("Loaded cached adjacency dict from %s", path)
+    return adjacency
+
+
+def _save_adjacency_cache(path, row_adjacency, row_mp_ids, matcher):
+    """Pickle the row-indexed adjacency dict to disk in sorted-index form."""
+    sorted_mp_ids = sorted(row_mp_ids)
+    sorted_idx_of_mp_id = {mp: i for i, mp in enumerate(sorted_mp_ids)}
+    sorted_of_row = [sorted_idx_of_mp_id[mp] for mp in row_mp_ids]
+
+    sorted_adjacency = {}
+    for row_i, neighbors in row_adjacency.items():
+        sorted_i = sorted_of_row[row_i]
+        sorted_adjacency[sorted_i] = sorted(
+            sorted_of_row[j] for j in neighbors
+        )
+    for i in range(len(row_mp_ids)):
+        sorted_adjacency.setdefault(i, [])
+
+    payload = {
+        "schema_version": ADJACENCY_CACHE_SCHEMA_VERSION,
+        "mp_ids": tuple(sorted_mp_ids),
+        "matcher_kwargs": _matcher_signature(matcher),
+        "adjacency": sorted_adjacency,
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    _atomic_pickle_dump(payload, path)
+    logger.info("Saved adjacency cache to %s", path)
 
 
 def save_component_graphs(graphs, save_dir):
@@ -281,6 +411,7 @@ def build_graph_components_from_sheet(
     struct_dir="structs",
     structure_cache_dir="All_charged_structures",
     matcher=None,
+    adjacency_cache_path=None,
 ):
     """Partition an enriched sheet into connected components.
 
@@ -297,6 +428,13 @@ def build_graph_components_from_sheet(
     working_ion : str
     charged_struct_dir, struct_dir, structure_cache_dir : str
     matcher : StructureMatcher or None
+    adjacency_cache_path : str or None
+        If provided, attempt to load the adjacency dict from this
+        pickle path; on cache miss / corrupt pickle / stale schema
+        rebuild via :func:`build_adjacency_dict` and atomically write
+        the result back.  The cache key encodes the sorted tuple of
+        row MP ids and the active matcher signature, so the cache
+        invalidates automatically when either changes.
 
     Returns
     -------
@@ -338,7 +476,34 @@ def build_graph_components_from_sheet(
         all_frameworks.append(fw)
         row_mp_ids.append(mp_id)
 
-    adjacency = build_adjacency_dict(all_frameworks, matcher=matcher)
+    # Duplicate MP ids in a sheet break the sorted-index remap; skip cache
+    # for that edge case but still build adjacency normally.
+    cache_usable = adjacency_cache_path is not None and len(
+        set(row_mp_ids),
+    ) == len(row_mp_ids)
+    if adjacency_cache_path is not None and not cache_usable:
+        logger.warning(
+            "Skipping adjacency cache for %s: duplicate MP ids in sheet",
+            adjacency_cache_path,
+        )
+
+    matcher_for_signature = matcher if matcher is not None else DEFAULT_MATCHER
+
+    adjacency = None
+    if cache_usable and os.path.exists(adjacency_cache_path):
+        adjacency = _load_adjacency_cache(
+            adjacency_cache_path, row_mp_ids, matcher_for_signature,
+        )
+    if adjacency is None:
+        adjacency = build_adjacency_dict(all_frameworks, matcher=matcher)
+        if cache_usable:
+            _save_adjacency_cache(
+                adjacency_cache_path,
+                adjacency,
+                row_mp_ids,
+                matcher_for_signature,
+            )
+
     component_indices = bfs_components(adjacency, len(all_frameworks))
 
     component_dfs = []

@@ -58,6 +58,7 @@ from spices.dataframe_ops import update_seawater_metastability_columns_by_mp_id
 from spices.screening.seawater import (
     EST_PER_WORKER_GB,
     _available_memory_gb,
+    _dispatch_phase1_tasks,
     _split_dataframe,
     _load_checkpoints,
     _recover_chunk_for_core,
@@ -1489,6 +1490,126 @@ def step2_enrich_charged_composition_sheets(
         logger.info("Cleaned up %s", runtime_dir)
 
 
+def _step3_process_composition(
+    fname,
+    composition_dir,
+    plateau_dir,
+    adjacency_cache_dir,
+    working_ion,
+    working_ion_valency,
+    working_ion_voltage_vs_SHE,
+    working_ion_energy,
+    element_str,
+    selection_criteria,
+    use_only_on_hull_phases,
+    save_plots,
+    save_graphs,
+    charged_struct_dir,
+    struct_dir,
+    structure_cache_dir,
+    decomp_energy_for_metastability,
+    cache_dir,
+    restart,
+):
+    """Per-composition worker for the parallel step-3 dispatch.
+
+    Module-level so it pickles cleanly for ``ProcessPoolExecutor``.
+
+    Resolves the MP client and ``PourbaixCache`` after fork so each
+    worker uses its own bounded in-memory LRU layer; the on-disk
+    pickle store under ``cache_dir`` is the shared source of truth.
+    Raises on any failure so the parent's
+    :func:`_dispatch_phase1_tasks` aborts the run (per user
+    direction: fail-fast over silent partial completion).
+    """
+    framework_name = fname.replace(".xlsx", "")
+    framework_dir = os.path.join(plateau_dir, framework_name)
+
+    if restart:
+        all_present = all(
+            os.path.exists(
+                os.path.join(framework_dir, f"sc_{sc}", fname),
+            )
+            for sc in selection_criteria
+        )
+        if all_present:
+            logger.info(
+                "Step 3: %s — all sc xlsxes present, skipping (restart)",
+                fname,
+            )
+            return
+
+    os.makedirs(framework_dir, exist_ok=True)
+
+    mp_client = get_client()
+    cache = PourbaixCache(
+        entries_dir=os.path.join(cache_dir, "saved_pbx_entries"),
+        pbx_dir=os.path.join(cache_dir, "saved_pbx"),
+    )
+
+    path = os.path.join(composition_dir, fname)
+    df = pd.read_excel(path)
+
+    adjacency_cache_path = os.path.join(
+        adjacency_cache_dir, f"{framework_name}.pkl",
+    )
+    component_dfs, component_graphs = build_graph_components_from_sheet(
+        df,
+        working_ion=working_ion,
+        charged_struct_dir=charged_struct_dir,
+        struct_dir=struct_dir,
+        structure_cache_dir=structure_cache_dir,
+        adjacency_cache_path=adjacency_cache_path,
+    )
+
+    if save_graphs:
+        save_component_graphs(
+            component_graphs,
+            os.path.join(framework_dir, "graphs"),
+        )
+
+    voltage_results = {sc: {} for sc in selection_criteria}
+
+    for i, comp_df in enumerate(component_dfs):
+        logger.debug("Step 3: %s/component_%d", fname, i)
+
+        for sc in selection_criteria:
+            sc_dir = os.path.join(framework_dir, f"sc_{sc}")
+            os.makedirs(sc_dir, exist_ok=True)
+
+            plateau_dict = obtain_voltage_plateau_data_based_on_convex_hull(
+                comp_df,
+                selection_criteria=[sc],
+                working_ion=working_ion,
+                working_ion_valency=working_ion_valency,
+                working_ion_voltage_vs_SHE=working_ion_voltage_vs_SHE,
+                working_ion_energy=working_ion_energy,
+                cache=cache,
+                mp_client=mp_client,
+                element_str=element_str,
+                use_only_on_hull_phases=use_only_on_hull_phases,
+                save_plot=save_plots,
+                save_plot_path=sc_dir,
+                decomp_energy_for_metastability=decomp_energy_for_metastability,
+            )
+
+            if isinstance(plateau_dict.get(f"sc {sc}"), pd.DataFrame):
+                voltage_results[sc][
+                    f"voltage_component_{i}"
+                ] = plateau_dict[f"sc {sc}"]
+
+    for sc in selection_criteria:
+        if not voltage_results[sc]:
+            continue
+
+        sc_dir = os.path.join(framework_dir, f"sc_{sc}")
+        sheet_path = os.path.join(sc_dir, fname)
+
+        with pd.ExcelWriter(sheet_path, engine="openpyxl") as writer:
+            for name, vdf in voltage_results[sc].items():
+                vdf.to_excel(writer, sheet_name=name, index=False)
+
+
 def step3_create_voltage_plateau_sheets(
     composition_dir,
     output_dir,
@@ -1496,8 +1617,6 @@ def step3_create_voltage_plateau_sheets(
     working_ion_valency,
     working_ion_voltage_vs_SHE,
     working_ion_energy,
-    cache,
-    mp_client,
     element_str,
     selection_criteria=None,
     use_only_on_hull_phases=True,
@@ -1507,24 +1626,33 @@ def step3_create_voltage_plateau_sheets(
     struct_dir="structs",
     structure_cache_dir="All_charged_structures",
     decomp_energy_for_metastability=0.3,
+    cache_dir=".",
+    n_workers=1,
+    restart=False,
 ):
     """
     Step 3: Partition each enriched sheet into graph-based components
     and compute voltage plateaus per component per selection criterion.
+
+    Workers (or the in-process sequential path) resolve their own
+    ``mp_client`` and :class:`PourbaixCache` from ``cache_dir`` after
+    fork, mirroring step-2's Phase-2 pattern.  Per-composition
+    adjacency dicts are pickled to
+    ``{output_dir}/../adjacency_cache/{framework}.pkl`` (sibling of
+    ``Voltage_plateau_data/``) so a restart skips the O(n^2)
+    StructureMatcher rebuild.
 
     Parameters
     ----------
     composition_dir : str
         Directory with enriched per-composition Excel files (step 2).
     output_dir : str
-        Directory for voltage plateau output.
+        Directory for voltage plateau output (``Voltage_plateau_data/``).
     working_ion : str
     working_ion_valency : int
     working_ion_voltage_vs_SHE : float
     working_ion_energy : float
         GGA(+U) energy per atom of the stable elemental working-ion phase.
-    cache : PourbaixCache
-    mp_client : MPRester
     element_str : str
     selection_criteria : list of int or None
     use_only_on_hull_phases : bool
@@ -1535,81 +1663,62 @@ def step3_create_voltage_plateau_sheets(
         ``{framework_dir}/graphs/``.  Default True.
     charged_struct_dir, struct_dir, structure_cache_dir : str
     decomp_energy_for_metastability : float
+    cache_dir : str
+        Root dir for the shared Pourbaix on-disk cache
+        (``saved_pbx_entries/``, ``saved_pbx/``).  Workers instantiate
+        their own :class:`PourbaixCache` against this.
+    n_workers : int
+        Parallel workers for per-composition dispatch.  ``<=1`` runs
+        sequentially in-process.
+    restart : bool
+        If True, skip a composition whose ``sc_{N}/{composition}.xlsx``
+        already exists for every requested selection criterion.  The
+        adjacency cache is always-on regardless of this flag.
     """
     if selection_criteria is None:
         selection_criteria = DEFAULT_SELECTION_CRITERIA
 
     os.makedirs(output_dir, exist_ok=True)
+    adjacency_cache_dir = os.path.join(
+        os.path.dirname(output_dir.rstrip(os.sep)) or ".",
+        "adjacency_cache",
+    )
+    os.makedirs(adjacency_cache_dir, exist_ok=True)
 
-    excel_files = [
+    excel_files = sorted(
         f for f in os.listdir(composition_dir) if f.endswith(".xlsx")
-    ]
-    total = len(excel_files)
+    )
 
-    for idx, fname in enumerate(excel_files):
-        logger.info("[%d/%d] Step 3: %s", idx + 1, total, fname)
-
-        framework_name = fname.replace(".xlsx", "")
-        framework_dir = os.path.join(output_dir, framework_name)
-        os.makedirs(framework_dir, exist_ok=True)
-
-        path = os.path.join(composition_dir, fname)
-        df = pd.read_excel(path)
-
-        component_dfs, component_graphs = build_graph_components_from_sheet(
-            df,
-            working_ion=working_ion,
-            charged_struct_dir=charged_struct_dir,
-            struct_dir=struct_dir,
-            structure_cache_dir=structure_cache_dir,
+    def _args_for(fname):
+        return (
+            fname,
+            composition_dir,
+            output_dir,
+            adjacency_cache_dir,
+            working_ion,
+            working_ion_valency,
+            working_ion_voltage_vs_SHE,
+            working_ion_energy,
+            element_str,
+            list(selection_criteria),
+            use_only_on_hull_phases,
+            save_plots,
+            save_graphs,
+            charged_struct_dir,
+            struct_dir,
+            structure_cache_dir,
+            decomp_energy_for_metastability,
+            cache_dir,
+            restart,
         )
 
-        if save_graphs:
-            save_component_graphs(
-                component_graphs,
-                os.path.join(framework_dir, "graphs"),
-            )
-
-        voltage_results = {sc: {} for sc in selection_criteria}
-
-        for i, comp_df in enumerate(component_dfs):
-            logger.debug("Processing %s/component_%d", fname, i)
-
-            for sc in selection_criteria:
-                sc_dir = os.path.join(framework_dir, f"sc_{sc}")
-                os.makedirs(sc_dir, exist_ok=True)
-
-                plateau_dict = obtain_voltage_plateau_data_based_on_convex_hull(
-                    comp_df,
-                    selection_criteria=[sc],
-                    working_ion=working_ion,
-                    working_ion_valency=working_ion_valency,
-                    working_ion_voltage_vs_SHE=working_ion_voltage_vs_SHE,
-                    working_ion_energy=working_ion_energy,
-                    cache=cache,
-                    mp_client=mp_client,
-                    element_str=element_str,
-                    use_only_on_hull_phases=use_only_on_hull_phases,
-                    save_plot=save_plots,
-                    save_plot_path=sc_dir,
-                    decomp_energy_for_metastability=decomp_energy_for_metastability,
-                )
-
-                if isinstance(plateau_dict.get(f"sc {sc}"), pd.DataFrame):
-                    voltage_results[sc][
-                        f"voltage_component_{i}"
-                    ] = plateau_dict[f"sc {sc}"]
-
-        for sc in selection_criteria:
-            if not voltage_results[sc]:
-                continue
-
-            sc_dir = os.path.join(framework_dir, f"sc_{sc}")
-            sheet_path = os.path.join(sc_dir, fname)
-
-            with pd.ExcelWriter(sheet_path, engine="openpyxl") as writer:
-                for name, vdf in voltage_results[sc].items():
-                    vdf.to_excel(writer, sheet_name=name, index=False)
+    _dispatch_phase1_tasks(
+        "Step 3",
+        n_workers,
+        excel_files,
+        _step3_process_composition,
+        _args_for,
+    )
 
 
 def step4_create_combined_sheet(
@@ -1767,13 +1876,18 @@ def run_intercalation_screening(
         See **Multiprocessing and backend resolution** below for the
         ``n_workers > 1`` case.
     n_workers : int
-        Number of parallel workers for sub-step 2's sea-Pourbaix
-        evaluation.  ``1`` (default) runs sequentially.  Values > 1
-        flatten new charged structures across all sheets and dispatch
-        them to a :class:`ProcessPoolExecutor`.
+        Parallel workers for sub-step 2 (per-row sea-Pourbaix
+        evaluation) **and** sub-step 3 (per-composition graph build +
+        voltage plateau).  ``1`` (default) runs both sequentially.
+        Step 3 workers fork-resolve their own ``mp_client`` and
+        :class:`PourbaixCache` against ``cache_dir``.
     restart : bool
-        If True (and ``n_workers > 1``), resume sub-step 2 from
-        per-row checkpoints in ``output_dir/runtime_sheets/``.
+        If True, resume sub-step 2 from per-row checkpoints in
+        ``output_dir/runtime_sheets/`` **and** skip sub-step 3
+        compositions whose ``sc_{N}/{composition}.xlsx`` already
+        exists for every requested selection criterion.  The step-3
+        adjacency cache (``output_dir/adjacency_cache/``) is always-on
+        regardless of this flag.
     save_interval : int
         Sub-step 2 worker writes a part-checkpoint every N rows.
     max_retries : int
@@ -1877,8 +1991,6 @@ def run_intercalation_screening(
         working_ion_valency=working_ion_valency,
         working_ion_voltage_vs_SHE=working_ion_voltage_vs_SHE,
         working_ion_energy=working_ion_energy,
-        cache=cache,
-        mp_client=mp_client,
         element_str=element,
         selection_criteria=selection_criteria,
         use_only_on_hull_phases=use_only_on_hull_phases,
@@ -1888,6 +2000,9 @@ def run_intercalation_screening(
         struct_dir=struct_dir,
         structure_cache_dir=structure_cache_dir,
         decomp_energy_for_metastability=decomp_energy,
+        cache_dir=cache_dir,
+        n_workers=n_workers,
+        restart=restart,
     )
 
     # Step 4

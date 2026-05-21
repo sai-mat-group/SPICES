@@ -639,3 +639,126 @@ class TestPhase1Init:
         assert intercalation_mod._PHASE1_COUNTER is sentinel
         # Restore for test isolation.
         intercalation_mod._PHASE1_COUNTER = None
+
+
+# --------------------------------------------------------------------
+# step3_create_voltage_plateau_sheets
+# --------------------------------------------------------------------
+
+
+class TestStep3CreateVoltagePlateauSheets:
+    """Per-composition dispatch for step 3 (graph build + voltage plateaus).
+
+    All cases mock the per-composition worker so they only exercise the
+    dispatcher orchestration: task enumeration, adjacency_cache_dir
+    creation, restart short-circuit, fail-fast on worker exception.
+    """
+
+    def _make_dirs(self, tmp_path):
+        comp_dir = tmp_path / "unique_charged_composition_sheets"
+        out_dir = tmp_path / "Li_intercalation" / "Voltage_plateau_data"
+        comp_dir.mkdir(parents=True)
+        out_dir.mkdir(parents=True)
+        (comp_dir / "FeO2.xlsx").write_text("dummy")
+        (comp_dir / "MnO2.xlsx").write_text("dummy")
+        return comp_dir, out_dir
+
+    def _kwargs(self):
+        return dict(
+            working_ion="Li",
+            working_ion_valency=1,
+            working_ion_voltage_vs_SHE=-3.05,
+            working_ion_energy=-1.9,
+            element_str="Li",
+            selection_criteria=[4],
+            decomp_energy_for_metastability=0.3,
+            cache_dir=".",
+        )
+
+    @patch("spices.screening.intercalation._step3_process_composition")
+    def test_sequential_writes_outputs(self, mock_worker, tmp_path):
+        comp_dir, out_dir = self._make_dirs(tmp_path)
+        intercalation_mod.step3_create_voltage_plateau_sheets(
+            str(comp_dir), str(out_dir),
+            n_workers=1, restart=False,
+            **self._kwargs(),
+        )
+        called_fnames = sorted(call.args[0] for call in mock_worker.call_args_list)
+        assert called_fnames == ["FeO2.xlsx", "MnO2.xlsx"]
+
+    @patch("spices.screening.intercalation._dispatch_phase1_tasks")
+    def test_parallel_forwards_n_workers(self, mock_dispatch, tmp_path):
+        comp_dir, out_dir = self._make_dirs(tmp_path)
+        intercalation_mod.step3_create_voltage_plateau_sheets(
+            str(comp_dir), str(out_dir),
+            n_workers=4, restart=False,
+            **self._kwargs(),
+        )
+        mock_dispatch.assert_called_once()
+        args, _ = mock_dispatch.call_args
+        label, n_workers, tasks, worker_fn, args_for_task = args
+        assert label == "Step 3"
+        assert n_workers == 4
+        assert sorted(tasks) == ["FeO2.xlsx", "MnO2.xlsx"]
+        assert worker_fn is intercalation_mod._step3_process_composition
+
+    @patch("spices.screening.intercalation._step3_process_composition")
+    def test_first_worker_failure_aborts(self, mock_worker, tmp_path):
+        comp_dir, out_dir = self._make_dirs(tmp_path)
+
+        def _maybe_raise(fname, *args, **kwargs):
+            if fname == "FeO2.xlsx":
+                raise RuntimeError("boom")
+
+        mock_worker.side_effect = _maybe_raise
+        with pytest.raises(RuntimeError, match="boom"):
+            intercalation_mod.step3_create_voltage_plateau_sheets(
+                str(comp_dir), str(out_dir),
+                n_workers=1, restart=False,
+                **self._kwargs(),
+            )
+
+    def test_adjacency_cache_dir_created_at_sibling(self, tmp_path):
+        comp_dir, out_dir = self._make_dirs(tmp_path)
+        with patch(
+            "spices.screening.intercalation._step3_process_composition"
+        ):
+            intercalation_mod.step3_create_voltage_plateau_sheets(
+                str(comp_dir), str(out_dir),
+                n_workers=1, restart=False,
+                **self._kwargs(),
+            )
+        assert (out_dir.parent / "adjacency_cache").is_dir()
+
+    def test_restart_skips_completed_composition(self, tmp_path):
+        """When restart=True and all sc xlsxes exist, worker returns
+        early without reading the input xlsx.
+
+        Tests ``_step3_process_composition`` directly (not the
+        dispatcher), since the short-circuit lives in the worker.
+        """
+        comp_dir, out_dir = self._make_dirs(tmp_path)
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        adj_dir = tmp_path / "adjacency_cache"
+        adj_dir.mkdir()
+
+        # Pre-create sc_4/FeO2.xlsx so the restart check finds it.
+        sc_dir = out_dir / "FeO2" / "sc_4"
+        sc_dir.mkdir(parents=True)
+        (sc_dir / "FeO2.xlsx").write_text("present")
+
+        with patch(
+            "spices.screening.intercalation.pd.read_excel"
+        ) as mock_read:
+            intercalation_mod._step3_process_composition(
+                "FeO2.xlsx",
+                str(comp_dir),
+                str(out_dir),
+                str(adj_dir),
+                "Li", 1, -3.05, -1.9, "Li", [4],
+                True, False, True,
+                "charged_structs", "structs", "All_charged_structures",
+                0.3, str(cache_dir), True,
+            )
+            mock_read.assert_not_called()

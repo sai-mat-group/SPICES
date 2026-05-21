@@ -317,6 +317,12 @@ def build_adjacency_dict(all_frameworks, matcher=None):
     adjacency = defaultdict(list)
 
     logger.info("Building adjacency dict for %d frameworks (O(n^2))", n)
+    # TODO: Within-composition pair-splitting (deferred follow-up).  For
+    # very large compositions (e.g. V3P8O29 ~404 frameworks, ~81k pairs
+    # → 3.5 h on a single core), the upper-triangle pair index space
+    # could be sharded across workers and reduced into a single
+    # adjacency dict.  See the "Step 3 parallelization" section in
+    # claude-prompts/multi-worker-OOM-fix.txt for context.
     for i in range(n):
         for j in range(i + 1, n):
             if matcher.fit(

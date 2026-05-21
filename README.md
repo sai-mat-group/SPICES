@@ -95,13 +95,34 @@ df_sea = run_seawater_screening(
 # components via a graph built over StructureMatcher-equivalence
 # (spices.intercalation.grouping).  One PDF per connected component
 # is saved to {output_dir}/Voltage_plateau_data/{framework}/graphs/
-# unless save_component_graphs=False.
+# unless save_component_graphs=False.  ``n_workers`` and ``restart``
+# apply to both sub-step 2 (per-row sea-Pourbaix evaluation) and
+# sub-step 3 (per-composition graph build + voltage plateau).
 from spices.screening.intercalation import run_intercalation_screening
 
 combined = run_intercalation_screening(
     element="Ca",
     input_path="Ca_seawater_results.xlsx",
     output_dir="Ca_intercalation/",
+)
+
+# Stage 3 with multiprocessing.  Adjacency dicts are pickled to
+# Ca_intercalation/adjacency_cache/{composition}.pkl so a restart
+# skips the O(n^2) StructureMatcher rebuild.
+combined = run_intercalation_screening(
+    element="Ca",
+    input_path="Ca_seawater_results.xlsx",
+    output_dir="Ca_intercalation/",
+    n_workers=24,
+)
+
+# Stage 3: resume after an interrupted run
+combined = run_intercalation_screening(
+    element="Ca",
+    input_path="Ca_seawater_results.xlsx",
+    output_dir="Ca_intercalation/",
+    n_workers=24,
+    restart=True,
 )
 
 # Stage 4: Compare frameworks across working ions
@@ -209,7 +230,7 @@ spices/
 
 scripts/                       # CLI wrappers and HPC submission templates
     run_seawater_screening.py  # CLI for Stage 2 (supports multiprocessing)
-    run_intercalation_screening.py  # CLI for Stage 3 (supports multiprocessing in sub-step 2)
+    run_intercalation_screening.py  # CLI for Stage 3 (supports multiprocessing in sub-steps 2 and 3)
     run_framework_comparison.py # CLI for Stage 4 (graph + optional set comparison)
     run_statistics.py          # CLI for Stage 5
     submit_seawater.sh         # SLURM submission template for Stage 2
@@ -218,25 +239,28 @@ scripts/                       # CLI wrappers and HPC submission templates
 
 ## HPC / Multiprocessing
 
-Stage 2 and Stage 3 sub-step 2 both parallelize via `-n N`.
+Stage 2 and Stage 3 sub-steps 2 and 3 all parallelize via `-n N`.
 
 **Stage 2** is internally a two-phase pipeline:
 
 * **Phase 1** — pre-build all unique Pourbaix entries (Phase 1a, keyed by chemsys) and unique seawater Pourbaix diagrams (Phase 1b, keyed by reduced sea-comp formula).  The parent enumerates the unique build keys from the input dataframe, filters out keys whose pickle already exists on disk, and dispatches **one task per remaining unique key** to the worker pool.  No two workers ever build the same diagram, and no worker waits idle on a lock — every active worker is computing something different.  Each Phase 1 task retries up to `--phase1-max-retries` (default 5) on transient errors; if a task ultimately fails, the run aborts so the user can investigate.
 * **Phase 2** — per-row metastability evaluation, chunked round-robin across workers (existing behavior).  Phase 2 always hits the on-disk cache built in Phase 1, so duplicate Pourbaix builds across workers are eliminated.
 
-**Stage 3 sub-step 2** is a 3-phase pipeline: Phase 1 (per-file discovery of new charged MP structures, including disk-cached CIF lookup and `find_structures` formula matching) and Phase 2 (per-row sea-Pourbaix evaluation of those new rows) both use the worker pool — only Phase 3 (atomic xlsx rewrite) is single-threaded in the parent.  Stage 3 sub-steps 1, 3, and 4 run sequentially in the parent; Stages 4 and 5 are single-process and should be launched directly on a workstation.
+**Stage 3 sub-step 2** is a 3-phase pipeline: Phase 1 (per-file discovery of new charged MP structures, including disk-cached CIF lookup and `find_structures` formula matching) and Phase 2 (per-row sea-Pourbaix evaluation of those new rows) both use the worker pool — only Phase 3 (atomic xlsx rewrite) is single-threaded in the parent.
+
+**Stage 3 sub-step 3** dispatches one task per unique-charged-composition file to the same worker pool.  Each worker resolves its own `mp_client` and `PourbaixCache` after fork, builds the per-composition framework adjacency dict (`O(n^2)` pairwise `StructureMatcher.fit`), runs BFS to extract connected components, renders component-graph PDFs, and computes voltage plateaus per component per selection criterion.  The adjacency dict is pickled to `{output_dir}/adjacency_cache/{composition}.pkl` — keyed by sorted MP-id tuple + matcher signature — so a restart skips the rebuild.  The cache is always-on regardless of `--restart`.  Sub-steps 1 and 4 still run sequentially in the parent (cheap); Stages 4 and 5 are single-process and should be launched directly on a workstation.
 
 > **Linux/Unix only.**  The multi-worker code uses `fcntl.flock` (POSIX advisory file locks) for the cross-worker `find_structures` race fix and `os.fork`-based `ProcessPoolExecutor` for the worker pool.  Run multi-worker pipelines on Linux (workstation or HPC); on Windows / macOS use `n_workers=1`.
 
 For multi-worker runs against the snapshot backend, export `SPICES_MP_BACKEND=snapshot` (and `SPICES_MP_SNAPSHOT_ROOT`, `SPICES_MP_SNAPSHOT_RELEASE`) so each forked worker resolves the same backend — see the `run_seawater_screening` docstring for the full caveat.
 
-### Restart and crash safety (Stage 2)
+### Restart and crash safety
 
 * **`--restart`** (Stage 2) resumes an interrupted run.  In Phase 1, only chemsys/sea-comp keys whose Pourbaix pickle is missing from disk are re-dispatched — if 8000 of 10000 unique diagrams already exist, the remaining 2000 are split across all workers.  In Phase 2, only rows whose `Seawater stability` is still NaN are re-evaluated, with checkpoint files from `runtime_sheets/` and `{element}_evaluated_backup.xlsx` merged in.
-* **Hard guard on `restart=False`** — if the output xlsx already contains evaluated rows and `--restart` is *not* passed, the run aborts with a clear error rather than silently overwriting prior progress.  Pass `--restart` to resume, or delete the file to start over.
-* **Atomic final write** — the output xlsx is written via `to_excel(<tmp>); os.replace(<tmp>, <final>)`.  A kill mid-write leaves either the previous file or the new one, never a corrupt half-written xlsx.  `runtime_sheets/` is cleaned up only after `os.replace` succeeds.
-* **Honest worker-death diagnostics** — when one worker dies, `ProcessPoolExecutor` cancels every pending future and each cancellation surfaces as `BrokenProcessPool`.  Stage 2 distinguishes the *first* (root-cause) failure from subsequent cascade cancellations in the log, then runs a post-mortem scan of `dmesg -T` and `journalctl --user` so the user can tell apart a real OOM (kernel SIGKILL of `python`), a SLURM cgroup time-limit kill, and a process-internal exception.
+* **`--restart`** (Stage 3) resumes an interrupted intercalation run.  Sub-step 2 resumes from per-row checkpoints in `runtime_sheets/`.  Sub-step 3 skips a composition whose `Voltage_plateau_data/{composition}/sc_{N}/{composition}.xlsx` already exists for every requested selection criterion; partial compositions are re-built from the on-disk adjacency cache (`{output_dir}/adjacency_cache/{composition}.pkl`), so the O(n²) `StructureMatcher` work is paid only once.
+* **Hard guard on `restart=False`** — if the Stage 2 output xlsx already contains evaluated rows and `--restart` is *not* passed, the run aborts with a clear error rather than silently overwriting prior progress.  Pass `--restart` to resume, or delete the file to start over.
+* **Atomic final write** — the output xlsx is written via `to_excel(<tmp>); os.replace(<tmp>, <final>)`.  A kill mid-write leaves either the previous file or the new one, never a corrupt half-written xlsx.  `runtime_sheets/` is cleaned up only after `os.replace` succeeds.  Stage 3's adjacency pickles use the same PID-tagged temp + `os.replace` pattern so two workers can never leave a truncated pickle on disk.
+* **Honest worker-death diagnostics** — when one worker dies, `ProcessPoolExecutor` cancels every pending future and each cancellation surfaces as `BrokenProcessPool`.  Stage 2 distinguishes the *first* (root-cause) failure from subsequent cascade cancellations in the log, then runs a post-mortem scan of `dmesg -T` and `journalctl --user` so the user can tell apart a real OOM (kernel SIGKILL of `python`), a SLURM cgroup time-limit kill, and a process-internal exception.  Stage 3's sub-step 3 dispatcher aborts on the first per-composition worker exception so partial-state corruption cannot accrete silently — re-run with `--restart` to resume.
 
 ```bash
 # Stage 2: seawater screening (parallel, 8 cores)
@@ -249,14 +273,17 @@ python scripts/run_seawater_screening.py Ca input.xlsx -o output.xlsx -n 8 --res
 python scripts/run_seawater_screening.py Ca input.xlsx -o output.xlsx -n 8 \
     --phase1-max-retries 10 --phase1-retry-delay 60
 
-# Stage 3: intercalation voltage screening (parallel sub-step 2, 8 cores)
+# Stage 3: intercalation voltage screening (parallel sub-steps 2 and 3, 8 cores)
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ -n 8
 
 # Stage 3 with per-plateau pH-overlap PDFs, without component graphs
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ \
     --save-plots --no-component-graphs
 
-# Stage 3 — resume an interrupted multi-worker run from per-row checkpoints
+# Stage 3 — resume an interrupted multi-worker run.  Sub-step 2 resumes
+# from per-row checkpoints; sub-step 3 skips completed compositions and
+# reuses the on-disk adjacency cache so the O(n^2) StructureMatcher work
+# is paid only once per composition across reruns.
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ \
     -n 8 --restart
 
@@ -284,6 +311,8 @@ Sub-step 2 of Stage 3 builds three CIF caches under `{output_dir}/` (e.g. `Ca_in
 | `All_charged_structures/` | `{reduced_formula}/{mp_id}.cif` | All MP structures that share a given reduced formula, downloaded in bulk by `find_structures` the first time that formula is encountered.  Used to map a charged framework to every MP id whose composition + structure matches.  A `.populated` sentinel inside each subdir flags "fully populated" for the multi-worker fast path. | Sub-step 2 Phase 1 (`find_structures`); sub-step 3 fallback for newly-added charged rows (`_load_row_struct` fallback path); Stage 4 framework comparison (`load_charged_frameworks`). |
 
 `structs/` and `All_charged_structures/` are inputs to Stage 4; `charged_structs/` is internal to Stage 3.  All three are safe to delete to force a re-download on the next run, but doing so wastes time — they are reusable across iterations as long as the MP release pinned by `SPICES_MP_SNAPSHOT_RELEASE` is the same.
+
+In addition, sub-step 3 maintains one **adjacency pickle** per unique-charged-composition file under `{output_dir}/adjacency_cache/{composition}.pkl`.  Each pickle stores the row-pairwise `StructureMatcher`-equivalence adjacency dict in sorted-MP-id-index form, keyed by `(sorted MP-id tuple, matcher signature, schema version)`.  On a re-run the pickle is loaded back into the row order of the current sheet, skipping the O(n²) rebuild — for compositions with a few hundred frameworks this turns a multi-hour rebuild into a sub-second load.  The cache is always-on and invalidates automatically if either the MP-id set or the matcher kwargs in `spices.intercalation.structure.DEFAULT_MATCHER` change.  Delete the directory to force a full rebuild.
 
 ## Running Tests
 

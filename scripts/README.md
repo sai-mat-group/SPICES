@@ -11,7 +11,7 @@ CLI wrappers and HPC submission templates for running SPICES pipeline stages.
 | `submit_seawater.sh` | SLURM template for Stage 2 |
 | `submit_intercalation.sh` | SLURM template for Stage 3 |
 
-Stage 2 and Stage 3 sub-step 2 (sea-Pourbaix evaluation of newly discovered charged structures) parallelize via `-n N`.  Stage 3 sub-steps 1, 3, and 4 run sequentially in the parent.
+Stage 2 and Stage 3 sub-steps 2 and 3 parallelize via `-n N`.  Sub-step 2 dispatches per-row sea-Pourbaix evaluation of newly discovered charged structures; sub-step 3 dispatches per-composition graph-component construction + voltage-plateau computation (with an on-disk adjacency-dict cache at `{output_dir}/adjacency_cache/` so a restart skips the O(n²) `StructureMatcher` rebuild).  Stage 3 sub-steps 1 and 4 run sequentially in the parent.
 
 ## Local Usage
 
@@ -37,8 +37,15 @@ python scripts/run_seawater_screening.py --help
 # Stage 3 — sequential
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/
 
-# Stage 3 — parallel sub-step 2 (8 cores), resume from checkpoint
+# Stage 3 — parallel sub-steps 2 and 3 (8 cores).  Adjacency dicts are
+# pickled to Ca_intercalation/adjacency_cache/{composition}.pkl on first
+# build and reloaded on every subsequent run.
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ -n 8
+
+# Stage 3 — resume an interrupted run.  Sub-step 2 resumes from per-row
+# checkpoints; sub-step 3 skips a composition whose sc_N/{composition}.xlsx
+# exists for every requested criterion and reuses the adjacency cache for
+# the rest.
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ -n 8 --restart
 
 # With plot saving
@@ -81,3 +88,8 @@ When running with multiple workers, intermediate files are saved to:
 Runtime sheets are automatically cleaned up after a successful run.
 
 For Stage 3 sub-step 2, the same `runtime_sheets/` and `process_logs/` directories are used (rooted at the intercalation `output_dir`).  The `--restart` flag resumes from per-row checkpoints.
+
+For Stage 3 sub-step 3, persistent state lives in two places under the intercalation `output_dir`:
+
+- `Voltage_plateau_data/{composition}/sc_{N}/{composition}.xlsx` — the actual voltage-plateau output, one xlsx per requested selection criterion.  `--restart` skips a composition only when every requested `sc_N/{composition}.xlsx` is present.
+- `adjacency_cache/{composition}.pkl` — the per-composition adjacency dict (sorted-MP-id-index form, atomically written via PID-tagged temp + `os.replace`).  Loaded back into row order on a re-run; the cache is always-on and invalidates automatically if the MP-id set or matcher kwargs change.  Safe to delete to force a full O(n²) rebuild.
