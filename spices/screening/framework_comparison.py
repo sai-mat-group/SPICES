@@ -12,21 +12,17 @@ Replaces per-element ``framework_comparison_utils.py`` and
 """
 
 import ast
+import json
 import logging
 import os
 import pickle
 import re
-import shutil
-import warnings
 from collections import defaultdict, deque
-from itertools import combinations
 
-import numpy as np
 import pandas as pd
-from pymatgen.core import Structure, Element, Composition
+from pymatgen.core import Structure, Element
 
 from spices.intercalation.structure import DEFAULT_MATCHER
-from spices.config import SUPPORTED_ELEMENTS
 
 logger = logging.getLogger(__name__)
 
@@ -222,64 +218,7 @@ def load_all_frameworks_for_element(
 
 
 # ====================================================================
-# Set operations (optional, enabled by run_set_comparison=True)
-# ====================================================================
-
-
-def framework_set_intersection(
-    req_charged, req_discharged, other_charged, other_discharged,
-):
-    """
-    Frameworks from the required ion that are shared with another ion.
-    Four-way intersection (charged-charged, charged-discharged, etc.)
-    combined via union.
-    """
-    dd = {x for x in req_discharged if x in other_discharged}
-    dc = {x for x in req_discharged if x in other_charged}
-    cd = {x for x in req_charged if x in other_discharged}
-    cc = {x for x in req_charged if x in other_charged}
-    return dd.union(dc, cd, cc)
-
-
-def multi_ion_common_frameworks(
-    req_charged, req_discharged,
-    other_charged_list, other_discharged_list,
-):
-    """Frameworks common to the required ion AND all other ions."""
-    if len(other_charged_list) != len(other_discharged_list):
-        raise ValueError("Charged and discharged lists must be same length")
-
-    result = None
-    for chg, dis in zip(other_charged_list, other_discharged_list):
-        intersection = framework_set_intersection(
-            req_charged, req_discharged, chg, dis,
-        )
-        if result is None:
-            result = intersection
-        else:
-            result = result.intersection(intersection)
-    return result or set()
-
-
-def ion_selective_frameworks(
-    req_charged, req_discharged,
-    other_charged_list, other_discharged_list,
-):
-    """Frameworks unique to the required ion (not shared with any other)."""
-    if len(other_charged_list) != len(other_discharged_list):
-        raise ValueError("Charged and discharged lists must be same length")
-
-    selective = req_discharged.union(req_charged)
-    for chg, dis in zip(other_charged_list, other_discharged_list):
-        common = multi_ion_common_frameworks(
-            selective, set(), [chg], [dis],
-        )
-        selective = selective - common
-    return selective
-
-
-# ====================================================================
-# Graph-based comparison (PRIMARY)
+# Graph-based comparison
 # ====================================================================
 
 
@@ -339,6 +278,82 @@ def build_adjacency_dict(all_frameworks, matcher=None):
             adjacency[i] = []
 
     return dict(adjacency)
+
+
+def reconnect_isolated_frameworks(adjacency, all_frameworks, df_dict):
+    """
+    Manually reconnect isolated frameworks using voltage plateau data.
+
+    Some charged↔discharged framework pairs that share a known voltage
+    plateau in the Excel may not be matched by ``StructureMatcher.fit``
+    (e.g. when ion removal causes lattice distortion). This helper looks
+    up each isolated framework's same-ion partner in
+    ``df_dict[working_ion]`` and adds a manual edge.
+
+    Encodes the scientific assumption: "if two structures share a row in
+    the voltage plateau Excel, they are the same framework." Use only
+    when that assumption is intended.
+
+    Parameters
+    ----------
+    adjacency : dict
+        From ``build_adjacency_dict``. Mutated in place AND returned.
+    all_frameworks : list of FrameworkStructure
+    df_dict : dict
+        Maps working ion symbol to its voltage plateau DataFrame.
+    """
+    mpid_to_idx = {fw.mp_id: i for i, fw in enumerate(all_frameworks)}
+    isolated_idxs = [i for i, nbrs in adjacency.items() if not nbrs]
+    edges_added = 0
+
+    for i in isolated_idxs:
+        if adjacency[i]:
+            continue
+        fw = all_frameworks[i]
+        ion = fw.working_ion.symbol
+        if ion not in df_dict:
+            logger.warning(
+                "Isolated %s (%s): no df_dict entry for ion %s",
+                fw.mp_id, fw.framework_reduced_formula, ion,
+            )
+            continue
+
+        df = df_dict[ion]
+        partners = []
+        if fw.mp_id in df["Charged MP id"].values:
+            partners = list(
+                df[df["Charged MP id"] == fw.mp_id]["Discharged MP id"].unique()
+            )
+        elif fw.mp_id in df["Discharged MP id"].values:
+            partners = list(
+                df[df["Discharged MP id"] == fw.mp_id]["Charged MP id"].unique()
+            )
+        else:
+            logger.warning(
+                "Isolated %s (%s, %s): not found in voltage plateau df",
+                fw.mp_id, ion, fw.framework_reduced_formula,
+            )
+            continue
+
+        for other_mpid in partners:
+            j = mpid_to_idx.get(other_mpid)
+            if j is None:
+                logger.warning(
+                    "Partner %s of isolated %s missing from framework list",
+                    other_mpid, fw.mp_id,
+                )
+                continue
+            if j not in adjacency[i]:
+                adjacency[i].append(j)
+            if i not in adjacency[j]:
+                adjacency[j].append(i)
+            edges_added += 1
+
+    logger.info(
+        "Reconnected %d edge(s) across %d isolated framework(s)",
+        edges_added, len(isolated_idxs),
+    )
+    return adjacency
 
 
 def bfs_components(adjacency, n):
@@ -581,7 +596,17 @@ def save_graph_figures(
         framework_formulae = {
             n.framework_reduced_formula for n in G.nodes
         }
-        framework_formula = list(framework_formulae)[0]
+        if len(framework_formulae) > 1:
+            offending = [
+                (n.mp_id, n.framework_reduced_formula) for n in G.nodes
+            ]
+            raise ValueError(
+                f"Component {idx} contains {len(framework_formulae)} "
+                f"different framework reduced formulae: {framework_formulae}. "
+                f"This indicates a false-positive StructureMatcher match. "
+                f"Nodes: {offending}"
+            )
+        framework_formula = next(iter(framework_formulae))
 
         plt.figure(figsize=(10, 8))
         ax = _draw_nodes_and_labels(G, pos)
@@ -709,7 +734,7 @@ def filter_plateaus_by_pH_and_area(
 
 
 # ====================================================================
-# Visualization helpers (set-based comparison)
+# Formula formatting (shared with set-based module)
 # ====================================================================
 
 
@@ -720,279 +745,123 @@ def formula_to_mathtext(s):
     return f"${s}$"
 
 
-def _get_working_ion_fraction(phase_formula, framework_formula, working_ion):
-    """Compute working ion fraction x in M_x[Framework]."""
-    framework_weight = Composition(framework_formula).get_reduced_formula_and_factor()[1]
-
-    if working_ion in phase_formula:
-        phase_comp = Composition(phase_formula)
-        num_ion = phase_comp.get_el_amt_dict().get(working_ion, 0)
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            fw_comp = phase_comp.replace({working_ion: {working_ion: 0}})
-
-        num_fw = fw_comp.get_reduced_formula_and_factor()[1] / framework_weight
-        return num_ion / num_fw
-
-    return 0
-
-
-def voltage_step_plot(
-    plot_num, df, ion_name, fig=None,
-    save=True, save_dir="./voltage_plots",
-):
-    """Generate a voltage vs. ion-fraction step plot."""
-    import matplotlib.pyplot as plt
-
-    plot_df = df[df["Plot number"] == plot_num]
-    if plot_df.empty:
-        raise ValueError(f"No data for plot number: {plot_num}")
-
-    framework_formula = plot_df["Framework formula"].iloc[0]
-    most_charged = plot_df["Charged Formula"].iloc[0]
-    charged_frac = _get_working_ion_fraction(
-        most_charged, framework_formula, ion_name,
-    )
-    discharged_fracs = [
-        _get_working_ion_fraction(f, framework_formula, ion_name)
-        for f in plot_df["Discharged Formula"].tolist()
-    ]
-    voltages = plot_df["V vs SHE (V)"].tolist()
-
-    x_vals = [charged_frac] + discharged_fracs
-    y_vals = [voltages[0]] + voltages
-
-    if fig is None:
-        fig, ax = plt.subplots(dpi=150)
-    else:
-        ax = fig.axes[0] if fig.axes else fig.add_subplot(1, 1, 1)
-
-    ax.axhline(1.23, color="blue", linestyle="--", linewidth=1.5)
-    ax.axhline(-0.71, color="blue", linestyle="--", linewidth=1.5)
-    ax.yaxis.set_major_locator(plt.MultipleLocator(0.5))
-    ax.yaxis.set_minor_locator(plt.MultipleLocator(0.1))
-    ax.tick_params(direction="in", length=6, width=1.5, which="major")
-    ax.tick_params(direction="in", length=3, width=1.0, which="minor")
-    for spine in ax.spines.values():
-        spine.set_linewidth(2)
-    ax.minorticks_on()
-    ax.grid(which="major", color="#CCCCCC", linestyle="-", linewidth=1.5)
-    ax.grid(which="minor", color="#DDDDDD", linestyle=":", linewidth=1)
-
-    ax.step(
-        x_vals, y_vals,
-        label=f"M = {ion_name}; plot {plot_num}",
-        color=ION_COLORS.get(ion_name, "black"),
-    )
-    ax.set_ylim(-0.8, 1.3)
-    ax.set_xlabel(
-        r"$x$ in $M_x$" + formula_to_mathtext(framework_formula),
-        fontsize=14,
-    )
-    ax.set_ylabel("Applied potential (V vs SHE)", fontsize=14)
-    ax.tick_params(direction="in")
-    legend = ax.legend(
-        loc="upper left", bbox_to_anchor=(1.02, 1),
-        borderaxespad=0.5, frameon=True,
-    )
-    legend.get_frame().set_edgecolor("black")
-
-    if save:
-        os.makedirs(save_dir, exist_ok=True)
-        fname = f"voltage_plot_{framework_formula}_plot{plot_num}.png"
-        fig.savefig(
-            os.path.join(save_dir, fname), dpi=300, bbox_inches="tight",
-        )
-        plt.close(fig)
-
-    return fig
-
-
-def overlay_multi_ion_voltage_plots(
-    req_framework_set, req_df,
-    other_framework_sets, other_dfs,
-    req_ion, other_ions,
-    save_dir, save=True,
-):
-    """Overlay voltage plots for shared frameworks across multiple ions."""
-    for framework in req_framework_set:
-        plot_filter = (
-            (req_df["Discharged MP id"] == framework.mp_id)
-            | (req_df["Charged MP id"] == framework.mp_id)
-        )
-        plot_nums = req_df[plot_filter]["Plot number"].unique()
-
-        for plot_num in plot_nums:
-            figure = None
-            for i, other_set in enumerate(other_framework_sets):
-                matching = [f for f in other_set if framework == f]
-                for match_fw in matching:
-                    pf = (
-                        (other_dfs[i]["Discharged MP id"] == match_fw.mp_id)
-                        | (other_dfs[i]["Charged MP id"] == match_fw.mp_id)
-                    )
-                    other_plot_nums = other_dfs[i][pf]["Plot number"].unique()
-                    for pn in other_plot_nums:
-                        figure = voltage_step_plot(
-                            pn, other_dfs[i], other_ions[i],
-                            fig=figure, save=False,
-                        )
-
-            voltage_step_plot(
-                plot_num, req_df, req_ion,
-                fig=figure, save=save, save_dir=save_dir,
-            )
-
-
-def save_all_combination_voltage_plots(
-    frameworks_dict, df_dict, ion_of_interest,
-    n_ions, save_dir="./Voltage_plateaus",
-):
-    """Generate overlaid plots for all N-ion combinations."""
-    other_ions = [ion for ion in frameworks_dict if ion != ion_of_interest]
-    combs = combinations(other_ions, n_ions - 1)
-
-    for comb in combs:
-        req_set = multi_ion_common_frameworks(
-            req_charged=frameworks_dict[ion_of_interest][1],
-            req_discharged=frameworks_dict[ion_of_interest][0],
-            other_charged_list=[frameworks_dict[i][1] for i in comb],
-            other_discharged_list=[frameworks_dict[i][0] for i in comb],
-        )
-        if not req_set:
-            continue
-
-        other_sets = []
-        other_dfs = []
-        for other in comb:
-            oset = multi_ion_common_frameworks(
-                req_charged=frameworks_dict[other][1],
-                req_discharged=frameworks_dict[other][0],
-                other_charged_list=(
-                    [frameworks_dict[i][1] for i in comb if i != other]
-                    + [frameworks_dict[ion_of_interest][1]]
-                ),
-                other_discharged_list=(
-                    [frameworks_dict[i][0] for i in comb if i != other]
-                    + [frameworks_dict[ion_of_interest][0]]
-                ),
-            )
-            other_sets.append(oset)
-            other_dfs.append(df_dict[other])
-
-        leaf = f"{ion_of_interest}-" + "-".join(comb)
-        path = os.path.join(save_dir, f"{n_ions}-ions", leaf)
-
-        overlay_multi_ion_voltage_plots(
-            req_set, df_dict[ion_of_interest],
-            other_sets, other_dfs,
-            ion_of_interest, list(comb),
-            save_dir=path, save=True,
-        )
-
-
-def venn_2set(
-    frameworks_dict, ion_a, ion_b,
-    intersection_set=None,
-    save_dir="./Venn-diags", save=True,
-):
-    """Generate a 2-set Venn diagram comparing two ions."""
-    import matplotlib.pyplot as plt
-    from matplotlib_venn import venn2 as _venn2
-
-    # Use .union() for "all frameworks" (bug fix: original used .intersection())
-    set_a = frameworks_dict[ion_a][0].union(frameworks_dict[ion_a][1])
-    set_b = frameworks_dict[ion_b][0].union(frameworks_dict[ion_b][1])
-
-    if intersection_set is None:
-        intersection_set = multi_ion_common_frameworks(
-            frameworks_dict[ion_a][1], frameworks_dict[ion_a][0],
-            [frameworks_dict[ion_b][1]], [frameworks_dict[ion_b][0]],
-        )
-
-    n_common = len(intersection_set)
-    colors = {
-        "Li": "crimson", "Na": "gold",
-        "K": "#988ED5", "Mg": "#348ABD", "Ca": "#8EBA42",
-    }
-
-    _venn2(
-        subsets=(len(set_a) - n_common, len(set_b) - n_common, n_common),
-        set_labels=(ion_a, ion_b),
-        set_colors=(colors.get(ion_a, "gray"), colors.get(ion_b, "gray")),
-        alpha=0.3,
-    )
-
-    if save:
-        os.makedirs(save_dir, exist_ok=True)
-        plt.savefig(
-            os.path.join(save_dir, f"{ion_a}-{ion_b}.pdf"), dpi=300,
-        )
-    plt.close()
-
-
 # ====================================================================
 # Top-level runner
 # ====================================================================
 
 
+def _load_cached_adjacency(cache_path, meta_path, combined_fw, reconnect_isolated):
+    """Load adjacency from cache iff sidecar metadata matches."""
+    if not (os.path.exists(cache_path) and os.path.exists(meta_path)):
+        return None
+    try:
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Cache meta unreadable (%s); rebuilding", e)
+        return None
+
+    cur_mpids = [fw.mp_id for fw in combined_fw]
+    if meta.get("mpids") != cur_mpids:
+        logger.info("Cache mp_id list differs; rebuilding adjacency")
+        return None
+    if bool(meta.get("reconnect_isolated")) != bool(reconnect_isolated):
+        logger.info(
+            "Cache reconnect_isolated flag differs (cached=%s, current=%s); "
+            "rebuilding adjacency",
+            meta.get("reconnect_isolated"), reconnect_isolated,
+        )
+        return None
+
+    with open(cache_path, "rb") as f:
+        return pickle.load(f)
+
+
+def _save_cached_adjacency(
+    cache_path, meta_path, adjacency, combined_fw, reconnect_isolated,
+):
+    """Pickle adjacency and write sidecar metadata."""
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    with open(cache_path, "wb") as f:
+        pickle.dump(adjacency, f)
+    meta = {
+        "mpids": [fw.mp_id for fw in combined_fw],
+        "reconnect_isolated": bool(reconnect_isolated),
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f)
+    logger.info("Saved adjacency cache to %s", cache_path)
+
+
 def run_framework_comparison(
-    element,
     stage3_dirs,
-    output_dir=None,
+    output_dir=".",
+    elements=None,
     sheet_name="criterion 4",
     pH_range=(7.0, 8.5),
     min_area_fraction=0.80,
     metastability_criterion=4,
-    n_ion_combinations=None,
     save_plots=True,
-    save_venn=True,
-    copy_filtered_plots=True,
-    run_set_comparison=False,
     cache_adjacency=True,
+    adj_cache_path=None,
+    reconnect_isolated=False,
 ):
     """
-    Run the Stage 4 framework comparison pipeline.
+    Run the Stage 4 graph-based framework comparison pipeline.
 
-    Graph-based comparison is the primary analysis. Set-based comparison
-    (voltage overlays, Venn diagrams) is optional.
+    Loads frameworks for all ions in ``stage3_dirs``, builds one shared
+    adjacency over the combined framework pool, identifies connected
+    components, and renders one set of graph PNGs. Then, for each ion
+    in ``elements``, partitions that ion's voltage plateau DataFrame
+    into ``only_{ion}`` (frameworks unique to this ion's component) and
+    ``multiple_ions`` (frameworks whose component spans more than one
+    ion), applies the pH/area filter, and writes per-ion Excels.
 
     Parameters
     ----------
-    element : str
-        Ion of interest (e.g. ``"Ca"``).
     stage3_dirs : dict
-        Maps element symbol to Stage 3 output directory. Each dir must
-        contain ``All_voltage_plateaus.xlsx``, ``structs/``, and
+        Maps ion symbol to its Stage 3 output dir. Each dir must contain
+        ``All_voltage_plateaus.xlsx``, ``structs/``, and
         ``All_charged_structures/`` (or ``All_charged_strutures/``).
-    output_dir : str or None
+    output_dir : str
+        Root output directory (default: current directory). Produces
+        ``{output_dir}/All_graphs/`` (shared) and
+        ``{output_dir}/{ion}/pH_area_filtered_plateaus.xlsx`` per ion.
+    elements : list of str or None
+        Ions to produce per-ion Excels for. Default: all of
+        ``stage3_dirs``.
     sheet_name : str
     pH_range : tuple of float
     min_area_fraction : float
     metastability_criterion : int
-    n_ion_combinations : list of int or None
     save_plots : bool
-    save_venn : bool
-    copy_filtered_plots : bool
-    run_set_comparison : bool
-        If True, also run set-based comparison (voltage overlays, Venn).
     cache_adjacency : bool
-        If True, save/load adjacency dict as pickle.
+    adj_cache_path : str or None
+        Override path for the adjacency cache file. Default:
+        ``{output_dir}/adjacency_cache.pkl`` (or
+        ``adjacency_cache_reconnected.pkl`` when
+        ``reconnect_isolated=True``). Sidecar
+        ``adjacency_cache[.meta].json`` stores the mp_id list and the
+        reconnect_isolated flag; loading is refused if these drift.
+    reconnect_isolated : bool
+        If True, after building adjacency call
+        ``reconnect_isolated_frameworks`` to manually add edges between
+        isolated frameworks and their voltage-plateau partner from the
+        same-ion Excel. Encodes the assumption that two structures
+        sharing a voltage plateau row ARE the same framework even if
+        ``StructureMatcher.fit`` says otherwise.
 
     Returns
     -------
     dict
-        ``{"only_{element}": DataFrame, "multiple_ions": DataFrame}``
+        ``{ion: {"only_{ion}": DataFrame, "multiple_ions": DataFrame}}``
     """
-    if output_dir is None:
-        output_dir = f"{element}_framework_comparison"
-    if n_ion_combinations is None:
-        n_ion_combinations = [2, 3, 4, 5]
+    if elements is None:
+        elements = list(stage3_dirs.keys())
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # --- Load frameworks for all elements ---
+    # --- Load frameworks for all ions ---
     frameworks_dict = {}
     df_dict = {}
 
@@ -1013,9 +882,7 @@ def run_framework_comparison(
         frameworks_dict[ion] = (dis_set, chg_set)
         df_dict[ion] = vdf
 
-    # --- Graph-based comparison (primary) ---
-    logger.info("=== Running graph-based framework comparison ===")
-
+    # --- Combine all ions' frameworks into one list ---
     all_fw_lists = {}
     for ion in frameworks_dict:
         dis, chg = frameworks_dict[ion]
@@ -1025,24 +892,45 @@ def run_framework_comparison(
     for ion in all_fw_lists:
         combined_fw.extend(all_fw_lists[ion])
 
-    # Build or load adjacency dict
-    adj_cache_path = os.path.join(output_dir, "adjacency_cache.pkl")
-    if cache_adjacency and os.path.exists(adj_cache_path):
-        logger.info("Loading cached adjacency dict from %s", adj_cache_path)
-        with open(adj_cache_path, "rb") as f:
-            adjacency = pickle.load(f)
-    else:
+    logger.info(
+        "Combined framework count: %d (across %d ions)",
+        len(combined_fw), len(all_fw_lists),
+    )
+
+    # --- Build or load adjacency ---
+    if adj_cache_path is None:
+        cache_name = (
+            "adjacency_cache_reconnected.pkl"
+            if reconnect_isolated else "adjacency_cache.pkl"
+        )
+        adj_cache_path = os.path.join(output_dir, cache_name)
+    meta_path = (
+        os.path.splitext(adj_cache_path)[0] + ".meta.json"
+    )
+
+    adjacency = None
+    if cache_adjacency:
+        adjacency = _load_cached_adjacency(
+            adj_cache_path, meta_path, combined_fw, reconnect_isolated,
+        )
+        if adjacency is not None:
+            logger.info("Loaded cached adjacency from %s", adj_cache_path)
+
+    if adjacency is None:
         adjacency = build_adjacency_dict(combined_fw)
+        if reconnect_isolated:
+            logger.info("Reconnecting isolated frameworks via plateau df")
+            reconnect_isolated_frameworks(adjacency, combined_fw, df_dict)
         if cache_adjacency:
-            with open(adj_cache_path, "wb") as f:
-                pickle.dump(adjacency, f)
-            logger.info("Saved adjacency dict to %s", adj_cache_path)
+            _save_cached_adjacency(
+                adj_cache_path, meta_path, adjacency,
+                combined_fw, reconnect_isolated,
+            )
 
-    # BFS connected components → graphs
+    # --- Connected components & graphs ---
     components = bfs_components(adjacency, len(combined_fw))
-    component_indices_sets = [set(comp) for comp in components]
+    logger.info("Found %d connected components", len(components))
 
-    import networkx as nx
     graphs = [
         make_networkx_graph(comp, combined_fw, adjacency)
         for comp in components
@@ -1058,116 +946,68 @@ def run_framework_comparison(
             min_area_fraction=min_area_fraction,
         )
 
-    # --- Set-based comparison (optional) ---
-    if run_set_comparison:
-        logger.info("=== Running set-based framework comparison ===")
-
-        other_ions = [ion for ion in frameworks_dict if ion != element]
-
-        # Pairwise intersections
-        intersections = {}
-        for other in other_ions:
-            intersections[other] = framework_set_intersection(
-                frameworks_dict[element][1], frameworks_dict[element][0],
-                frameworks_dict[other][1], frameworks_dict[other][0],
-            )
-
-        # Voltage plots
-        if save_plots:
-            for n in n_ion_combinations:
-                save_all_combination_voltage_plots(
-                    frameworks_dict, df_dict, element, n,
-                    save_dir=os.path.join(output_dir, "Voltage_plateaus"),
-                )
-
-        # Venn diagrams
-        if save_venn:
-            for other in other_ions:
-                venn_2set(
-                    frameworks_dict, element, other,
-                    intersection_set=intersections[other],
-                    save_dir=os.path.join(output_dir, "Venn-diags"),
-                )
-
-    # --- pH/area filtering ---
-    logger.info("=== Filtering voltage plateaus ===")
-    element_df = df_dict[element]
-
-    # Split into ion-selective vs multi-ion
-    other_ions = [ion for ion in frameworks_dict if ion != element]
-    multi_ion_set = set()
-    for other in other_ions:
-        inter = framework_set_intersection(
-            frameworks_dict[element][1], frameworks_dict[element][0],
-            frameworks_dict[other][1], frameworks_dict[other][0],
-        )
-        multi_ion_set = multi_ion_set.union(inter)
-
-    multi_ion_mpids = {fw.mp_id for fw in multi_ion_set}
-
-    multi_mask = (
-        element_df["Charged MP id"].isin(multi_ion_mpids)
-        | element_df["Discharged MP id"].isin(multi_ion_mpids)
-    )
-    only_element_df = element_df[~multi_mask].copy()
-    multiple_ions_df = element_df[multi_mask].copy()
-
-    filtered_only = filter_plateaus_by_pH_and_area(
-        only_element_df, pH_range, min_area_fraction,
-        metastability_criterion,
-    )
-    filtered_multi = filter_plateaus_by_pH_and_area(
-        multiple_ions_df, pH_range, min_area_fraction,
-        metastability_criterion,
-    )
-
-    # Export
-    excel_path = os.path.join(output_dir, "pH_area_filtered_plateaus.xlsx")
-    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        filtered_only.to_excel(
-            writer, sheet_name=f"only_{element}", index=False,
-        )
-        filtered_multi.to_excel(
-            writer, sheet_name="multiple_ions", index=False,
-        )
-    logger.info("Filtered results saved to %s", excel_path)
-
-    # Copy filtered plots
-    if copy_filtered_plots and save_plots:
-        _copy_filtered_plots(
-            filtered_only, filtered_multi, element, output_dir,
-        )
-
-    return {
-        f"only_{element}": filtered_only,
-        "multiple_ions": filtered_multi,
-    }
-
-
-def _copy_filtered_plots(
-    only_df, multi_df, element, output_dir,
-):
-    """Copy voltage plateau plots matching filtered plot numbers."""
-    plots_dir = os.path.join(output_dir, "pH_area_filtered_plateaus")
-    only_dir = os.path.join(plots_dir, f"only_{element}")
-    multi_dir = os.path.join(plots_dir, "multiple_ions")
-    os.makedirs(only_dir, exist_ok=True)
-    os.makedirs(multi_dir, exist_ok=True)
-
-    voltage_plots_dir = os.path.join(output_dir, "Voltage_plateaus")
-    if not os.path.exists(voltage_plots_dir):
-        return
-
-    for target_dir, df in [(only_dir, only_df), (multi_dir, multi_df)]:
-        if len(df) == 0:
+    # --- Per-ion Excel partition (graph-component-based) ---
+    # For each component, record which ions appear in it. An ion's mp_id
+    # is "multi-ion" iff its component contains nodes from another ion.
+    multi_ion_mpids_per_element = {ion: set() for ion in elements}
+    for comp in components:
+        ions_in_comp = {
+            combined_fw[i].working_ion.symbol for i in comp
+        }
+        if len(ions_in_comp) <= 1:
             continue
-        plot_nums = df["Plot number"].unique()
-        for root, _, files in os.walk(voltage_plots_dir):
-            for fname in files:
-                if not fname.endswith(".png"):
-                    continue
-                for pn in plot_nums:
-                    if f"plot{int(pn)}" in fname:
-                        src = os.path.join(root, fname)
-                        dst = os.path.join(target_dir, fname)
-                        shutil.copy2(src, dst)
+        for i in comp:
+            fw = combined_fw[i]
+            sym = fw.working_ion.symbol
+            if sym in multi_ion_mpids_per_element:
+                multi_ion_mpids_per_element[sym].add(fw.mp_id)
+
+    results = {}
+    for element in elements:
+        logger.info("=== Filtering voltage plateaus for %s ===", element)
+        if element not in df_dict:
+            logger.warning("No voltage df for %s; skipping", element)
+            continue
+        element_df = df_dict[element]
+        multi_mpids = multi_ion_mpids_per_element[element]
+
+        multi_mask = (
+            element_df["Charged MP id"].isin(multi_mpids)
+            | element_df["Discharged MP id"].isin(multi_mpids)
+        )
+        only_element_df = element_df[~multi_mask].copy()
+        multiple_ions_df = element_df[multi_mask].copy()
+
+        filtered_only = filter_plateaus_by_pH_and_area(
+            only_element_df, pH_range, min_area_fraction,
+            metastability_criterion,
+        )
+        filtered_multi = filter_plateaus_by_pH_and_area(
+            multiple_ions_df, pH_range, min_area_fraction,
+            metastability_criterion,
+        )
+
+        element_out = os.path.join(output_dir, element)
+        os.makedirs(element_out, exist_ok=True)
+        excel_path = os.path.join(
+            element_out, "pH_area_filtered_plateaus.xlsx",
+        )
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            filtered_only.to_excel(
+                writer, sheet_name=f"only_{element}", index=False,
+            )
+            filtered_multi.to_excel(
+                writer, sheet_name="multiple_ions", index=False,
+            )
+        logger.info(
+            "%s: only_%s=%d rows, multiple_ions=%d rows -> %s",
+            element, element, len(filtered_only),
+            len(filtered_multi), excel_path,
+        )
+
+        results[element] = {
+            f"only_{element}": filtered_only,
+            "multiple_ions": filtered_multi,
+        }
+
+    return results

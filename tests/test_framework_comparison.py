@@ -1,4 +1,4 @@
-"""Tests for framework comparison module."""
+"""Tests for graph-based framework comparison module."""
 
 import pytest
 import pandas as pd
@@ -6,13 +6,12 @@ from unittest.mock import MagicMock
 
 from spices.screening.framework_comparison import (
     FrameworkStructure,
-    framework_set_intersection,
-    multi_ion_common_frameworks,
-    ion_selective_frameworks,
     filter_plateaus_by_pH_and_area,
     formula_to_mathtext,
-    _get_working_ion_fraction,
     bfs_components,
+    reconnect_isolated_frameworks,
+    save_graph_figures,
+    make_networkx_graph,
     ION_COLORS,
 )
 from spices.intercalation.structure import DEFAULT_MATCHER
@@ -56,59 +55,13 @@ class TestFrameworkStructure:
         assert fw.is_expt is True
 
 
-class TestSetOperations:
-    def _make_fw(self, mp_id, formula):
-        """Create a mock FrameworkStructure with given formula hash."""
-        fw = MagicMock(spec=FrameworkStructure)
-        fw.mp_id = mp_id
-        fw.framework_reduced_formula = formula
-        fw.__hash__ = MagicMock(return_value=hash(formula))
-        fw.__eq__ = MagicMock(
-            side_effect=lambda other: (
-                other.framework_reduced_formula == formula
-            )
-        )
-        return fw
-
-    def test_intersection_finds_common(self):
-        fw_a = self._make_fw("mp-1", "FeO2")
-        fw_b = self._make_fw("mp-2", "FeO2")
-        fw_c = self._make_fw("mp-3", "MnO2")
-
-        result = framework_set_intersection(
-            {fw_a}, {fw_a}, {fw_b}, {fw_c},
-        )
-        # fw_a and fw_b have same formula → should match
-        assert len(result) >= 1
-
-    def test_intersection_no_common(self):
-        fw_a = self._make_fw("mp-1", "FeO2")
-        fw_b = self._make_fw("mp-2", "TiO2")
-
-        result = framework_set_intersection(
-            {fw_a}, set(), {fw_b}, set(),
-        )
-        assert len(result) == 0
-
-    def test_ion_selective_removes_common(self):
-        fw_a = self._make_fw("mp-1", "FeO2")
-        fw_b = self._make_fw("mp-2", "FeO2")
-        fw_c = self._make_fw("mp-3", "MnO2")
-
-        # fw_a (FeO2) is shared with fw_b, fw_c (MnO2) is unique
-        result = ion_selective_frameworks(
-            {fw_a, fw_c}, set(),
-            [{fw_b}], [set()],
-        )
-        # Only MnO2 should remain
-        assert fw_c in result
-        assert fw_a not in result
-
-
 class TestFilterPlateaus:
     def test_empty_df(self):
-        df = pd.DataFrame(columns=["Plot number", "pH range metastability criterion 4",
-                                    "Total metastability area fraction"])
+        df = pd.DataFrame(columns=[
+            "Plot number",
+            "pH range metastability criterion 4",
+            "Total metastability area fraction",
+        ])
         result = filter_plateaus_by_pH_and_area(df)
         assert len(result) == 0
 
@@ -155,22 +108,6 @@ class TestFormulaToMathtext:
         assert "_{3}" in result
 
 
-class TestWorkingIonFraction:
-    def test_full_intercalation(self):
-        # CaFeO2 has 1 Ca per FeO2 framework unit
-        frac = _get_working_ion_fraction("CaFeO2", "FeO2", "Ca")
-        assert abs(frac - 1.0) < 1e-6
-
-    def test_no_working_ion(self):
-        frac = _get_working_ion_fraction("FeO2", "FeO2", "Ca")
-        assert frac == 0
-
-    def test_partial_intercalation(self):
-        # Ca2Fe2O4 = Ca(FeO2) has 1 Ca per FeO2 framework
-        frac = _get_working_ion_fraction("Ca2Fe2O4", "FeO2", "Ca")
-        assert abs(frac - 1.0) < 1e-6
-
-
 class TestBfsComponents:
     def test_single_component(self):
         adj = {0: [1], 1: [0, 2], 2: [1]}
@@ -187,6 +124,87 @@ class TestBfsComponents:
         adj = {0: [], 1: [], 2: []}
         components = bfs_components(adj, 3)
         assert len(components) == 3
+
+
+class TestReconnectIsolated:
+    def _fake_fw(self, mp_id, ion_symbol):
+        fw = MagicMock(spec=FrameworkStructure)
+        fw.mp_id = mp_id
+        fw.framework_reduced_formula = f"FW_{mp_id}"
+        # working_ion exposes .symbol
+        wi = MagicMock()
+        wi.symbol = ion_symbol
+        fw.working_ion = wi
+        return fw
+
+    def test_isolated_reconnected_via_charged_partner(self):
+        fws = [
+            self._fake_fw("mp-A", "Li"),
+            self._fake_fw("mp-B", "Li"),
+            self._fake_fw("mp-X", "Na"),
+        ]
+        # A and B are isolated; df says they are a charged-discharged pair
+        adjacency = {0: [], 1: [], 2: []}
+        df_dict = {
+            "Li": pd.DataFrame({
+                "Charged MP id": ["mp-A"],
+                "Discharged MP id": ["mp-B"],
+            }),
+            "Na": pd.DataFrame({
+                "Charged MP id": ["mp-X"],
+                "Discharged MP id": ["mp-X"],
+            }),
+        }
+        adj = reconnect_isolated_frameworks(adjacency, fws, df_dict)
+        assert 1 in adj[0]
+        assert 0 in adj[1]
+
+    def test_isolated_with_no_partner_logs_warning(self, caplog):
+        fws = [self._fake_fw("mp-Z", "Li")]
+        adjacency = {0: []}
+        df_dict = {
+            "Li": pd.DataFrame({
+                "Charged MP id": ["mp-other"],
+                "Discharged MP id": ["mp-third"],
+            }),
+        }
+        with caplog.at_level("WARNING"):
+            adj = reconnect_isolated_frameworks(adjacency, fws, df_dict)
+        assert adj[0] == []  # still isolated
+        assert any("not found" in rec.message for rec in caplog.records)
+
+
+class TestSaveGraphFiguresMultiFormulaRaise:
+    def test_raises_when_component_has_multiple_formulae(self, tmp_path):
+        """Component-formula check (BUG 2 fix)."""
+        # Build a NetworkX graph with two nodes whose framework formulas differ
+        n1 = MagicMock(spec=FrameworkStructure)
+        n1.mp_id = "mp-1"
+        n1.framework_reduced_formula = "FeO2"
+        n1.struct_reduced_formula = "LiFeO2"
+        n1.is_expt = False
+        wi1 = MagicMock(); wi1.symbol = "Li"
+        n1.working_ion = wi1
+
+        n2 = MagicMock(spec=FrameworkStructure)
+        n2.mp_id = "mp-2"
+        n2.framework_reduced_formula = "MnO2"  # different formula!
+        n2.struct_reduced_formula = "LiMnO2"
+        n2.is_expt = False
+        wi2 = MagicMock(); wi2.symbol = "Li"
+        n2.working_ion = wi2
+
+        import networkx as nx
+        G = nx.Graph()
+        G.add_node(n1)
+        G.add_node(n2)
+        G.add_edge(n1, n2)
+
+        with pytest.raises(ValueError, match="different framework reduced formulae"):
+            save_graph_figures(
+                [G], [n1, n2], df_dict={},
+                save_dir=str(tmp_path / "graphs"),
+            )
 
 
 class TestIonColors:

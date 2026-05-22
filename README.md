@@ -398,6 +398,26 @@ The MPContribs `ion_ref_data` project is not versioned alongside the bulk S3 dum
 
 Cached Pourbaix diagram data files (pickle format, ~1.3 GB per stage) are archived on Zenodo for reproducibility. They are excluded from the git repository via `.gitignore`. To use existing caches, point the `PourbaixCache` to the directory containing your `saved_pbx/` and `saved_pbx_entries/` folders (see the snapshot section above for the `backend="snapshot"` workflow).
 
+## TODO
+
+### Duplicate `(Charged MP id, Discharged MP id)` rows in Stage 3 `All_voltage_plateaus.xlsx`
+
+Stage 3's per-element `All_voltage_plateaus.xlsx` can contain multiple rows that share the same `(Charged MP id, Discharged MP id)` key with identical `V vs SHE (V)`, `Total metastability area fraction`, and `pH range metastability criterion 4` values — they differ only in `Plot number` (and appear at consecutive plot numbers, e.g. 721/722, 188/189/190).
+
+Observed on the Li run (`cached_MP/Li/2025-06-09/GGA_GGA+U/step3/Li_intercalation/All_voltage_plateaus.xlsx`, 948 raw rows / 940 unique pair keys → 8 extra rows from 7 duplicated keys):
+
+| Pair | Framework | Copies | V (V vs SHE) |
+|---|---|---|---|
+| mp-1177031 → mp-849623 | FeP2O7 | 2 | +0.271 |
+| mp-1177781 → mp-1177512 | VFe(P2O7)2 | 2 | −0.084 |
+| mp-752954 → mp-759149 | CrCo3O8 | 2 | +0.231 |
+| **mp-756480 → mp-19419** | **FeO2** | **3** | +0.155 |
+| mp-760033 → mp-772945 | Mn2(PO4)3 | 2 | +0.751 |
+| mp-762265 → mp-762292 | VO2 | 2 | −0.787 |
+| mp-768531 → mp-768584 | MnV(PO4)3 | 2 | +0.271 |
+
+Likely cause: during pseudo-binary convex-hull plateau extraction, multiple equivalent two-phase segments between the same charged/discharged endpoints emit separate plateau rows with the same voltage. Decide whether dedup belongs in the plateau-extraction code (`spices.intercalation.hull` / `spices.intercalation.voltage`) or in the per-composition Excel writer, and apply the same logic to other working ions.
+
 ## License
 
 MIT

@@ -1,14 +1,30 @@
 #!/usr/bin/env python
 """
-CLI wrapper for SPICES Stage 4: Framework Comparison.
+CLI wrapper for SPICES Stage 4: graph-based framework comparison.
+
+A single invocation builds the cross-ion structural-match graph once
+and writes one ``pH_area_filtered_plateaus.xlsx`` per ion. Shared graph
+PNGs land under ``{output_dir}/All_graphs/``.
 
 Usage examples:
 
-    # Default: graph-based comparison
-    python scripts/run_framework_comparison.py Ca --stage3-dir ./intercalation_results/
+    # Full 5-ion run (writes ./All_graphs/ and ./{Ca,K,Li,Mg,Na}/...)
+    python scripts/run_framework_comparison.py \\
+        --stage3-dir ./3rd_Iteration/3.Intercalation_voltage_filter
 
-    # Also run set-based comparison (voltage overlays, Venn diagrams)
-    python scripts/run_framework_comparison.py Ca --stage3-dir ./intercalation_results/ --sets
+    # Subset for a fast smoke test (K only)
+    python scripts/run_framework_comparison.py \\
+        --stage3-dir ./3rd_Iteration/3.Intercalation_voltage_filter \\
+        --elements K -o ./_smoketest_K
+
+    # Use shared adjacency cache + manual reconnection of isolated nodes
+    python scripts/run_framework_comparison.py \\
+        --stage3-dir ./3rd_Iteration/3.Intercalation_voltage_filter \\
+        --adj-cache ./shared_adjacency_cache.pkl \\
+        --reconnect-isolated
+
+For set-based comparison (Venn diagrams, voltage overlays), use
+``scripts/run_framework_set_comparison.py`` instead.
 """
 
 import argparse
@@ -21,20 +37,14 @@ from spices.io import setup_logging
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SPICES Stage 4: Framework Comparison",
+        description="SPICES Stage 4: graph-based framework comparison",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Example:\n"
-            "  python scripts/run_framework_comparison.py Ca "
-            "--stage3-dir ./intercalation_results/ -o Ca_comparison/\n"
+            "Default: writes ./All_graphs/ and per-ion subdirs "
+            "./{Ca,K,Li,Mg,Na}/pH_area_filtered_plateaus.xlsx\n"
         ),
     )
 
-    parser.add_argument(
-        "element",
-        choices=SUPPORTED_ELEMENTS,
-        help="Ion of interest",
-    )
     parser.add_argument(
         "--stage3-dir",
         required=True,
@@ -42,8 +52,20 @@ def main():
     )
     parser.add_argument(
         "-o", "--output-dir",
+        default=".",
+        help="Output directory (default: current directory)",
+    )
+    parser.add_argument(
+        "--elements",
+        nargs="+",
+        choices=SUPPORTED_ELEMENTS,
         default=None,
-        help="Output directory (default: {element}_framework_comparison/)",
+        help=(
+            "Ions to load and analyze (default: all 5). When fewer "
+            "ions are passed, the graph build is also restricted to "
+            "that subset (useful for fast smoke tests, e.g. "
+            "--elements K runs in ~30 s)."
+        ),
     )
     parser.add_argument(
         "--sheet-name",
@@ -63,46 +85,63 @@ def main():
         help="Minimum metastability area fraction (default: 0.80)",
     )
     parser.add_argument(
-        "--sets",
-        action="store_true",
-        help="Also run set-based comparison (voltage overlays, Venn diagrams)",
-    )
-    parser.add_argument(
         "--no-plots",
         action="store_true",
-        help="Skip saving plots",
+        help="Skip saving graph PNGs",
     )
     parser.add_argument(
-        "--no-copy-plots",
+        "--adj-cache",
+        default=None,
+        help=(
+            "Path to adjacency cache pickle. Default: "
+            "{output_dir}/adjacency_cache.pkl (or "
+            "adjacency_cache_reconnected.pkl with --reconnect-isolated)"
+        ),
+    )
+    parser.add_argument(
+        "--reconnect-isolated",
         action="store_true",
-        help="Skip copying filtered plots to subdirectories",
+        help=(
+            "Manually reconnect isolated frameworks via voltage-plateau "
+            "Excel partner lookup. Encodes the assumption: two structures "
+            "sharing a voltage plateau row are the same framework. Off "
+            "by default."
+        ),
     )
 
     args = parser.parse_args()
 
     setup_logging()
 
-    # Build stage3_dirs from root
+    # --elements restricts both the graph build (loaded ions) and the
+    # per-ion Excels. Default loads all 5 supported ions.
+    ions_to_load = args.elements or SUPPORTED_ELEMENTS
     stage3_dirs = {
         e: os.path.join(args.stage3_dir, e)
-        for e in SUPPORTED_ELEMENTS
+        for e in ions_to_load
+        if os.path.isdir(os.path.join(args.stage3_dir, e))
     }
+    if not stage3_dirs:
+        parser.error(
+            f"No requested ion subdirs found under {args.stage3_dir} "
+            f"(looked for: {ions_to_load})"
+        )
 
     result = run_framework_comparison(
-        element=args.element,
         stage3_dirs=stage3_dirs,
         output_dir=args.output_dir,
+        elements=args.elements,
         sheet_name=args.sheet_name,
         metastability_criterion=args.criterion,
         min_area_fraction=args.min_area,
         save_plots=not args.no_plots,
-        copy_filtered_plots=not args.no_copy_plots,
-        run_set_comparison=args.sets,
+        adj_cache_path=args.adj_cache,
+        reconnect_isolated=args.reconnect_isolated,
     )
 
-    for key, df in result.items():
-        if df is not None:
-            print(f"{key}: {len(df)} filtered plateaus")
+    for ion, sheets in result.items():
+        for sheet_name, df in sheets.items():
+            print(f"{ion}/{sheet_name}: {len(df)} filtered plateaus")
 
 
 if __name__ == "__main__":
