@@ -9,6 +9,9 @@ from shapely.geometry import Polygon, LineString, Point
 from shapely.ops import unary_union
 
 from spices.config import PREFAC, H_LINE, O_LINE
+from spices.plotting import apply_publication_style
+
+apply_publication_style()
 
 
 def check_overlap(polygon_coords, line_equation1, line_equation2,
@@ -358,7 +361,7 @@ def _plot_ph_range_intersection(
     import matplotlib.pyplot as plt
     from shapely.geometry import MultiLineString, GeometryCollection
 
-    plt.figure(dpi=150, figsize=(6.4, 3.8))
+    plt.figure(figsize=(3.5, 2.6))
     if title:
         plt.title(title)
     plt.xlabel("pH")

@@ -6,10 +6,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pymatgen.analysis.pourbaix_diagram import PourbaixPlotter
 
+from spices.plotting import apply_publication_style
 from spices.pourbaix.decomposition import (
     get_decomposition_energy_from_mp_id,
     get_decomposition_energy_from_formula,
 )
+
+apply_publication_style()
 
 
 def get_metastability_heat_map_plot_by_mp_id(
@@ -59,7 +62,7 @@ def get_metastability_heat_map_plot_by_mp_id(
     )
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(30, 24))
+        fig, ax = plt.subplots(figsize=(7.2, 5.4))
         fig.subplots_adjust(left=0, right=0.96, bottom=0, top=1)
     else:
         fig = ax.figure
@@ -73,8 +76,7 @@ def get_metastability_heat_map_plot_by_mp_id(
 
     cbar_ax = fig.add_axes([0.98, 0.1, 0.05, 0.8])
     cbar = fig.colorbar(img, cax=cbar_ax)
-    cbar.set_label(f"{mp_id} Decomposition Energy (eV/atom)", fontsize=36)
-    cbar.ax.tick_params(labelsize=35)
+    cbar.set_label(f"{mp_id} Decomposition Energy (eV/atom)")
 
     plotter = PourbaixPlotter(pourbaix_diagram)
     plotter.get_pourbaix_plot(
@@ -82,9 +84,8 @@ def get_metastability_heat_map_plot_by_mp_id(
         ax=ax, label_domains=True, show_neutral_axes=True,
     )
 
-    ax.tick_params(axis="both", which="major", labelsize=35)
-    ax.set_xlabel("pH", fontsize=40)
-    ax.set_ylabel("E(V)", fontsize=40)
+    ax.set_xlabel("pH")
+    ax.set_ylabel("E(V)")
 
     return ax
 
@@ -131,7 +132,7 @@ def get_metastability_heat_map_plot(
     )
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(30, 24))
+        fig, ax = plt.subplots(figsize=(7.2, 5.4))
         fig.subplots_adjust(left=0, right=0.96, bottom=0, top=1)
     else:
         fig = ax.figure
@@ -145,10 +146,7 @@ def get_metastability_heat_map_plot(
 
     cbar_ax = fig.add_axes([0.98, 0.1, 0.05, 0.8])
     cbar = fig.colorbar(img, cax=cbar_ax)
-    cbar.set_label(
-        f"{formula_string} Decomposition Energy (eV/atom)", fontsize=36,
-    )
-    cbar.ax.tick_params(labelsize=35)
+    cbar.set_label(f"{formula_string} Decomposition Energy (eV/atom)")
 
     plotter = PourbaixPlotter(pourbaix_diagram)
     plotter.get_pourbaix_plot(
@@ -156,9 +154,8 @@ def get_metastability_heat_map_plot(
         ax=ax, label_domains=True, show_neutral_axes=True,
     )
 
-    ax.tick_params(axis="both", which="major", labelsize=35)
-    ax.set_xlabel("pH", fontsize=40)
-    ax.set_ylabel("E(V)", fontsize=40)
+    ax.set_xlabel("pH")
+    ax.set_ylabel("E(V)")
 
     return ax
 

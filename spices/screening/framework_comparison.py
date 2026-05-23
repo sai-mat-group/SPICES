@@ -23,6 +23,9 @@ import pandas as pd
 from pymatgen.core import Structure, Element
 
 from spices.intercalation.structure import DEFAULT_MATCHER
+from spices.plotting import apply_publication_style
+
+apply_publication_style()
 
 logger = logging.getLogger(__name__)
 
@@ -509,6 +512,24 @@ def classify_edges(G, df_dict, pH_filter=(7, 8.5),
     }
 
 
+NODE_SIZE = 4500
+NODE_BORDER_WIDTH = 1.0
+# Legend marker size is decoupled from NODE_SIZE so the legend remains
+# visually proportional to the (fixed) legend font size even if NODE_SIZE
+# is tuned for in-graph readability.
+LEGEND_MARKER_SIZE = (2000 ** 0.5) * 0.3
+
+
+def _node_color(G, n):
+    """Resolve a node's display color: explicit attr, then ion lookup."""
+    attr_color = G.nodes[n].get("color")
+    if attr_color is not None:
+        return attr_color
+    if getattr(n, "working_ion", None) is not None:
+        return ION_COLORS.get(n.working_ion.symbol, "lightgrey")
+    return "lightgrey"
+
+
 def _draw_nodes_and_labels(G, pos):
     """Draw nodes (expt hex / theoretical circle, ion-colored), labels,
     and the two shared legends (working-ion color, phase shape).
@@ -524,56 +545,214 @@ def _draw_nodes_and_labels(G, pos):
     expt_nodes = [n for n in G.nodes if n.is_expt]
     non_expt_nodes = [n for n in G.nodes if not n.is_expt]
 
-    expt_colors = [
-        ION_COLORS.get(n.working_ion.symbol, "gray")
-        for n in expt_nodes
-    ]
-    non_expt_colors = [
-        ION_COLORS.get(n.working_ion.symbol, "gray")
-        for n in non_expt_nodes
-    ]
+    expt_colors = [_node_color(G, n) for n in expt_nodes]
+    non_expt_colors = [_node_color(G, n) for n in non_expt_nodes]
 
-    nx.draw_networkx_nodes(
-        G, pos, nodelist=expt_nodes, node_size=2000,
+    expt_coll = nx.draw_networkx_nodes(
+        G, pos, nodelist=expt_nodes, node_size=NODE_SIZE,
         node_color=expt_colors, node_shape="H",
+        edgecolors="black", linewidths=NODE_BORDER_WIDTH,
     )
-    nx.draw_networkx_nodes(
-        G, pos, nodelist=non_expt_nodes, node_size=2000,
+    non_expt_coll = nx.draw_networkx_nodes(
+        G, pos, nodelist=non_expt_nodes, node_size=NODE_SIZE,
         node_color=non_expt_colors, node_shape="o",
+        edgecolors="black", linewidths=NODE_BORDER_WIDTH,
     )
+    # Markers are sized in display pt^2 and would otherwise be hard-clipped
+    # at the axes spine when their centre sits near the data-range edge.
+    # _pad_axes_to_fit_nodes (below) pads the view to fit them; clip_on=False
+    # is belt-and-suspenders so a marker is never cut by the axes box.
+    for coll in (expt_coll, non_expt_coll):
+        if coll is not None:
+            coll.set_clip_on(False)
 
     labels = {
         n: f"{formula_to_mathtext(n.struct_reduced_formula)}\n{n.mp_id}"
         for n in G.nodes
     }
-    nx.draw_networkx_labels(G, pos, labels=labels, font_size=6)
+    text_items = nx.draw_networkx_labels(G, pos, labels=labels, font_size=9)
+    for text in text_items.values():
+        text.set_clip_on(False)
 
     ax = plt.gca()
     ion_handles = [
         mpatches.Patch(color=c, label=ion)
         for ion, c in ION_COLORS.items()
     ]
+    ion_handles.append(
+        mpatches.Patch(color="lightgrey", label="Multi-ion / none"),
+    )
     leg1 = ax.legend(
         handles=ion_handles, title="Working Ion",
         loc="upper left", bbox_to_anchor=(1.01, 1.02), frameon=True,
     )
     ax.add_artist(leg1)
 
-    ms = (2000 ** 0.5) * 0.3
     shape_handles = [
         Line2D([0], [0], marker="H", linestyle="None",
                fillstyle="none", markeredgecolor="black",
-               markersize=ms, label="Experimental"),
+               markersize=LEGEND_MARKER_SIZE, label="Experimental"),
         Line2D([0], [0], marker="o", linestyle="None",
                fillstyle="none", markeredgecolor="black",
-               markersize=ms, label="Theoretical"),
+               markersize=LEGEND_MARKER_SIZE, label="Theoretical"),
     ]
     leg2 = ax.legend(
         handles=shape_handles, title="Phase type",
         loc="upper left", bbox_to_anchor=(1.01, 0.61), frameon=True,
+        labelspacing=1.8, borderpad=0.8,
     )
     ax.add_artist(leg2)
+
+    _pad_axes_to_fit_nodes(ax, pos)
     return ax
+
+
+def _pad_axes_to_fit_nodes(ax, pos, node_size=NODE_SIZE, frac=1.3):
+    """Pad the axes view limits so fixed-size node markers fit fully.
+
+    ``spring_layout`` positions are node *centres*; matplotlib autoscales
+    to those points only, so a marker (sized in display pt^2) near the
+    data-range edge spills past the axes box and gets clipped at the spine.
+    This pads each axis by the node radius converted to data units, with a
+    safety factor for the label that overflows the marker.
+
+    ``ax.margins`` is unsuitable: it pads by a fraction of the data span,
+    which is ~0 for the linear layout of a 2-node component.
+    """
+    import math
+
+    xs = [p[0] for p in pos.values()]
+    ys = [p[1] for p in pos.values()]
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+
+    # Seed the view (with a floor for degenerate/linear layouts) so transData
+    # is non-singular before we read the data-per-pixel scale from it.
+    eps = 0.5
+    ax.set_xlim(x_min - eps, x_max + eps)
+    ax.set_ylim(y_min - eps, y_max + eps)
+
+    r_px = math.sqrt(node_size / math.pi) / 72.0 * ax.figure.dpi
+    inv = ax.transData.inverted()
+    ox, oy = inv.transform((0.0, 0.0))
+    rx, ry = inv.transform((r_px, r_px))
+    pad_x = abs(rx - ox) * frac
+    pad_y = abs(ry - oy) * frac
+
+    # set_xlim/ylim disables autoscale, so edges drawn afterward by callers
+    # (which sit between nodes) won't override these padded limits.
+    ax.set_xlim(x_min - pad_x, x_max + pad_x)
+    ax.set_ylim(y_min - pad_y, y_max + pad_y)
+
+
+class _MergedFrameworkNode:
+    """Proxy node for a group of FrameworkStructure objects sharing one mp_id.
+
+    Surfaces the same attribute interface used by ``_draw_nodes_and_labels``
+    so the same renderer accepts both unmerged ``FrameworkStructure`` and
+    merged proxies.
+    """
+
+    def __init__(self, mp_id, framework_reduced_formula, is_expt,
+                 working_ions):
+        self.mp_id = mp_id
+        self.framework_reduced_formula = framework_reduced_formula
+        # Merged node has no single intercalated composition; show the
+        # bare framework formula in the label.
+        self.struct_reduced_formula = framework_reduced_formula
+        self.is_expt = is_expt
+        self.working_ion = None
+        self.working_ions = set(working_ions)
+
+
+EDGE_PRIORITY = {
+    "pH_area_filtered": 4,
+    "pH_filtered": 3,
+    "same_ion": 2,
+    "diff_ion": 1,
+    "no_voltage": 1,
+}
+
+
+def _collapse_graph_by_mpid(G, edge_groups):
+    """Merge same-mp_id nodes into a single light-grey proxy node.
+
+    A merged group MUST share ``is_expt`` — same mp_id has one provenance
+    (experimental or theoretical).  Mismatch raises ``ValueError``.
+
+    Parameters
+    ----------
+    G : networkx.Graph
+        Original graph with ``FrameworkStructure`` nodes.
+    edge_groups : dict
+        Output of :func:`classify_edges`.
+
+    Returns
+    -------
+    G_display : networkx.Graph
+        Graph with merged proxy nodes.  Each node has a ``color``
+        attribute: ion color for singletons, ``"lightgrey"`` for merged
+        proxies.
+    edge_groups_display : dict
+        Edge groups remapped to the merged graph.  Self-loops dropped;
+        parallel edges between the same display-node pair collapse to
+        the single highest-priority category
+        (``pH_area_filtered`` > ``pH_filtered`` > ``same_ion`` >
+        ``diff_ion`` / ``no_voltage``).
+    """
+    import networkx as nx
+
+    groups = defaultdict(list)
+    for n in G.nodes:
+        groups[n.mp_id].append(n)
+
+    proxy = {}
+    for mp_id, group in groups.items():
+        if len(group) == 1:
+            proxy[mp_id] = group[0]
+            continue
+        is_expt_values = {n.is_expt for n in group}
+        if len(is_expt_values) > 1:
+            # TODO: remove this raise once verified across the full
+            # 5-ion dataset.  Same mp_id should have one provenance.
+            raise ValueError(
+                f"Merged node mp_id={mp_id} has inconsistent is_expt: "
+                f"{sorted(is_expt_values)}"
+            )
+        proxy[mp_id] = _MergedFrameworkNode(
+            mp_id=mp_id,
+            framework_reduced_formula=group[0].framework_reduced_formula,
+            is_expt=group[0].is_expt,
+            working_ions={n.working_ion.symbol for n in group},
+        )
+
+    G_display = nx.Graph()
+    for mp_id, p in proxy.items():
+        if isinstance(p, _MergedFrameworkNode):
+            color = "lightgrey"
+        else:
+            color = ION_COLORS.get(p.working_ion.symbol, "lightgrey")
+        G_display.add_node(p, color=color)
+
+    best_cat = {}
+    for cat, edges in edge_groups.items():
+        prio = EDGE_PRIORITY[cat]
+        for u, v in edges:
+            u_p = proxy[u.mp_id]
+            v_p = proxy[v.mp_id]
+            if u_p is v_p:
+                continue
+            key = frozenset((id(u_p), id(v_p)))
+            current = best_cat.get(key)
+            if current is None or current[0] < prio:
+                best_cat[key] = (prio, cat, u_p, v_p)
+
+    edge_groups_display = {cat: [] for cat in edge_groups}
+    for _, cat, u_p, v_p in best_cat.values():
+        G_display.add_edge(u_p, v_p)
+        edge_groups_display[cat].append((u_p, v_p))
+
+    return G_display, edge_groups_display
 
 
 def save_graph_figures(
@@ -591,8 +770,6 @@ def save_graph_figures(
     os.makedirs(save_dir, exist_ok=True)
 
     for idx, G in enumerate(graphs):
-        pos = nx.spring_layout(G)
-
         framework_formulae = {
             n.framework_reduced_formula for n in G.nodes
         }
@@ -608,45 +785,53 @@ def save_graph_figures(
             )
         framework_formula = next(iter(framework_formulae))
 
-        plt.figure(figsize=(10, 8))
-        ax = _draw_nodes_and_labels(G, pos)
-
-        # Classify and draw edges
         edge_groups = classify_edges(
             G, df_dict, pH_filter, metastability_criterion,
             min_area_fraction,
         )
 
+        G_display, edge_groups_display = _collapse_graph_by_mpid(
+            G, edge_groups,
+        )
+        pos = nx.spring_layout(G_display)
+
+        plt.figure(figsize=(7.2, 5.4))
+        ax = _draw_nodes_and_labels(G_display, pos)
+
         nx.draw_networkx_edges(
-            G, pos,
-            edgelist=edge_groups["diff_ion"] + edge_groups["no_voltage"],
-            edge_color="tab:gray", width=1.5,
+            G_display, pos,
+            edgelist=(
+                edge_groups_display["diff_ion"]
+                + edge_groups_display["no_voltage"]
+            ),
+            edge_color="tab:gray", width=1.0,
             style=(0, (5, 3)), alpha=0.4,
         )
         nx.draw_networkx_edges(
-            G, pos, edgelist=edge_groups["same_ion"],
-            edge_color="tab:gray", width=1.5, style="solid", alpha=0.6,
+            G_display, pos, edgelist=edge_groups_display["same_ion"],
+            edge_color="tab:gray", width=1.0, style="solid", alpha=0.6,
         )
         nx.draw_networkx_edges(
-            G, pos, edgelist=edge_groups["pH_filtered"],
-            edge_color="tab:blue", width=1.5,
+            G_display, pos, edgelist=edge_groups_display["pH_filtered"],
+            edge_color="tab:blue", width=1.0,
             style=(0, (5, 3)), alpha=1,
         )
         nx.draw_networkx_edges(
-            G, pos, edgelist=edge_groups["pH_area_filtered"],
-            edge_color="tab:blue", width=1.5, style="solid", alpha=1,
+            G_display, pos,
+            edgelist=edge_groups_display["pH_area_filtered"],
+            edge_color="tab:blue", width=1.0, style="solid", alpha=1,
         )
 
         edge_handles = [
-            Line2D([0], [0], color="tab:gray", alpha=0.4, lw=1.5,
+            Line2D([0], [0], color="tab:gray", alpha=0.4, lw=1.0,
                    linestyle=(0, (5, 3)),
                    label="Not (meta)stable / Diff. ions"),
-            Line2D([0], [0], color="tab:gray", alpha=0.6, lw=1.5,
+            Line2D([0], [0], color="tab:gray", alpha=0.6, lw=1.0,
                    linestyle="solid", label="(Meta)stable"),
-            Line2D([0], [0], color="tab:blue", lw=1.5,
+            Line2D([0], [0], color="tab:blue", lw=1.0,
                    linestyle=(0, (5, 3)),
                    label="(Meta)stable across pH 7-8.5"),
-            Line2D([0], [0], color="tab:blue", lw=1.5,
+            Line2D([0], [0], color="tab:blue", lw=1.0,
                    linestyle="solid",
                    label="Area > 80% across pH 7-8.5"),
         ]
@@ -657,16 +842,20 @@ def save_graph_figures(
         )
 
         ax.spines[:].set_visible(False)
+        ax.set_xticks([])
+        ax.set_yticks([])
         plt.grid(False)
 
-        num_ions = len({n.working_ion.symbol for n in G.nodes})
+        num_ions = len({
+            n.working_ion.symbol for n in G.nodes
+            if n.working_ion is not None
+        })
         sub_dir = os.path.join(save_dir, f"{num_ions}_ions")
         os.makedirs(sub_dir, exist_ok=True)
         plt.savefig(
             os.path.join(
                 sub_dir, f"image_{idx}_{framework_formula}.png",
             ),
-            dpi=600, bbox_inches="tight",
         )
         plt.close()
 
@@ -739,9 +928,10 @@ def filter_plateaus_by_pH_and_area(
 
 
 def formula_to_mathtext(s):
-    """Format chemical formula for LaTeX rendering."""
+    """Format chemical formula for LaTeX rendering with upright element symbols."""
     s = s.replace("\u00b7", r"\cdot ").replace(".", r"\cdot ")
     s = re.sub(r"([A-Za-z\)])(\d+(?:\.\d+)?)", r"\1_{\2}", s)
+    s = re.sub(r"([A-Za-z]+)", r"\\mathrm{\1}", s)
     return f"${s}$"
 
 
@@ -750,8 +940,34 @@ def formula_to_mathtext(s):
 # ====================================================================
 
 
-def _load_cached_adjacency(cache_path, meta_path, combined_fw, reconnect_isolated):
-    """Load adjacency from cache iff sidecar metadata matches."""
+CACHE_SCHEMA_VERSION = 2
+
+
+def _diff_first_n(a, b, n=5):
+    """Return (idx, a_val, b_val) for the first n positions where lists differ."""
+    out = []
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            out.append((i, x, y))
+            if len(out) >= n:
+                return out
+    if len(a) != len(b) and len(out) < n:
+        if len(a) > len(b):
+            for i in range(len(b), min(len(a), len(b) + n - len(out))):
+                out.append((i, a[i], None))
+        else:
+            for i in range(len(a), min(len(b), len(a) + n - len(out))):
+                out.append((i, None, b[i]))
+    return out
+
+
+def _load_cached_state(cache_path, meta_path, stage3_dirs, sheet_name,
+                      reconnect_isolated):
+    """Load (combined_fw, adjacency) bundle if sidecar metadata matches.
+
+    Returns ``(combined_fw, adjacency)`` on success, ``None`` on miss
+    (file absent, schema mismatch, key mismatch, or corruption).
+    """
     if not (os.path.exists(cache_path) and os.path.exists(meta_path)):
         return None
     try:
@@ -761,36 +977,92 @@ def _load_cached_adjacency(cache_path, meta_path, combined_fw, reconnect_isolate
         logger.warning("Cache meta unreadable (%s); rebuilding", e)
         return None
 
-    cur_mpids = [fw.mp_id for fw in combined_fw]
-    if meta.get("mpids") != cur_mpids:
-        logger.info("Cache mp_id list differs; rebuilding adjacency")
+    if meta.get("schema_version") != CACHE_SCHEMA_VERSION:
+        logger.info(
+            "Cache schema version mismatch (cached=%s, current=%s); "
+            "rebuilding",
+            meta.get("schema_version"), CACHE_SCHEMA_VERSION,
+        )
         return None
+
+    cur_keys = list(stage3_dirs.keys())
+    if list(meta.get("stage3_dirs_keys", [])) != cur_keys:
+        logger.info(
+            "Cache stage3 ion order differs (cached=%s, current=%s); "
+            "rebuilding",
+            meta.get("stage3_dirs_keys"), cur_keys,
+        )
+        return None
+
+    if meta.get("sheet_name") != sheet_name:
+        logger.info(
+            "Cache sheet_name differs (cached=%s, current=%s); rebuilding",
+            meta.get("sheet_name"), sheet_name,
+        )
+        return None
+
     if bool(meta.get("reconnect_isolated")) != bool(reconnect_isolated):
         logger.info(
-            "Cache reconnect_isolated flag differs (cached=%s, current=%s); "
-            "rebuilding adjacency",
+            "Cache reconnect_isolated flag differs "
+            "(cached=%s, current=%s); rebuilding",
             meta.get("reconnect_isolated"), reconnect_isolated,
         )
         return None
 
-    with open(cache_path, "rb") as f:
-        return pickle.load(f)
+    try:
+        with open(cache_path, "rb") as f:
+            bundle = pickle.load(f)
+    except (pickle.UnpicklingError, EOFError, AttributeError, OSError) as e:
+        logger.warning("Cache pickle unreadable (%s); rebuilding", e)
+        return None
+
+    if not isinstance(bundle, dict) or "combined_fw" not in bundle \
+            or "adjacency" not in bundle:
+        logger.info(
+            "Cache pickle is legacy adjacency-only format; rebuilding "
+            "(framework pool was not cached)"
+        )
+        return None
+
+    combined_fw = bundle["combined_fw"]
+    adjacency = bundle["adjacency"]
+
+    cached_mpids = meta.get("mpids", [])
+    actual_mpids = [fw.mp_id for fw in combined_fw]
+    if cached_mpids != actual_mpids:
+        diffs = _diff_first_n(cached_mpids, actual_mpids)
+        logger.warning(
+            "Cache pickle mp_ids don't match sidecar; rebuilding. "
+            "First diffs: %s", diffs,
+        )
+        return None
+
+    return combined_fw, adjacency
 
 
-def _save_cached_adjacency(
-    cache_path, meta_path, adjacency, combined_fw, reconnect_isolated,
-):
-    """Pickle adjacency and write sidecar metadata."""
+def _save_cached_state(cache_path, meta_path, combined_fw, adjacency,
+                       stage3_dirs, sheet_name, reconnect_isolated):
+    """Pickle (combined_fw, adjacency) bundle and write sidecar metadata."""
     os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    bundle = {"combined_fw": combined_fw, "adjacency": adjacency}
     with open(cache_path, "wb") as f:
-        pickle.dump(adjacency, f)
+        pickle.dump(bundle, f)
+    n_edges = sum(len(v) for v in adjacency.values()) // 2
     meta = {
-        "mpids": [fw.mp_id for fw in combined_fw],
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "stage3_dirs_keys": list(stage3_dirs.keys()),
+        "sheet_name": sheet_name,
         "reconnect_isolated": bool(reconnect_isolated),
+        "mpids": [fw.mp_id for fw in combined_fw],
+        "n_frameworks": len(combined_fw),
+        "n_adjacency_edges": n_edges,
     }
     with open(meta_path, "w") as f:
         json.dump(meta, f)
-    logger.info("Saved adjacency cache to %s", cache_path)
+    logger.info(
+        "Saved step4 cache to %s (%d frameworks, %d edges)",
+        cache_path, len(combined_fw), n_edges,
+    )
 
 
 def run_framework_comparison(
@@ -805,6 +1077,8 @@ def run_framework_comparison(
     cache_adjacency=True,
     adj_cache_path=None,
     reconnect_isolated=False,
+    rerender_plots=False,
+    force_rebuild=False,
 ):
     """
     Run the Stage 4 graph-based framework comparison pipeline.
@@ -850,81 +1124,111 @@ def run_framework_comparison(
         same-ion Excel. Encodes the assumption that two structures
         sharing a voltage plateau row ARE the same framework even if
         ``StructureMatcher.fit`` says otherwise.
+    rerender_plots : bool
+        If True, require a valid cache and skip both the framework load
+        and the per-ion Excel writes; only regenerate PNGs.  Raises
+        ``FileNotFoundError`` if no valid cache is found.  Use when
+        iterating on plot styling.
+    force_rebuild : bool
+        If True, ignore any existing cache and rebuild from scratch.
 
     Returns
     -------
     dict
         ``{ion: {"only_{ion}": DataFrame, "multiple_ions": DataFrame}}``
+        When ``rerender_plots=True``, returns an empty dict (no Excels).
     """
     if elements is None:
         elements = list(stage3_dirs.keys())
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # --- Load frameworks for all ions ---
-    frameworks_dict = {}
-    df_dict = {}
-
-    for ion in stage3_dirs:
-        s3_dir = stage3_dirs[ion]
-        excel_path = os.path.join(s3_dir, "All_voltage_plateaus.xlsx")
-        discharged_dir = os.path.join(s3_dir, "structs")
-
-        # Handle typo in original directory name
-        charged_dir = os.path.join(s3_dir, "All_charged_structures")
-        if not os.path.exists(charged_dir):
-            charged_dir = os.path.join(s3_dir, "All_charged_strutures")
-
-        logger.info("Loading frameworks for %s from %s", ion, s3_dir)
-        dis_set, chg_set, vdf = load_all_frameworks_for_element(
-            excel_path, sheet_name, discharged_dir, charged_dir, ion,
-        )
-        frameworks_dict[ion] = (dis_set, chg_set)
-        df_dict[ion] = vdf
-
-    # --- Combine all ions' frameworks into one list ---
-    all_fw_lists = {}
-    for ion in frameworks_dict:
-        dis, chg = frameworks_dict[ion]
-        all_fw_lists[ion] = _get_all_frameworks_list(list(dis), list(chg))
-
-    combined_fw = []
-    for ion in all_fw_lists:
-        combined_fw.extend(all_fw_lists[ion])
-
-    logger.info(
-        "Combined framework count: %d (across %d ions)",
-        len(combined_fw), len(all_fw_lists),
-    )
-
-    # --- Build or load adjacency ---
+    # --- Resolve cache paths ---
     if adj_cache_path is None:
         cache_name = (
-            "adjacency_cache_reconnected.pkl"
-            if reconnect_isolated else "adjacency_cache.pkl"
+            "step4_cache_reconnected.pkl"
+            if reconnect_isolated else "step4_cache.pkl"
         )
         adj_cache_path = os.path.join(output_dir, cache_name)
-    meta_path = (
-        os.path.splitext(adj_cache_path)[0] + ".meta.json"
-    )
+    meta_path = os.path.splitext(adj_cache_path)[0] + ".meta.json"
 
-    adjacency = None
-    if cache_adjacency:
-        adjacency = _load_cached_adjacency(
-            adj_cache_path, meta_path, combined_fw, reconnect_isolated,
+    # --- Try cache first (skips both load and adjacency build) ---
+    cached = None
+    if cache_adjacency and not force_rebuild:
+        cached = _load_cached_state(
+            adj_cache_path, meta_path,
+            stage3_dirs, sheet_name, reconnect_isolated,
         )
-        if adjacency is not None:
-            logger.info("Loaded cached adjacency from %s", adj_cache_path)
 
-    if adjacency is None:
+    df_dict = {}
+    if cached is not None:
+        combined_fw, adjacency = cached
+        logger.info(
+            "Loaded %d frameworks + adjacency from cache %s",
+            len(combined_fw), adj_cache_path,
+        )
+        # Still need df_dict for edge classification + per-ion Excel
+        # writes; reading Excels is cheap.
+        for ion in stage3_dirs:
+            excel_path = os.path.join(
+                stage3_dirs[ion], "All_voltage_plateaus.xlsx",
+            )
+            df_dict[ion] = pd.read_excel(excel_path, sheet_name=sheet_name)
+    else:
+        if rerender_plots:
+            raise FileNotFoundError(
+                f"--rerender-plots requires a valid cache at "
+                f"{adj_cache_path}, but none was found or it failed "
+                f"validation. Run the full pipeline once to build the "
+                f"cache first."
+            )
+
+        # --- Full load: frameworks for all ions ---
+        frameworks_dict = {}
+        for ion in stage3_dirs:
+            s3_dir = stage3_dirs[ion]
+            excel_path = os.path.join(s3_dir, "All_voltage_plateaus.xlsx")
+            discharged_dir = os.path.join(s3_dir, "structs")
+
+            # Handle typo in original directory name
+            charged_dir = os.path.join(s3_dir, "All_charged_structures")
+            if not os.path.exists(charged_dir):
+                charged_dir = os.path.join(s3_dir, "All_charged_strutures")
+
+            logger.info("Loading frameworks for %s from %s", ion, s3_dir)
+            dis_set, chg_set, vdf = load_all_frameworks_for_element(
+                excel_path, sheet_name, discharged_dir, charged_dir, ion,
+            )
+            frameworks_dict[ion] = (dis_set, chg_set)
+            df_dict[ion] = vdf
+
+        # --- Combine all ions' frameworks into one list ---
+        all_fw_lists = {}
+        for ion in frameworks_dict:
+            dis, chg = frameworks_dict[ion]
+            all_fw_lists[ion] = _get_all_frameworks_list(
+                list(dis), list(chg),
+            )
+
+        combined_fw = []
+        for ion in all_fw_lists:
+            combined_fw.extend(all_fw_lists[ion])
+
+        logger.info(
+            "Combined framework count: %d (across %d ions)",
+            len(combined_fw), len(all_fw_lists),
+        )
+
+        # --- Build adjacency ---
         adjacency = build_adjacency_dict(combined_fw)
         if reconnect_isolated:
             logger.info("Reconnecting isolated frameworks via plateau df")
             reconnect_isolated_frameworks(adjacency, combined_fw, df_dict)
         if cache_adjacency:
-            _save_cached_adjacency(
-                adj_cache_path, meta_path, adjacency,
-                combined_fw, reconnect_isolated,
+            _save_cached_state(
+                adj_cache_path, meta_path,
+                combined_fw, adjacency,
+                stage3_dirs, sheet_name, reconnect_isolated,
             )
 
     # --- Connected components & graphs ---
@@ -945,6 +1249,12 @@ def run_framework_comparison(
             metastability_criterion=metastability_criterion,
             min_area_fraction=min_area_fraction,
         )
+
+    if rerender_plots:
+        logger.info(
+            "--rerender-plots: skipping per-ion Excel writes."
+        )
+        return {}
 
     # --- Per-ion Excel partition (graph-component-based) ---
     # For each component, record which ions appear in it. An ion's mp_id

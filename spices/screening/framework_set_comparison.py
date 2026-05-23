@@ -25,12 +25,15 @@ import pandas as pd
 from pymatgen.core import Composition
 
 from spices.config import SUPPORTED_ELEMENTS
+from spices.plotting import apply_publication_style
 from spices.screening.framework_comparison import (
     FrameworkStructure,
     ION_COLORS,
     formula_to_mathtext,
     load_all_frameworks_for_element,
 )
+
+apply_publication_style()
 
 logger = logging.getLogger(__name__)
 
@@ -164,21 +167,17 @@ def voltage_step_plot(
     y_vals = [voltages[0]] + voltages
 
     if fig is None:
-        fig, ax = plt.subplots(dpi=150)
+        fig, ax = plt.subplots(figsize=(3.5, 2.6))
     else:
         ax = fig.axes[0] if fig.axes else fig.add_subplot(1, 1, 1)
 
-    ax.axhline(1.23, color="blue", linestyle="--", linewidth=1.5)
-    ax.axhline(-0.71, color="blue", linestyle="--", linewidth=1.5)
+    ax.axhline(1.23, color="blue", linestyle="--")
+    ax.axhline(-0.71, color="blue", linestyle="--")
     ax.yaxis.set_major_locator(plt.MultipleLocator(0.5))
     ax.yaxis.set_minor_locator(plt.MultipleLocator(0.1))
-    ax.tick_params(direction="in", length=6, width=1.5, which="major")
-    ax.tick_params(direction="in", length=3, width=1.0, which="minor")
-    for spine in ax.spines.values():
-        spine.set_linewidth(2)
     ax.minorticks_on()
-    ax.grid(which="major", color="#CCCCCC", linestyle="-", linewidth=1.5)
-    ax.grid(which="minor", color="#DDDDDD", linestyle=":", linewidth=1)
+    ax.grid(which="major", color="#CCCCCC", linestyle="-", linewidth=0.6)
+    ax.grid(which="minor", color="#DDDDDD", linestyle=":", linewidth=0.4)
 
     ax.step(
         x_vals, y_vals,
@@ -188,10 +187,8 @@ def voltage_step_plot(
     ax.set_ylim(-0.8, 1.3)
     ax.set_xlabel(
         r"$x$ in $M_x$" + formula_to_mathtext(framework_formula),
-        fontsize=14,
     )
-    ax.set_ylabel("Applied potential (V vs SHE)", fontsize=14)
-    ax.tick_params(direction="in")
+    ax.set_ylabel("Applied potential (V vs SHE)")
     legend = ax.legend(
         loc="upper left", bbox_to_anchor=(1.02, 1),
         borderaxespad=0.5, frameon=True,
@@ -201,9 +198,7 @@ def voltage_step_plot(
     if save:
         os.makedirs(save_dir, exist_ok=True)
         fname = f"voltage_plot_{framework_formula}_plot{plot_num}.png"
-        fig.savefig(
-            os.path.join(save_dir, fname), dpi=300, bbox_inches="tight",
-        )
+        fig.savefig(os.path.join(save_dir, fname))
         plt.close(fig)
 
     return fig
@@ -333,6 +328,7 @@ def venn_2set(
         "K": "#988ED5", "Mg": "#348ABD", "Ca": "#8EBA42",
     }
 
+    plt.figure(figsize=(3.5, 3.5))
     _venn2(
         subsets=(
             len(set_a_mpids) - n_common,
@@ -348,9 +344,7 @@ def venn_2set(
 
     if save:
         os.makedirs(save_dir, exist_ok=True)
-        plt.savefig(
-            os.path.join(save_dir, f"{ion_a}-{ion_b}.pdf"), dpi=300,
-        )
+        plt.savefig(os.path.join(save_dir, f"{ion_a}-{ion_b}.pdf"))
     plt.close()
 
 

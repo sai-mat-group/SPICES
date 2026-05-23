@@ -125,14 +125,16 @@ combined = run_intercalation_screening(
     restart=True,
 )
 
-# Stage 4: Compare frameworks across working ions
+# Stage 4: Compare frameworks across working ions.  The graph is built ONCE
+# over every ion in stage3_dirs; `elements` only restricts the per-ion Excel
+# output (default None → all ions present).  Set-based comparison (Venn diagrams,
+# voltage overlays) is a separate entry point, run_set_based_comparison.
 from spices.screening.framework_comparison import run_framework_comparison
 
 stage3_dirs = {e: f"{e}_intercalation/" for e in ["Ca", "K", "Li", "Mg", "Na"]}
 result = run_framework_comparison(
-    element="Ca",
     stage3_dirs=stage3_dirs,
-    output_dir="Ca_framework_comparison/",
+    output_dir="framework_comparison/",
 )
 ```
 
@@ -195,6 +197,7 @@ spices/
     mp_client.py               # Materials Project API client (live + snapshot backends)
     dataframe_ops.py           # DataFrame-level stability update functions
     io.py                      # Logging configuration
+    plotting.py                # Publication-style matplotlib rcParams (Helvetica, embedded fonts)
 
     pourbaix/                  # Core Pourbaix diagram analysis
         composition.py         # Chemical composition manipulation
@@ -218,7 +221,8 @@ spices/
         dilute_water.py        # Stage 1: pure water stability evaluation
         seawater.py            # Stage 2: seawater stability screening
         intercalation.py       # Stage 3: intercalation voltage filtering
-        framework_comparison.py # Stage 4: cross-element framework comparison
+        framework_comparison.py # Stage 4: cross-element framework comparison (graph-based)
+        framework_set_comparison.py # Stage 4 companion: set-based (mp_id) comparison — Venn + voltage overlays
         statistics.py          # Stage 5: aggregate statistics and figures
 
     mp_snapshot/               # Offline MP backend for reproducing frozen releases
@@ -231,7 +235,8 @@ spices/
 scripts/                       # CLI wrappers and HPC submission templates
     run_seawater_screening.py  # CLI for Stage 2 (supports multiprocessing)
     run_intercalation_screening.py  # CLI for Stage 3 (supports multiprocessing in sub-steps 2 and 3)
-    run_framework_comparison.py # CLI for Stage 4 (graph + optional set comparison)
+    run_framework_comparison.py # CLI for Stage 4 (graph-based framework comparison)
+    run_framework_set_comparison.py # CLI for Stage 4 set-based comparison (Venn + voltage overlays)
     run_statistics.py          # CLI for Stage 5
     submit_seawater.sh         # SLURM submission template for Stage 2
     submit_intercalation.sh    # SLURM submission template for Stage 3
@@ -258,6 +263,7 @@ For multi-worker runs against the snapshot backend, export `SPICES_MP_BACKEND=sn
 
 * **`--restart`** (Stage 2) resumes an interrupted run.  In Phase 1, only chemsys/sea-comp keys whose Pourbaix pickle is missing from disk are re-dispatched — if 8000 of 10000 unique diagrams already exist, the remaining 2000 are split across all workers.  In Phase 2, only rows whose `Seawater stability` is still NaN are re-evaluated, with checkpoint files from `runtime_sheets/` and `{element}_evaluated_backup.xlsx` merged in.
 * **`--restart`** (Stage 3) resumes an interrupted intercalation run.  Sub-step 2 resumes from per-row checkpoints in `runtime_sheets/`.  Sub-step 3 skips a composition whose `Voltage_plateau_data/{composition}/sc_{N}/{composition}.xlsx` already exists for every requested selection criterion; partial compositions are re-built from the on-disk adjacency cache (`{output_dir}/adjacency_cache/{composition}.pkl`), so the O(n²) `StructureMatcher` work is paid only once.
+* **Stage 4 framework cache** — `run_framework_comparison` bundles the loaded framework pool *and* the O(n²) cross-element `StructureMatcher` adjacency into a single pickle (`{output_dir}/step4_cache.pkl`, or `step4_cache_reconnected.pkl` with `--reconnect-isolated`) plus a `.meta.json` sidecar.  Every run validates the sidecar (schema version, Stage-3 ion dirs and their order, sheet name, reconnect flag, and the full mp-id list); any mismatch — or a truncated / corrupt pickle caught while unpickling — is treated as a cache miss and rebuilt, so a kill mid-write is self-healing on the next run even though the Stage 4 write is *not* atomic (unlike the Stage 2/3 PID-temp + `os.replace` pattern).  `--rerender-plots` requires a valid cache and re-draws only the PNGs, skipping the framework load, the O(n²) build, and the per-ion Excel writes; `--force-rebuild` ignores any existing cache and rebuilds from scratch.  Stage 4 is otherwise single-process, and Stage 5 has no cache or restart path.
 * **Hard guard on `restart=False`** — if the Stage 2 output xlsx already contains evaluated rows and `--restart` is *not* passed, the run aborts with a clear error rather than silently overwriting prior progress.  Pass `--restart` to resume, or delete the file to start over.
 * **Atomic final write** — the output xlsx is written via `to_excel(<tmp>); os.replace(<tmp>, <final>)`.  A kill mid-write leaves either the previous file or the new one, never a corrupt half-written xlsx.  `runtime_sheets/` is cleaned up only after `os.replace` succeeds.  Stage 3's adjacency pickles use the same PID-tagged temp + `os.replace` pattern so two workers can never leave a truncated pickle on disk.
 * **Honest worker-death diagnostics** — when one worker dies, `ProcessPoolExecutor` cancels every pending future and each cancellation surfaces as `BrokenProcessPool`.  Stage 2 distinguishes the *first* (root-cause) failure from subsequent cascade cancellations in the log, then runs a post-mortem scan of `dmesg -T` and `journalctl --user` so the user can tell apart a real OOM (kernel SIGKILL of `python`), a SLURM cgroup time-limit kill, and a process-internal exception.  Stage 3's sub-step 3 dispatcher aborts on the first per-composition worker exception so partial-state corruption cannot accrete silently — re-run with `--restart` to resume.
@@ -287,11 +293,12 @@ python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_int
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ \
     -n 8 --restart
 
-# Stage 4: framework comparison (graph-based by default)
-python scripts/run_framework_comparison.py Ca --stage3-dir ./intercalation_results/
+# Stage 4: framework comparison (graph-based; one build over all ions present)
+python scripts/run_framework_comparison.py --stage3-dir ./intercalation_results/
+# (add --elements K to restrict the per-ion Excel output, e.g. for a smoke test)
 
-# Stage 4 with optional set-based comparison
-python scripts/run_framework_comparison.py Ca --stage3-dir ./intercalation_results/ --sets
+# Stage 4: set-based comparison (separate script — Venn diagrams + voltage overlays)
+python scripts/run_framework_set_comparison.py --stage3-dir ./intercalation_results/
 
 # HPC submission (edit the templates first)
 sbatch scripts/submit_seawater.sh

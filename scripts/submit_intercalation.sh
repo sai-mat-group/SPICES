@@ -64,6 +64,7 @@ python "${SPICES_DIR}/scripts/run_intercalation_screening.py" \
     --decomp-energy "${DECOMP_ENERGY}" \
     --cache-dir "${CACHE_DIR}" \
     --selection-criteria "${SELECTION_CRITERIA}"
+    --save-plots
 
 echo "============================================"
 echo "Finished at: $(date)"

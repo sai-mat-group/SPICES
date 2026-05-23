@@ -93,9 +93,9 @@ def main():
         "--adj-cache",
         default=None,
         help=(
-            "Path to adjacency cache pickle. Default: "
-            "{output_dir}/adjacency_cache.pkl (or "
-            "adjacency_cache_reconnected.pkl with --reconnect-isolated)"
+            "Path to step-4 cache pickle (frameworks + adjacency). "
+            "Default: {output_dir}/step4_cache.pkl (or "
+            "step4_cache_reconnected.pkl with --reconnect-isolated)"
         ),
     )
     parser.add_argument(
@@ -108,8 +108,29 @@ def main():
             "by default."
         ),
     )
+    parser.add_argument(
+        "--rerender-plots",
+        action="store_true",
+        help=(
+            "Require an existing valid cache; skip framework load + "
+            "adjacency build AND per-ion Excel writes. Only regenerates "
+            "the PNGs. Errors out if no valid cache is found."
+        ),
+    )
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help=(
+            "Ignore any existing cache and rebuild from scratch."
+        ),
+    )
 
     args = parser.parse_args()
+
+    if args.rerender_plots and args.force_rebuild:
+        parser.error("--rerender-plots and --force-rebuild are mutually exclusive")
+    if args.rerender_plots and args.no_plots:
+        parser.error("--rerender-plots and --no-plots are mutually exclusive")
 
     setup_logging()
 
@@ -137,6 +158,8 @@ def main():
         save_plots=not args.no_plots,
         adj_cache_path=args.adj_cache,
         reconnect_isolated=args.reconnect_isolated,
+        rerender_plots=args.rerender_plots,
+        force_rebuild=args.force_rebuild,
     )
 
     for ion, sheets in result.items():

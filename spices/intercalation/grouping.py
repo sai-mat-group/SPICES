@@ -16,6 +16,7 @@ import pandas as pd
 from pymatgen.core import Structure
 
 from spices.intercalation.structure import DEFAULT_MATCHER
+from spices.plotting import apply_publication_style
 from spices.pourbaix.cache import _atomic_pickle_dump
 from spices.screening.framework_comparison import (
     FrameworkStructure,
@@ -23,6 +24,8 @@ from spices.screening.framework_comparison import (
     bfs_components,
     make_networkx_graph,
 )
+
+apply_publication_style()
 
 logger = logging.getLogger(__name__)
 
@@ -178,15 +181,17 @@ def save_component_graphs(graphs, save_dir):
     for idx, G in enumerate(graphs):
         pos = nx.spring_layout(G)
 
-        plt.figure(figsize=(10, 8))
+        plt.figure(figsize=(7.2, 5.4))
         ax = _draw_nodes_and_labels(G, pos)
 
         nx.draw_networkx_edges(
-            G, pos, edge_color="tab:gray", width=1.5,
+            G, pos, edge_color="tab:gray", width=1.0,
             style="solid", alpha=0.8,
         )
 
         ax.spines[:].set_visible(False)
+        ax.set_xticks([])
+        ax.set_yticks([])
         plt.grid(False)
 
         out_path = os.path.join(save_dir, f"component_{idx}.pdf")

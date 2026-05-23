@@ -17,7 +17,10 @@ import numpy as np
 import pandas as pd
 
 from spices.config import SUPPORTED_ELEMENTS
+from spices.plotting import apply_publication_style
 from spices.screening.framework_comparison import ION_COLORS
+
+apply_publication_style()
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +217,7 @@ def count_phases_with_voltage_stability(
 def plot_pipeline_bar_chart(
     stage_data,
     save_path=None,
-    figsize=(14, 8),
+    figsize=(7.2, 4.0),
 ):
     """
     Generate a grouped bar chart of phase counts per element per stage.
@@ -241,7 +244,7 @@ def plot_pipeline_bar_chart(
     x = np.arange(n_elements)
     width = 0.8 / n_stages
 
-    fig, ax = plt.subplots(figsize=figsize, dpi=150)
+    fig, ax = plt.subplots(figsize=figsize)
 
     for i, stage in enumerate(stage_labels):
         values = [stage_data[e].get(stage, 0) for e in elements]
@@ -256,24 +259,21 @@ def plot_pipeline_bar_chart(
             if val > 0:
                 ax.text(
                     bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                    str(val), ha="center", va="bottom", fontsize=7,
+                    str(val), ha="center", va="bottom",
                 )
 
-    ax.set_xlabel("Working Ion", fontsize=14)
-    ax.set_ylabel("Number of Phases", fontsize=14)
+    ax.set_xlabel("Working Ion")
+    ax.set_ylabel("Number of Phases")
     ax.set_xticks(x)
     ax.set_xticklabels(elements)
-    ax.legend(loc="upper right", fontsize=9)
+    ax.legend(loc="upper right")
     ax.set_yscale("log")
     ax.grid(axis="y", alpha=0.3)
-
-    for spine in ax.spines.values():
-        spine.set_linewidth(1.5)
 
     plt.tight_layout()
 
     if save_path:
-        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        fig.savefig(save_path)
         logger.info("Bar chart saved to %s", save_path)
 
     return fig
@@ -305,7 +305,7 @@ def plot_nested_venn(
     import matplotlib.pyplot as plt
     from matplotlib.patches import Circle
 
-    fig, ax = plt.subplots(figsize=(4, 6), dpi=150)
+    fig, ax = plt.subplots(figsize=(3.5, 3.5))
     ax.set_aspect("equal")
 
     max_radius = 2.0
@@ -323,25 +323,25 @@ def plot_nested_venn(
             (0, y_center), radius,
             fill=True, facecolor=color,
             alpha=0.15 + 0.2 * i,
-            edgecolor="black", linewidth=1.5,
+            edgecolor="black", linewidth=1.0,
         )
         ax.add_patch(circle)
 
         ax.text(
             0, y_center + radius + 0.15,
             f"{label}\n({count})",
-            ha="center", va="bottom", fontsize=8, fontweight="bold",
+            ha="center", va="bottom", fontweight="bold",
         )
 
     ax.set_xlim(-max_radius - 1, max_radius + 1)
     ax.set_ylim(-max_radius - 1, max_radius + 1.5)
-    ax.set_title(element, fontsize=16, fontweight="bold")
+    ax.set_title(element, fontweight="bold")
     ax.axis("off")
 
     plt.tight_layout()
 
     if save_path:
-        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        fig.savefig(save_path)
         logger.info("Nested Venn saved to %s", save_path)
 
     return fig
