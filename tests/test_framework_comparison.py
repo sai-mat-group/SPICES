@@ -3,6 +3,7 @@
 import json
 import pickle
 import pytest
+import networkx as nx
 import pandas as pd
 from unittest.mock import MagicMock
 
@@ -14,6 +15,7 @@ from spices.screening.framework_comparison import (
     reconnect_isolated_frameworks,
     save_graph_figures,
     make_networkx_graph,
+    build_structure_voltage_records,
     ION_COLORS,
     NODE_SIZE,
     NODE_BORDER_WIDTH,
@@ -47,6 +49,43 @@ class _PicklableFakeFW:
 def _fake_fw(mp_id, ion_symbol, is_expt=False, framework_formula=None):
     """Build a picklable stand-in FrameworkStructure for graph tests."""
     return _PicklableFakeFW(mp_id, ion_symbol, is_expt, framework_formula)
+
+
+class _FakeComposition:
+    """Composition stub: ``get_atomic_fraction(ion)`` reads a {symbol: frac}."""
+
+    def __init__(self, fracs):
+        self._fracs = fracs
+
+    def get_atomic_fraction(self, ion):
+        return self._fracs.get(getattr(ion, "symbol", ion), 0.0)
+
+
+class _RecNode:
+    """Fake FrameworkStructure for build_structure_voltage_records tests.
+
+    ``frac`` is the node's OWN working-ion atomic fraction (0 = empty host);
+    asked for any other ion the composition returns 0.
+    """
+
+    def __init__(self, mp_id, ion_symbol, frac, is_expt=False, formula=None):
+        self.mp_id = mp_id
+        self.working_ion = _Ion(ion_symbol)
+        self.is_expt = is_expt
+        self.struct_reduced_formula = formula or f"S_{mp_id}"
+        self.struct = MagicMock()
+        self.struct.composition = _FakeComposition({ion_symbol: frac})
+
+
+def _voltage_df(rows):
+    """rows: tuples ``(charged_mpid, discharged_mpid, V, area, pH_str)``."""
+    return pd.DataFrame({
+        "Charged MP id": [r[0] for r in rows],
+        "Discharged MP id": [r[1] for r in rows],
+        "V vs SHE (V)": [r[2] for r in rows],
+        "Total metastability area fraction": [r[3] for r in rows],
+        "pH range metastability criterion 4": [r[4] for r in rows],
+    })
 
 
 class TestFrameworkStructure:
@@ -440,3 +479,148 @@ class TestCacheRoundtrip:
             {"Li": "/tmp/li"}, "criterion 4", reconnect_isolated=False,
         )
         assert loaded is None
+
+
+class TestBuildStructureVoltageRecords:
+    def test_qualify_solid_hashed_excluded_boundary(self):
+        host = _RecNode("mp-host", "Li", 0.0, formula="FePO4")
+        d1 = _RecNode("mp-d1", "Li", 0.2)
+        d2 = _RecNode("mp-d2", "Li", 0.3)
+        d3 = _RecNode("mp-d3", "Li", 0.4)
+        d4 = _RecNode("mp-d4", "Li", 0.5)
+        G = nx.Graph()
+        G.add_edge(host, d1)
+        G.add_edge(host, d2)
+        G.add_edge(host, d3)
+        G.add_edge(host, d4)
+        df = _voltage_df([
+            ("mp-host", "mp-d1", 0.30, 0.91, "(7.0, 8.5)"),  # solid
+            ("mp-host", "mp-d2", 0.32, 0.75, "(7.0, 8.5)"),  # hashed
+            ("mp-host", "mp-d3", 0.34, 0.65, "(7.0, 8.5)"),  # excluded (<0.70)
+            ("mp-host", "mp-d4", 0.36, 0.70, "(7.0, 8.5)"),  # excluded (==0.70)
+        ])
+        rec = build_structure_voltage_records([G], {"Li": df})
+        assert len(rec["components"]) == 1
+        c = rec["components"][0]
+        assert c["route"] == "ion_selective"
+        assert c["n_ions"] == 1
+        assert sorted(m["status"] for m in c["markers"]) == ["hashed", "solid"]
+        assert c["label_key"] == "FePO4\nmp-host"  # empty host (frac 0)
+
+    def test_multi_ion_with_faded_partner(self):
+        li_host = _RecNode("mp-lh", "Li", 0.0, formula="FePO4")
+        li_d = _RecNode("mp-ld", "Li", 0.3)
+        na_host = _RecNode("mp-nh", "Na", 0.05)
+        na_d = _RecNode("mp-nd", "Na", 0.4)
+        G = nx.Graph()
+        G.add_edge(li_host, li_d)       # Li qualifies
+        G.add_edge(na_host, na_d)       # Na non-qualifying -> faded
+        G.add_edge(li_host, na_host)    # diff-ion (shared skeleton)
+        df_dict = {
+            "Li": _voltage_df([("mp-lh", "mp-ld", 0.3, 0.90, "(7.0, 8.5)")]),
+            "Na": _voltage_df([("mp-nh", "mp-nd", 0.2, 0.50, "(7.0, 8.5)")]),
+        }
+        rec = build_structure_voltage_records([G], df_dict)
+        c = rec["components"][0]
+        assert c["route"] == "multi_ion"
+        assert c["n_ions"] == 2
+        by_ion = {m["ion"]: m for m in c["markers"]}
+        assert by_ion["Li"]["status"] == "solid"
+        assert by_ion["Na"]["status"] == "faded"
+        assert by_ion["Na"]["covers_pH"] is True
+        assert c["label_key"] == "FePO4\nmp-lh"  # li_host frac 0 is the min
+
+    def test_label_uses_each_nodes_own_working_ion(self):
+        li_lo = _RecNode("mp-li-lo", "Li", 0.1, formula="HOST")
+        li_hi = _RecNode("mp-li-hi", "Li", 0.5)
+        na_lo = _RecNode("mp-na-lo", "Na", 0.3)
+        na_hi = _RecNode("mp-na-hi", "Na", 0.6)
+        G = nx.Graph()
+        G.add_edge(li_lo, li_hi)
+        G.add_edge(na_lo, na_hi)
+        G.add_edge(li_lo, na_lo)
+        df_dict = {
+            "Li": _voltage_df([("mp-li-lo", "mp-li-hi", 0.3, 0.9, "(7.0, 8.5)")]),
+            "Na": _voltage_df([("mp-na-lo", "mp-na-hi", 0.2, 0.9, "(7.0, 8.5)")]),
+        }
+        rec = build_structure_voltage_records([G], df_dict)
+        # Li node at 0.1 is the true minimum; using one global ion would make
+        # the Na nodes read fraction 0 and wrongly win.
+        assert rec["components"][0]["label_key"] == "HOST\nmp-li-lo"
+
+    def test_label_tiebreak_experimental_then_mpid(self, caplog):
+        li_host = _RecNode("mp-a", "Li", 0.0, is_expt=False, formula="HOST")
+        li_d = _RecNode("mp-li-d", "Li", 0.3)
+        na_host = _RecNode("mp-z", "Na", 0.0, is_expt=True, formula="HOST")
+        na_d = _RecNode("mp-na-d", "Na", 0.3)
+        G = nx.Graph()
+        G.add_edge(li_host, li_d)
+        G.add_edge(na_host, na_d)
+        G.add_edge(li_host, na_host)
+        df_dict = {
+            "Li": _voltage_df([("mp-a", "mp-li-d", 0.3, 0.9, "(7.0, 8.5)")]),
+            "Na": _voltage_df([("mp-z", "mp-na-d", 0.2, 0.9, "(7.0, 8.5)")]),
+        }
+        with caplog.at_level("WARNING"):
+            rec = build_structure_voltage_records([G], df_dict)
+        # Tie at frac 0; experimental mp-z beats theoretical (lower) mp-a.
+        assert rec["components"][0]["label_mpid"] == "mp-z"
+        assert any("tie" in r.message.lower() for r in caplog.records)
+
+    def test_component_dropped_when_none_qualify(self):
+        host = _RecNode("mp-h", "Li", 0.0, formula="X")
+        d = _RecNode("mp-d", "Li", 0.3)
+        G = nx.Graph()
+        G.add_edge(host, d)
+        df = _voltage_df([("mp-h", "mp-d", 0.3, 0.65, "(7.0, 8.5)")])
+        rec = build_structure_voltage_records([G], {"Li": df})
+        assert rec["components"] == []
+
+    def test_nan_area_excluded_and_json_safe(self):
+        host = _RecNode("mp-h", "Li", 0.0, formula="X")
+        good = _RecNode("mp-g", "Li", 0.3)
+        bad = _RecNode("mp-b", "Li", 0.4)
+        G = nx.Graph()
+        G.add_edge(host, good)
+        G.add_edge(host, bad)
+        df = _voltage_df([
+            ("mp-h", "mp-g", 0.3, 0.90, "(7.0, 8.5)"),
+            ("mp-h", "mp-b", 0.3, float("nan"), "(7.0, 8.5)"),
+        ])
+        rec = build_structure_voltage_records([G], {"Li": df})
+        markers = rec["components"][0]["markers"]
+        assert [m["discharged_mpid"] for m in markers] == ["mp-g"]
+        json.dumps(rec, allow_nan=False)  # must not raise
+
+    def test_bad_ph_component_skipped_not_fatal(self):
+        bad_h = _RecNode("mp-bh", "Li", 0.0, formula="BAD")
+        bad_d = _RecNode("mp-bd", "Li", 0.3)
+        g_bad = nx.Graph()
+        g_bad.add_edge(bad_h, bad_d)
+        good_h = _RecNode("mp-gh", "Li", 0.0, formula="GOOD")
+        good_d = _RecNode("mp-gd", "Li", 0.3)
+        g_good = nx.Graph()
+        g_good.add_edge(good_h, good_d)
+        df = _voltage_df([
+            ("mp-bh", "mp-bd", 0.3, 0.9, float("nan")),  # NaN pH -> raises
+            ("mp-gh", "mp-gd", 0.3, 0.9, "(7.0, 8.5)"),
+        ])
+        rec = build_structure_voltage_records([g_bad, g_good], {"Li": df})
+        assert [c["label_key"] for c in rec["components"]] == ["GOOD\nmp-gh"]
+
+    def test_schema_keys_present(self):
+        host = _RecNode("mp-h", "Li", 0.0, formula="X")
+        d = _RecNode("mp-d", "Li", 0.3, is_expt=True)
+        G = nx.Graph()
+        G.add_edge(host, d)
+        df = _voltage_df([("mp-h", "mp-d", 0.3, 0.9, "(7.0, 8.5)")])
+        rec = build_structure_voltage_records([G], {"Li": df})
+        assert rec["schema_version"] == 1
+        assert rec["qualify_area"] == 0.70 and rec["hatch_area"] == 0.80
+        c = rec["components"][0]
+        assert set(c) >= {"component_id", "route", "n_ions", "label_formula",
+                          "label_mpid", "label_key", "markers"}
+        m = c["markers"][0]
+        assert set(m) >= {"ion", "V", "type", "status", "area", "covers_pH",
+                          "charged_mpid", "discharged_mpid"}
+        assert m["type"] == "Experimental"  # discharged is_expt=True

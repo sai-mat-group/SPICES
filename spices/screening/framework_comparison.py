@@ -22,21 +22,13 @@ from collections import defaultdict, deque
 import pandas as pd
 from pymatgen.core import Structure, Element
 
+from spices.config import ION_COLORS  # re-exported for backward compatibility
 from spices.intercalation.structure import DEFAULT_MATCHER
 from spices.plotting import apply_publication_style
 
 apply_publication_style()
 
 logger = logging.getLogger(__name__)
-
-# Ion-specific plot colors
-ION_COLORS = {
-    "Li": "#E24A33",
-    "Na": "#FBC15E",
-    "K": "#988ED5",
-    "Mg": "#348ABD",
-    "Ca": "#8EBA42",
-}
 
 
 # ====================================================================
@@ -410,6 +402,19 @@ def make_networkx_graph(component_indices, all_frameworks, adjacency):
     return G
 
 
+def _charged_discharged(u, v):
+    """Return ``(charged, discharged)`` for an edge.
+
+    The charged (de-intercalated) phase is the one with the *lower* working-ion
+    atomic fraction.  A tie keeps ``u`` as charged for determinism.
+    """
+    u_frac = u.struct.composition.get_atomic_fraction(u.working_ion)
+    v_frac = v.struct.composition.get_atomic_fraction(v.working_ion)
+    if u_frac > v_frac:
+        return v, u
+    return u, v
+
+
 def _get_df_value_for_edge(u, v, df_dict, column_name, criterion=None):
     """Look up a value from the voltage DataFrame for a same-ion edge."""
     working_ion = u.working_ion.symbol
@@ -418,13 +423,7 @@ def _get_df_value_for_edge(u, v, df_dict, column_name, criterion=None):
 
     df = df_dict[working_ion]
 
-    # Determine charged/discharged
-    u_frac = u.struct.composition.get_atomic_fraction(u.working_ion)
-    v_frac = v.struct.composition.get_atomic_fraction(v.working_ion)
-    if u_frac > v_frac:
-        discharged, charged = u, v
-    else:
-        discharged, charged = v, u
+    charged, discharged = _charged_discharged(u, v)
 
     col = column_name
     if criterion is not None:
@@ -509,6 +508,181 @@ def classify_edges(G, df_dict, pH_filter=(7, 8.5),
         "no_voltage": no_voltage,
         "pH_filtered": remaining_pH,
         "pH_area_filtered": pH_area_filtered,
+    }
+
+
+def _most_deintercalated_node(G):
+    """Return the component's most de-intercalated phase.
+
+    The most de-intercalated node has the lowest working-ion atomic fraction
+    (an empty host has fraction 0).  Ties at the minimum (e.g. several empty
+    hosts shared across ions) are broken experimental-first then lowest
+    ``mp_id``; such a tie is rare and is logged as a warning.
+    """
+    def frac(n):
+        return n.struct.composition.get_atomic_fraction(n.working_ion)
+
+    nodes = list(G.nodes)
+    min_frac = min(frac(n) for n in nodes)
+    tied = [n for n in nodes if frac(n) == min_frac]
+    # Only a genuine ambiguity (distinct mp-ids tying at the minimum) changes
+    # the label; a shared empty host loaded once per ion ties at fraction 0 but
+    # resolves to one mp-id, so it is not worth warning about.
+    distinct_mpids = sorted({n.mp_id for n in tied})
+    if len(distinct_mpids) > 1:
+        logger.warning(
+            "Most-de-intercalated label tie at working-ion fraction %.4g "
+            "among distinct phases %s; breaking experimental-first then "
+            "lowest mp-id.", min_frac, distinct_mpids,
+        )
+    return min(tied, key=lambda n: (not n.is_expt, n.mp_id))
+
+
+def _component_voltage_record(component_id, G, df_dict, pH_filter,
+                              metastability_criterion, qualify_area,
+                              hatch_area, ion_order):
+    """Build one component's structure-voltage record, or ``None`` to drop it.
+
+    Drops the component when no same-ion plateau qualifies (covers ``pH_filter``
+    AND area strictly above ``qualify_area``).  See
+    :func:`build_structure_voltage_records`.
+    """
+    ec = classify_edges(
+        G, df_dict, pH_filter, metastability_criterion, min_area_fraction=0.0,
+    )
+    # "covering" = same-ion plateaus covering pH_filter (any area, since the
+    # 0.0 threshold puts every covering edge in pH_area_filtered); "same_ion"
+    # = plateaus that do NOT cover pH_filter. Both carry a voltage row.
+    covering = list(ec["pH_filtered"]) + list(ec["pH_area_filtered"])
+    covering_set = set(covering)
+    all_plateaus = covering + list(ec["same_ion"])
+
+    def _edge_area(u, v):
+        return float(_get_df_value_for_edge(
+            u, v, df_dict, "Total metastability area fraction",
+        ))
+
+    def _make_marker(u, v, status, covers_pH, area):
+        volt = float(_get_df_value_for_edge(u, v, df_dict, "V vs SHE (V)"))
+        if not pd.notna(volt):
+            return None
+        charged, discharged = _charged_discharged(u, v)
+        return {
+            "ion": u.working_ion.symbol,
+            "V": volt,
+            "type": ("Experimental"
+                     if (charged.is_expt or discharged.is_expt)
+                     else "Theoretical"),
+            "status": status,
+            "area": area,
+            "covers_pH": covers_pH,
+            "charged_mpid": charged.mp_id,
+            "discharged_mpid": discharged.mp_id,
+        }
+
+    # --- qualifying markers: cover pH AND area > qualify_area (strict) ---
+    qualifying_markers = []
+    qualifying_ions = set()
+    for u, v in covering:
+        area = _edge_area(u, v)
+        if not (pd.notna(area) and area > qualify_area):
+            continue
+        marker = _make_marker(
+            u, v, "solid" if area >= hatch_area else "hashed", True, area,
+        )
+        if marker is not None:
+            qualifying_markers.append(marker)
+            qualifying_ions.add(marker["ion"])
+
+    if not qualifying_ions:
+        return None
+
+    # --- faded markers: every plateau of a non-qualifying structural ion ---
+    faded_markers = []
+    for u, v in all_plateaus:
+        if u.working_ion.symbol in qualifying_ions:
+            continue
+        area = _edge_area(u, v)
+        if not pd.notna(area):
+            continue
+        marker = _make_marker(u, v, "faded", (u, v) in covering_set, area)
+        if marker is not None:
+            faded_markers.append(marker)
+
+    markers = qualifying_markers + faded_markers
+    markers.sort(key=lambda m: (
+        ion_order.get(m["ion"], len(ion_order)),
+        m["charged_mpid"], m["discharged_mpid"],
+    ))
+
+    structural_ions = {
+        n.working_ion.symbol for n in G.nodes if n.working_ion is not None
+    }
+    n_ions = len(structural_ions)
+    label_node = _most_deintercalated_node(G)
+    label_formula = label_node.struct_reduced_formula
+
+    return {
+        "component_id": component_id,
+        "route": "multi_ion" if n_ions >= 2 else "ion_selective",
+        "n_ions": n_ions,
+        "label_formula": label_formula,
+        "label_mpid": label_node.mp_id,
+        "label_key": f"{label_formula}\n{label_node.mp_id}",
+        "markers": markers,
+    }
+
+
+def build_structure_voltage_records(graphs, df_dict, pH_filter=(7.0, 8.5),
+                                    metastability_criterion=4,
+                                    qualify_area=0.70, hatch_area=0.80):
+    """Derive Stage-5 structure-voltage records from the Stage-4 graph.
+
+    Each connected component is one host skeleton shared by one or more working
+    ions.  Per component:
+
+    * QUALIFYING markers come from same-ion plateau edges that cover
+      ``pH_filter`` AND have ``Total metastability area fraction`` strictly
+      greater than ``qualify_area``.  ``status`` is ``"solid"`` when
+      ``area >= hatch_area`` else ``"hashed"``.
+    * FADED markers come from every plateau of a *structural* ion that has no
+      qualifying edge, tagged ``status="faded"`` with ``area`` and ``covers_pH``
+      so Stage-5 can optionally hide non-pH-covering ones.
+    * Components with no qualifying edge are dropped.
+    * ``n_ions`` is the number of distinct structural working ions; ``route`` is
+      ``"multi_ion"`` when ``n_ions >= 2`` else ``"ion_selective"``.
+    * The column label is the most de-intercalated phase
+      (:func:`_most_deintercalated_node`).
+
+    Returns a JSON-able dict (``schema_version`` 1).  A component whose voltage
+    lookups raise (e.g. a malformed pH cell) is logged and skipped rather than
+    aborting the whole stage.
+    """
+    ion_order = {ion: i for i, ion in enumerate(ION_COLORS)}
+
+    components_out = []
+    for component_id, G in enumerate(graphs):
+        try:
+            record = _component_voltage_record(
+                component_id, G, df_dict, pH_filter,
+                metastability_criterion, qualify_area, hatch_area, ion_order,
+            )
+        except (ValueError, SyntaxError) as exc:
+            logger.warning(
+                "Skipping component %d while building voltage records: %s",
+                component_id, exc,
+            )
+            continue
+        if record is not None:
+            components_out.append(record)
+
+    return {
+        "schema_version": 1,
+        "pH_filter": [float(pH_filter[0]), float(pH_filter[1])],
+        "metastability_criterion": metastability_criterion,
+        "qualify_area": float(qualify_area),
+        "hatch_area": float(hatch_area),
+        "components": components_out,
     }
 
 
@@ -1073,6 +1247,7 @@ def run_framework_comparison(
     pH_range=(7.0, 8.5),
     min_area_fraction=0.80,
     metastability_criterion=4,
+    qualify_area=0.70,
     save_plots=True,
     cache_adjacency=True,
     adj_cache_path=None,
@@ -1108,6 +1283,11 @@ def run_framework_comparison(
     pH_range : tuple of float
     min_area_fraction : float
     metastability_criterion : int
+    qualify_area : float
+        Strict lower bound on the metastability area fraction for a same-ion
+        plateau to be plotted in Stage-5 (default 0.70). Written into
+        ``structure_voltage_records.json`` together with ``hatch_area``
+        (= ``min_area_fraction``), which sets the solid/hatched split.
     save_plots : bool
     cache_adjacency : bool
     adj_cache_path : str or None
@@ -1240,6 +1420,26 @@ def run_framework_comparison(
         for comp in components
     ]
 
+    # --- Structure-voltage records (the source of the Stage-5 figures) ---
+    # Written BEFORE save_graph_figures so a render-time failure (e.g. the
+    # multi-formula assertion there) cannot leave Stage-5 without its data,
+    # and BEFORE the rerender_plots early-return so --rerender-plots refreshes
+    # it cheaply from cache.
+    records = build_structure_voltage_records(
+        graphs, df_dict,
+        pH_filter=pH_range,
+        metastability_criterion=metastability_criterion,
+        qualify_area=qualify_area,
+        hatch_area=min_area_fraction,
+    )
+    records_path = os.path.join(output_dir, "structure_voltage_records.json")
+    with open(records_path, "w") as fh:
+        json.dump(records, fh, indent=2, allow_nan=False)
+    logger.info(
+        "Wrote %d structure-voltage component records to %s",
+        len(records["components"]), records_path,
+    )
+
     if save_plots:
         graph_dir = os.path.join(output_dir, "All_graphs")
         save_graph_figures(
@@ -1257,6 +1457,11 @@ def run_framework_comparison(
         return {}
 
     # --- Per-ion Excel partition (graph-component-based) ---
+    # NOTE: these only_{ion}/multiple_ions sheets are now a RAW DATA EXPORT
+    # only. They are NOT the source of the Stage-5 structure-voltage figures,
+    # which are driven by structure_voltage_records.json (written above) and
+    # use a different (structural) routing. The two may therefore disagree.
+    # TODO: delete this per-ion Excel partition once confirmed unused.
     # For each component, record which ions appear in it. An ion's mp_id
     # is "multi-ion" iff its component contains nodes from another ion.
     multi_ion_mpids_per_element = {ion: set() for ion in elements}

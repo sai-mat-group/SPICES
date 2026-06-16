@@ -15,6 +15,15 @@ math required.
 import matplotlib as mpl
 
 
+# Figure-size constants (inches). Journal columns: single = 89 mm, double =
+# 183 mm. ``SINGLE_PANEL_HEIGHT`` is the de-facto height paired with the
+# single-column width across SPICES modules. Compose multi-panel sizes from
+# these (e.g. ``(0.7 * SINGLE_COL_WIDTH, 2 * SINGLE_PANEL_HEIGHT)``).
+SINGLE_COL_WIDTH = 3.5
+DOUBLE_COL_WIDTH = 7.2
+SINGLE_PANEL_HEIGHT = 2.6
+
+
 _APPLIED = False
 
 

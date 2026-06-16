@@ -85,6 +85,17 @@ def main():
         help="Minimum metastability area fraction (default: 0.80)",
     )
     parser.add_argument(
+        "--qualify-area",
+        type=float,
+        default=0.70,
+        help=(
+            "Strict lower bound on area fraction for a plateau to appear in "
+            "the Stage-5 structure-voltage figures (default: 0.70). Plateaus "
+            "with area in (qualify-area, min-area) are hatched; >= min-area "
+            "are solid. Written into structure_voltage_records.json."
+        ),
+    )
+    parser.add_argument(
         "--no-plots",
         action="store_true",
         help="Skip saving graph PNGs",
@@ -155,6 +166,7 @@ def main():
         sheet_name=args.sheet_name,
         metastability_criterion=args.criterion,
         min_area_fraction=args.min_area,
+        qualify_area=args.qualify_area,
         save_plots=not args.no_plots,
         adj_cache_path=args.adj_cache,
         reconnect_isolated=args.reconnect_isolated,

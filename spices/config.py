@@ -26,6 +26,15 @@ DEFAULT_ANIONS = ["O", "S", "Se", "F", "Cl", "Br", "I", "P", "N", "C", "Si"]
 # Supported working ion elements
 SUPPORTED_ELEMENTS = ["Ca", "K", "Li", "Mg", "Na"]
 
+# Ion-specific plot colors (used by the Stage 4 and Stage 5 figures)
+ION_COLORS = {
+    "Li": "#E24A33",
+    "Na": "#FBC15E",
+    "K": "#988ED5",
+    "Mg": "#348ABD",
+    "Ca": "#8EBA42",
+}
+
 # Default decomposition energy threshold (eV) for metastability
 DEFAULT_DECOMP_ENERGY_THRESHOLD = 0.5
 

@@ -13,7 +13,7 @@ SPICES implements a 6-stage computational pipeline (Stages 0--5) for identifying
 2. **Seawater filter** -- Evaluate stability under seawater ionic conditions (accepts Stage 0 or Stage 1 output)
 3. **Intercalation voltage filter** -- Filter by electrochemical voltage profiles
 4. **Framework comparison** -- Compare material frameworks across different working ions (Ca, K, Li, Mg, Na)
-5. **Statistical analysis** -- Generate aggregate statistics, Venn diagrams, and publication-ready figures
+5. **Statistical analysis** -- Aggregate per-ion counts into a summary table and publication figures: a per-ion pipeline bar chart, per-ion filter funnels (nested area-proportional circles, not true Venn diagrams), the screened periodic table, and the ion-selective + multi-ion structure-voltage plots
 
 ### XC functional restriction
 
@@ -127,8 +127,10 @@ combined = run_intercalation_screening(
 
 # Stage 4: Compare frameworks across working ions.  The graph is built ONCE
 # over every ion in stage3_dirs; `elements` only restricts the per-ion Excel
-# output (default None → all ions present).  Set-based comparison (Venn diagrams,
-# voltage overlays) is a separate entry point, run_set_based_comparison.
+# output (default None → all ions present).  It also writes
+# structure_voltage_records.json — the graph-derived single/multi-ion selection
+# that drives the Stage 5 structure-voltage figures.  Set-based comparison (Venn
+# diagrams, voltage overlays) is a separate entry point, run_set_based_comparison.
 from spices.screening.framework_comparison import run_framework_comparison
 
 stage3_dirs = {e: f"{e}_intercalation/" for e in ["Ca", "K", "Li", "Mg", "Na"]}
@@ -263,7 +265,7 @@ For multi-worker runs against the snapshot backend, export `SPICES_MP_BACKEND=sn
 
 * **`--restart`** (Stage 2) resumes an interrupted run.  In Phase 1, only chemsys/sea-comp keys whose Pourbaix pickle is missing from disk are re-dispatched — if 8000 of 10000 unique diagrams already exist, the remaining 2000 are split across all workers.  In Phase 2, only rows whose `Seawater stability` is still NaN are re-evaluated, with checkpoint files from `runtime_sheets/` and `{element}_evaluated_backup.xlsx` merged in.
 * **`--restart`** (Stage 3) resumes an interrupted intercalation run.  Sub-step 2 resumes from per-row checkpoints in `runtime_sheets/`.  Sub-step 3 skips a composition whose `Voltage_plateau_data/{composition}/sc_{N}/{composition}.xlsx` already exists for every requested selection criterion; partial compositions are re-built from the on-disk adjacency cache (`{output_dir}/adjacency_cache/{composition}.pkl`), so the O(n²) `StructureMatcher` work is paid only once.
-* **Stage 4 framework cache** — `run_framework_comparison` bundles the loaded framework pool *and* the O(n²) cross-element `StructureMatcher` adjacency into a single pickle (`{output_dir}/step4_cache.pkl`, or `step4_cache_reconnected.pkl` with `--reconnect-isolated`) plus a `.meta.json` sidecar.  Every run validates the sidecar (schema version, Stage-3 ion dirs and their order, sheet name, reconnect flag, and the full mp-id list); any mismatch — or a truncated / corrupt pickle caught while unpickling — is treated as a cache miss and rebuilt, so a kill mid-write is self-healing on the next run even though the Stage 4 write is *not* atomic (unlike the Stage 2/3 PID-temp + `os.replace` pattern).  `--rerender-plots` requires a valid cache and re-draws only the PNGs, skipping the framework load, the O(n²) build, and the per-ion Excel writes; `--force-rebuild` ignores any existing cache and rebuilds from scratch.  Stage 4 is otherwise single-process, and Stage 5 has no cache or restart path.
+* **Stage 4 framework cache** — `run_framework_comparison` bundles the loaded framework pool *and* the O(n²) cross-element `StructureMatcher` adjacency into a single pickle (`{output_dir}/step4_cache.pkl`, or `step4_cache_reconnected.pkl` with `--reconnect-isolated`) plus a `.meta.json` sidecar.  Every run validates the sidecar (schema version, Stage-3 ion dirs and their order, sheet name, reconnect flag, and the full mp-id list); any mismatch — or a truncated / corrupt pickle caught while unpickling — is treated as a cache miss and rebuilt, so a kill mid-write is self-healing on the next run even though the Stage 4 write is *not* atomic (unlike the Stage 2/3 PID-temp + `os.replace` pattern).  `--rerender-plots` requires a valid cache and re-draws the PNGs *and* refreshes `structure_voltage_records.json` (the Stage-5 figure data), skipping the framework load, the O(n²) build, and the per-ion Excel writes; `--force-rebuild` ignores any existing cache and rebuilds from scratch.  Stage 4 is otherwise single-process, and Stage 5 has no cache or restart path.
 * **Hard guard on `restart=False`** — if the Stage 2 output xlsx already contains evaluated rows and `--restart` is *not* passed, the run aborts with a clear error rather than silently overwriting prior progress.  Pass `--restart` to resume, or delete the file to start over.
 * **Atomic final write** — the output xlsx is written via `to_excel(<tmp>); os.replace(<tmp>, <final>)`.  A kill mid-write leaves either the previous file or the new one, never a corrupt half-written xlsx.  `runtime_sheets/` is cleaned up only after `os.replace` succeeds.  Stage 3's adjacency pickles use the same PID-tagged temp + `os.replace` pattern so two workers can never leave a truncated pickle on disk.
 * **Honest worker-death diagnostics** — when one worker dies, `ProcessPoolExecutor` cancels every pending future and each cancellation surfaces as `BrokenProcessPool`.  Stage 2 distinguishes the *first* (root-cause) failure from subsequent cascade cancellations in the log, then runs a post-mortem scan of `dmesg -T` and `journalctl --user` so the user can tell apart a real OOM (kernel SIGKILL of `python`), a SLURM cgroup time-limit kill, and a process-internal exception.  Stage 3's sub-step 3 dispatcher aborts on the first per-composition worker exception so partial-state corruption cannot accrete silently — re-run with `--restart` to resume.
@@ -299,6 +301,18 @@ python scripts/run_framework_comparison.py --stage3-dir ./intercalation_results/
 
 # Stage 4: set-based comparison (separate script — Venn diagrams + voltage overlays)
 python scripts/run_framework_set_comparison.py --stage3-dir ./intercalation_results/
+
+# Stage 5: aggregate statistics + publication figures (all 5 ions)
+python scripts/run_statistics.py \
+    --stage2-dir ./2.Seawater-metastability \
+    --stage3-dir ./3.Intercalation-voltage-filter \
+    --stage4-dir ./4.compare_frameworks \
+    -o ./statistics_output --criterion 4
+# (--stage4-dir is optional; it enables the structure-voltage figures, which read
+#  <stage4-dir>/structure_voltage_records.json written by Stage 4 — pass
+#  --stage4-records to point at that JSON explicitly.  --faded-partner-plateaus
+#  {all,ph_covering} sets which faded partner-ion markers appear in the multi-ion
+#  plot; --bar-color-by {stage,ion}, --no-periodic-table, --criterion N too.)
 
 # HPC submission (edit the templates first)
 sbatch scripts/submit_seawater.sh
