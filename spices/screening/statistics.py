@@ -33,8 +33,7 @@ from spices.config import (
     SUPPORTED_ELEMENTS,
 )
 from spices.plotting import (
-    SINGLE_COL_WIDTH,
-    SINGLE_PANEL_HEIGHT,
+    DOUBLE_COL_WIDTH,
     apply_publication_style,
 )
 
@@ -522,7 +521,7 @@ PIPELINE_BAR_ION_ORDER = ["Li", "Mg", "Ca", "Na", "K"]
 def plot_pipeline_bar_chart(
     stage_data,
     save_path=None,
-    figsize=(0.8 * SINGLE_COL_WIDTH, 2 * SINGLE_PANEL_HEIGHT),
+    figsize=(0.35 * DOUBLE_COL_WIDTH, 110 / 25.4),
     color_by="stage",
     yscale="log",
 ):
@@ -536,8 +535,8 @@ def plot_pipeline_bar_chart(
     save_path : str or None
         Output path; the format follows the extension (``.pdf`` -> vector).
     figsize : tuple
-        Default = panel-b size (0.8 * single-col width, 2 * single-panel
-        height) = (2.8, 5.2) in: a tall narrow panel.
+        Default = panel-b size (0.35 * double-col width wide, 110 mm tall)
+        = (2.36, 4.33) in: a tall narrow panel.
     color_by : {"stage", "ion"}
         ``"stage"`` (default): one consistent color per stage from
         ``PIPELINE_BAR_COLORS`` (cyan, violet, yellow); legend maps
@@ -716,7 +715,7 @@ def plot_periodic_table(
     transition_metals=None,
     anions=None,
     save_path=None,
-    figsize=(1.2 * SINGLE_COL_WIDTH, 1.2 * SINGLE_COL_WIDTH * 8 / 18),
+    figsize=(0.7 * DOUBLE_COL_WIDTH, 0.7 * DOUBLE_COL_WIDTH * 8 / 18),
 ):
     """
     Periodic table highlighting the screened transition-metal and anion
@@ -765,7 +764,7 @@ def plot_periodic_table(
     # a small ``gap`` keeps that inter-box white hairline-thin. The number is
     # tucked into the far top-left corner (small, non-bold) and the symbol is
     # nudged just below centre so the two never crowd each other.
-    gap, radius, margin = 0.01, 0.12, 0.13  # cell inset / corner radius / number inset
+    gap, radius, margin = 0.005, 0.12, 0.13  # cell inset / corner radius / number inset
     side = 1 - gap
     sym_dy = 0.08  # drop symbol slightly below cell centre
     for num, sym, name, mass, row, col in _PERIODIC_TABLE_ELEMENTS:

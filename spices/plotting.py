@@ -6,8 +6,8 @@ Sans-serif (Helvetica), 6-7 pt in-figure text, fonts embedded in PDF/EPS.
 Each plotting module in SPICES imports and calls
 :func:`apply_publication_style` at module load. Calls are idempotent.
 
-figsize convention (assume single-column 89 mm = 3.5 in, double-column
-183 mm = 7.2 in): the modules render at publication figsize directly, so
+figsize convention (single-column 83 mm = 3.27 in, double-column
+171 mm = 6.73 in): the modules render at publication figsize directly, so
 matplotlib point sizes equal printed point sizes — no post-export scaling
 math required.
 """
@@ -15,13 +15,17 @@ math required.
 import matplotlib as mpl
 
 
-# Figure-size constants (inches). Journal columns: single = 89 mm, double =
-# 183 mm. ``SINGLE_PANEL_HEIGHT`` is the de-facto height paired with the
-# single-column width across SPICES modules. Compose multi-panel sizes from
-# these (e.g. ``(0.7 * SINGLE_COL_WIDTH, 2 * SINGLE_PANEL_HEIGHT)``).
-SINGLE_COL_WIDTH = 3.5
-DOUBLE_COL_WIDTH = 7.2
-SINGLE_PANEL_HEIGHT = 2.6
+# Figure-size constants (inches). Journal columns: single = 83 mm, double =
+# 171 mm. Compose multi-panel sizes from these (e.g. a panel at
+# ``(0.35 * DOUBLE_COL_WIDTH, 110 / 25.4)``).
+SINGLE_COL_WIDTH = 83 / 25.4   # 3.27 in (83 mm)
+DOUBLE_COL_WIDTH = 171 / 25.4  # 6.73 in (171 mm)
+
+# Figure-3 panel geometry: half the double column, 6:4.5 aspect (width:height).
+# Single source of truth shared by additional_plots/figure_3_pbx.py (panel a) and
+# figure_3_metastability.py (panel b) so the two panels are exactly the same height.
+HALF_DOUBLE_COL_WIDTH = 0.5 * DOUBLE_COL_WIDTH              # ~3.37 in
+HALF_DOUBLE_COL_HEIGHT = HALF_DOUBLE_COL_WIDTH * 4.5 / 6.0  # ~2.52 in
 
 
 _APPLIED = False

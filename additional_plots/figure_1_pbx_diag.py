@@ -4,26 +4,30 @@ SPICES additional figure: Figure 1 panels c & d -- Li-Fe-P Pourbaix diagrams.
 
 These two panels convey the scientific reasoning of the workflow (they are not
 derived from the step-5 statistics): they show how Li-Fe-P phase stability shifts
-with the aqueous ion concentration.
+with the aqueous ion concentration. They are drawn together as one double panel
+(c left, d right) whose total width is 1.4x the single-column width.
 
 Panel c: composition Li:Fe:P = 1:1:1, aqueous concentrations Li = 0.75,
          Fe = 0.25, P = 0.33. The region where LiFePO4 is stable is filled violet
-         and labelled "LiFePO4(s)"; every other region is white and unlabelled
-         (to avoid clutter).
+         and labelled "LiFePO4(s)". Only this region is bordered; every other
+         region is white, unlabelled and borderless (to avoid clutter).
 Panel d: same composition at the dilute limit (all concentrations = 1e-6).
-         LiFePO4 is no longer stable; the analogous region around the operating
-         point (pH 8, -0.4 V vs SHE) is filled the same violet and labelled with
-         whatever phase(s) are stable there.
+         LiFePO4 is no longer stable: the footprint it occupied in panel c is now
+         tiled by several coexisting assemblages. That footprint is subdivided,
+         each sub-region filled a distinct muted colour and bordered, and every
+         sub-region is labelled -- entirely within the axes box -- with the
+         phase(s) stable there, using non-crossing leader arrows that fan out to
+         the top, left and bottom margins of the plot.
 
-Both panels use the SPICES publication style and are written as vector PDFs for
+The figure uses the SPICES publication style and is written as a vector PDF for
 assembly in Inkscape. Pourbaix entries are sourced from the cached MP 2025
 snapshot via :func:`spices.mp_client.get_client` (set ``SPICES_MP_BACKEND=snapshot``
 and ``SPICES_MP_SNAPSHOT_ROOT``), reusing the on-disk :class:`PourbaixCache`.
 
-The base diagram (white domains, black boundaries, dark-red water lines) is drawn
-by the shared :class:`CustomPourbaixPlotter`; the exact-violet highlight and the
-single-region label are painted on top here, so the shared plotter -- which other
-figures rely on -- stays untouched.
+The base diagram (white domains, dark-red water lines) is drawn by the shared
+:class:`CustomPourbaixPlotter` with white domain borders, so the shared plotter --
+which other figures rely on -- stays untouched; the violet highlight (panel c),
+the footprint subdivision (panel d) and all labels are painted on top here.
 
 Reproduces 3rd_Iteration/5.Calculating_statistics/pourbaix-diagram-plots/
 LFPO-pbx-2.png (panel c) and LFPO-pbx-1.png (panel d), re-styled for publication.
@@ -31,16 +35,21 @@ LFPO-pbx-2.png (panel c) and LFPO-pbx-1.png (panel d), re-styled for publication
 
 import argparse
 import logging
+import math
 import os
 import re
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.font_manager import FontProperties
+from matplotlib.ticker import MultipleLocator
 from pymatgen.analysis.pourbaix_diagram import PourbaixDiagram, MultiEntry
+from shapely import make_valid
+from shapely.geometry import Polygon, box
 
 from spices.io import setup_logging
 from spices.mp_client import get_client
-from spices.plotting import apply_publication_style, SINGLE_COL_WIDTH
+from spices.plotting import apply_publication_style, SINGLE_COL_WIDTH, DOUBLE_COL_WIDTH
 from spices.pourbaix.cache import PourbaixCache
 from spices.pourbaix.plotting import CustomPourbaixPlotter
 
@@ -55,14 +64,45 @@ HIGHLIGHT_COLOR = "#6b6ecf"
 WATER_LINE_COLOR = "#931621"  # dark red, as in the original LFPO-pbx notebooks
 DOMAIN_COLOR = "white"
 
+# Panel d: one muted, distinguishable colour per sub-region (largest first).
+# Curated Tableau-muted hues, deliberately excluding any blue-violet so they do
+# not read as panel c's "LiFePO4 stable" violet. Edit freely; cycles if there
+# are ever more sub-regions than colours.
+PALETTE_D = [
+    "#4e79a7",  # blue
+    "#f28e2b",  # orange
+    "#59a14f",  # green
+    "#e15759",  # red
+    "#76b7b2",  # teal
+    "#edc948",  # yellow
+    "#ff9da7",  # salmon
+    "#9c755f",  # brown
+    "#bab0ac",  # warm grey
+    "#8cd17d",  # light green
+    "#86bcb6",  # light teal
+    "#d37295",  # rose
+]
+
 CHEMSYS = "Li-Fe-P"
 COMP_DICT = {"Li": 1, "Fe": 1, "P": 1}
 CONC_DICT_C = {"Li": 0.75, "Fe": 0.25, "P": 0.33}  # panel c
 CONC_DICT_D = {"Li": 1e-6, "Fe": 1e-6, "P": 1e-6}  # panel d (dilute limit)
 
 LIMITS = ((0, 14), (-1.5, 1.5))
-REF_PH, REF_V = 8.0, -0.4  # operating point that selects the highlighted region
+REF_PH, REF_V = 8.0, -0.4  # operating point that selects the LiFePO4 region
 PANEL_C_LABEL = "LiFePO4(s)"
+
+FIG_WIDTH = 0.65 * DOUBLE_COL_WIDTH  # total width of the c+d double panel (in.)
+FIG_HEIGHT = 2.6                     # in.; square-ish boxes leave room for labels
+LABEL_FONTSIZE_D = 3.8          # pt; small so all 12 in-box labels stay legible
+SUBREGION_BORDER_WIDTH = 0.3    # pt; per sub-region outline (panel d)
+FOOTPRINT_BORDER_WIDTH = 0.6    # pt; outer LiFePO4 footprint outline (panel d)
+AREA_TOL = 1e-4                 # ignore numerically-empty clip remnants
+
+
+def _label_fontprops(size):
+    """Helvetica Light :class:`FontProperties` at ``size`` pt (stable-phase labels)."""
+    return FontProperties(family="Helvetica", weight="light", size=size)
 
 
 def _subscript_formula(text):
@@ -108,6 +148,26 @@ def _entry_phase_label(entry):
     return " + ".join(_entry_latex(e) for e in subentries)
 
 
+def _polygon_parts(geom):
+    """Yield the exterior coordinate array (Nx2) of each polygonal part of ``geom``.
+
+    A shapely clip can return a Polygon, MultiPolygon, or GeometryCollection;
+    non-areal parts (lines/points from edge-touching clips) are skipped. The
+    Pourbaix sub-regions are convex with no holes, so interior rings are ignored.
+    """
+    if geom.is_empty:
+        return
+    if geom.geom_type == "Polygon":
+        geoms = [geom]
+    elif geom.geom_type in ("MultiPolygon", "GeometryCollection"):
+        geoms = list(geom.geoms)
+    else:
+        geoms = []
+    for g in geoms:
+        if g.geom_type == "Polygon" and not g.is_empty:
+            yield np.asarray(g.exterior.coords)
+
+
 def load_lfp_entries(mp_client, cache_dir="."):
     """Read-or-download the Li-Fe-P PourbaixEntry list from the on-disk cache."""
     cache = PourbaixCache(
@@ -122,37 +182,13 @@ def build_diagram(entries, conc_dict):
     return PourbaixDiagram(entries, comp_dict=COMP_DICT, conc_dict=conc_dict)
 
 
-def plot_panel(diagram, out_path, label_text=None, panel_width=None,
-               ref_ph=REF_PH, ref_v=REF_V, limits=LIMITS):
-    """Render one Pourbaix panel and save it as a vector PDF.
+def _render_base(diagram, ax, limits):
+    """Draw the shared white-domain / dark-red-water-line base diagram and re-style.
 
-    Parameters
-    ----------
-    diagram : PourbaixDiagram
-    out_path : str
-        Destination PDF path.
-    label_text : str or None
-        Literal label for the highlighted region (panel c). If ``None``, the
-        label is derived from the phase(s) stable at ``(ref_ph, ref_v)`` (panel d).
-    panel_width : float or None
-        Figure width in inches (default ``SINGLE_COL_WIDTH``); height = width * 2/3.
-    ref_ph, ref_v : float
-        Operating point selecting the region to highlight.
-    limits : ((xlo, xhi), (ylo, yhi))
-
-    Returns
-    -------
-    matplotlib.figure.Figure
+    Domain borders are drawn in the fill colour (white) so the base contributes
+    no visible boundaries -- the panels add their own borders only where wanted.
+    Water lines are a separate code path and stay dark red.
     """
-    apply_publication_style()
-
-    width = panel_width or SINGLE_COL_WIDTH
-    fig, ax = plt.subplots(figsize=(width, width * 2 / 3))
-
-    # Base diagram: all domains white, no labels, dark-red water lines, no
-    # neutral axes. highlight_entry stays None -- we overpaint the highlight
-    # ourselves at full opacity so the colour matches #6b6ecf exactly (the
-    # plotter fills domains at alpha=0.5, which would wash the hex out).
     plotter = CustomPourbaixPlotter(diagram)
     plotter.get_pourbaix_plot(
         limits=limits,
@@ -162,44 +198,196 @@ def plot_panel(diagram, out_path, label_text=None, panel_width=None,
         show_neutral_axes=False,
         highlight_entry=None,
         domain_color=DOMAIN_COLOR,
-        domain_boundary_color="black",
+        domain_boundary_color=DOMAIN_COLOR,   # white -> base borders invisible
         water_line_color=WATER_LINE_COLOR,
         domain_boundary_width=0.4,
         spine_width=0.8,
         separate_colours_for_ions_and_solids=False,
     )
+    _restyle_axes(ax, limits)
 
-    # Highlight the region containing the operating point, in exact violet.
-    # get_stable_entry returns an object that is a key of _stable_domain_vertices
-    # (both are built together in PourbaixDiagram.__init__), so the lookup is
-    # identity-safe.
-    highlight = diagram.get_stable_entry(ref_ph, ref_v)
-    verts = np.asarray(diagram._stable_domain_vertices[highlight])
-    closed = np.vstack([verts, verts[0]])
-    ax.fill(closed[:, 0], closed[:, 1], color=HIGHLIGHT_COLOR, alpha=1.0,
-            zorder=2)
-    ax.plot(closed[:, 0], closed[:, 1], color="black", linewidth=0.4, zorder=3)
 
-    # Label ONLY the highlighted region.
-    text = _subscript_formula(label_text) if label_text else \
-        _entry_phase_label(highlight)
-    center = verts.mean(axis=0)
-    ax.annotate(text, center, ha="center", va="center",
-                fontsize=plt.rcParams["axes.labelsize"], zorder=4)
+def _restyle_axes(ax, limits):
+    """Override the plotter's hardcoded 20 pt labels / thick ticks with SPICES style.
 
-    # Re-apply the publication style: get_pourbaix_plot hardcodes 20 pt axis
-    # labels / bold title / thick inward ticks, which override apply_publication_style.
+    Top/right tick marks are removed (the box spines stay).
+    """
     ax.set_title("")
     ax.set_xlabel("pH", fontsize=plt.rcParams["axes.labelsize"])
     ax.set_ylabel("Applied potential (V vs SHE)",
                   fontsize=plt.rcParams["axes.labelsize"])
     ax.tick_params(axis="both", which="both", direction="in", length=3,
-                   width=0.8, top=True, right=True,
+                   width=0.8, top=False, right=False,
                    labelsize=plt.rcParams["xtick.labelsize"])
     for spine in ax.spines.values():
         spine.set_linewidth(0.8)
+    ax.xaxis.set_major_locator(MultipleLocator(2))  # pH ticks 0,2,4,...,14
     ax.set_xlim(limits[0])
     ax.set_ylim(limits[1])
+
+
+def render_panel_c(ax, diagram, label_text=PANEL_C_LABEL,
+                   ref_ph=REF_PH, ref_v=REF_V, limits=LIMITS):
+    """Draw panel c (LiFePO4 stable region highlighted violet) into ``ax``."""
+    _render_base(diagram, ax, limits)
+
+    # Highlight the LiFePO4 region in exact violet at full opacity (the base
+    # fills domains at alpha 0.5, which would wash the hex out). get_stable_entry
+    # returns an object that is a key of _stable_domain_vertices, so the lookup is
+    # identity-safe.
+    highlight = diagram.get_stable_entry(ref_ph, ref_v)
+    verts = np.asarray(diagram._stable_domain_vertices[highlight])
+    closed = np.vstack([verts, verts[0]])
+    ax.fill(closed[:, 0], closed[:, 1], color=HIGHLIGHT_COLOR, alpha=1.0, zorder=2)
+    ax.plot(closed[:, 0], closed[:, 1], color="black", linewidth=0.4, zorder=3)
+
+    # Label ONLY the highlighted region, in Helvetica Light.
+    text = _subscript_formula(label_text) if label_text else \
+        _entry_phase_label(highlight)
+    ax.annotate(text, verts.mean(axis=0), ha="center", va="center",
+                fontproperties=_label_fontprops(plt.rcParams["axes.labelsize"]),
+                zorder=4)
+
+
+def _footprint(pbx_c, ref_ph, ref_v, limits):
+    """The LiFePO4 stability polygon from panel c, clipped to the plot box."""
+    lfp = pbx_c.get_stable_entry(ref_ph, ref_v)
+    (xlo, xhi), (ylo, yhi) = limits
+    poly = make_valid(Polygon(np.asarray(pbx_c._stable_domain_vertices[lfp])))
+    return poly.intersection(box(xlo, ylo, xhi, yhi))
+
+
+def _subdivide(pbx_d, foot):
+    """Sub-regions tiling ``foot`` at the dilute limit, as ``(entry, geom)`` largest-first."""
+    regions = []
+    for entry, verts in pbx_d._stable_domain_vertices.items():
+        sub = foot.intersection(make_valid(Polygon(np.asarray(verts))))
+        if sub.area > AREA_TOL:
+            regions.append((entry, sub))
+    regions.sort(key=lambda es: es[1].area, reverse=True)
+    return regions
+
+
+def _strip_math(text):
+    """Approximate visible character count of a mathtext label (drop $ _ ^ { } \\)."""
+    return re.sub(r"[\${}^_\\]", "", text)
+
+
+def _place_inside_labels(ax, regions, foot, limits, fontsize):
+    """Label every sub-region with non-crossing leaders, all inside the axes box.
+
+    The footprint is a thin wedge: a dense cluster of small regions on the left
+    and a few regions at the right tip. Regions left of the footprint centroid
+    are labelled on the left (a vertical stack that the left white strip holds
+    without overlap, arrows pointing right). The remaining right-tip regions --
+    too close in pH for side-by-side labels -- are sent to the top or bottom
+    white area (by whether they sit above or below the centroid) and greedily
+    stacked into rows near their own pH so the wide labels never collide; their
+    arrows are near-vertical. Left labels live in the pH < footprint zone and
+    top/bottom labels in the pH >= centroid zone, so the two fans never cross.
+    """
+    (xlo, xhi), (ylo, yhi) = limits
+    mx = 0.03 * (xhi - xlo)
+    my = 0.05 * (yhi - ylo)
+    x0, y0, x1, y1 = xlo + mx, ylo + my, xhi - mx, yhi - my
+    fc = foot.centroid
+    fontprops = _label_fontprops(fontsize)
+    char_ph = 0.20 * (fontsize / 4.0)   # approx label width per character, in pH
+    row_gap = 0.05 * (yhi - ylo)
+    gap_ph = 0.02 * (xhi - xlo)
+
+    def emit(entry, target, anchor, ha, va):
+        ax.annotate(_entry_phase_label(entry), xy=target, xycoords="data",
+                    xytext=anchor, textcoords="data", ha=ha, va=va,
+                    fontproperties=fontprops, annotation_clip=True, zorder=5,
+                    arrowprops=dict(arrowstyle="->", lw=0.4, color="0.35",
+                                    shrinkA=2, shrinkB=2, mutation_scale=4))
+
+    # Only the leftmost tight pH column goes to the left strip; the rest (central
+    # and right-tip regions) go to the top/bottom white areas, split by their own
+    # median V so both are used. Keeping the left set to a narrow pH column makes
+    # its near-horizontal leaders genuinely non-crossing.
+    fxmin, _, fxmax, _ = foot.bounds
+    left_cut = fxmin + 0.22 * (fxmax - fxmin)
+    left = [(entry, sub.centroid) for entry, sub in regions if sub.centroid.x < left_cut]
+    rest = [(entry, sub.centroid) for entry, sub in regions if sub.centroid.x >= left_cut]
+    top, bottom = [], []
+    if rest:
+        v_sorted = sorted(c.y for _, c in rest)
+        v_split = v_sorted[len(v_sorted) // 2]   # upper half -> top, lower -> bottom
+        top = [(e, c) for e, c in rest if c.y >= v_split]
+        bottom = [(e, c) for e, c in rest if c.y < v_split]
+
+    # Left: stack just left of the cluster (small Δx => sorting by V cannot cross),
+    # text reading leftward into the white strip.
+    x_left = max(x0, fxmin - 0.3)
+    left.sort(key=lambda ec: ec[1].y)
+    for i, (entry, c) in enumerate(left):
+        emit(entry, (c.x, c.y), (x_left, y0 + (i + 0.5) / len(left) * (y1 - y0)),
+             "right", "center")
+
+    # Top / bottom: greedy row-stacking near each region's pH, near-vertical arrows.
+    def place_rows(group, y_base, y_dir, va):
+        group.sort(key=lambda ec: ec[1].x)
+        row_right = []   # right extent (pH) of the last label placed in each row
+        for entry, c in group:
+            half = 0.5 * len(_strip_math(_entry_phase_label(entry))) * char_ph
+            lx = min(max(c.x, x0 + half), x1 - half)   # keep the label inside box
+            row = next((r for r, rx in enumerate(row_right)
+                        if lx - half >= rx + gap_ph), len(row_right))
+            if row == len(row_right):
+                row_right.append(lx + half)
+            else:
+                row_right[row] = lx + half
+            emit(entry, (c.x, c.y), (lx, y_base + y_dir * row * row_gap), "center", va)
+
+    place_rows(top, y1, -1, "top")
+    place_rows(bottom, y0, +1, "bottom")
+
+
+def render_panel_d(ax, pbx_d, pbx_c, ref_ph=REF_PH, ref_v=REF_V, limits=LIMITS,
+                   label_fontsize=LABEL_FONTSIZE_D):
+    """Draw panel d (LiFePO4 footprint subdivided at the dilute limit) into ``ax``.
+
+    The polygon LiFePO4 occupies in panel c is overlaid on the dilute-limit
+    diagram and split into the assemblages stable within it; each sub-region is
+    filled a distinct muted colour, bordered, and labelled inside the box.
+    """
+    _render_base(pbx_d, ax, limits)
+
+    foot = _footprint(pbx_c, ref_ph, ref_v, limits)
+    regions = _subdivide(pbx_d, foot)
+    logger.info("Panel d: %d sub-regions tile the LiFePO4 footprint", len(regions))
+
+    # Fill + border each sub-region in its own muted colour.
+    for i, (entry, sub) in enumerate(regions):
+        color = PALETTE_D[i % len(PALETTE_D)]
+        for ring in _polygon_parts(sub):
+            ax.fill(ring[:, 0], ring[:, 1], color=color, alpha=1.0, zorder=2)
+            ax.plot(ring[:, 0], ring[:, 1], color="black",
+                    linewidth=SUBREGION_BORDER_WIDTH, zorder=3)
+
+    # Outline the whole footprint to echo panel c's LiFePO4 boundary.
+    for ring in _polygon_parts(foot):
+        ax.plot(ring[:, 0], ring[:, 1], color="black",
+                linewidth=FOOTPRINT_BORDER_WIDTH, zorder=4)
+
+    _place_inside_labels(ax, regions, foot, limits, label_fontsize)
+
+
+def plot_figure(pbx_c, pbx_d, out_path, fig_width=FIG_WIDTH, fig_height=FIG_HEIGHT,
+                ref_ph=REF_PH, ref_v=REF_V, limits=LIMITS,
+                label_fontsize=LABEL_FONTSIZE_D):
+    """Render the c+d double panel as one vector PDF (total width ``fig_width``)."""
+    apply_publication_style()
+    fig, (ax_c, ax_d) = plt.subplots(
+        1, 2, figsize=(fig_width, fig_height), layout="constrained")
+
+    render_panel_c(ax_c, pbx_c, label_text=PANEL_C_LABEL,
+                   ref_ph=ref_ph, ref_v=ref_v, limits=limits)
+
+    render_panel_d(ax_d, pbx_d, pbx_c, ref_ph=ref_ph, ref_v=ref_v, limits=limits,
+                   label_fontsize=label_fontsize)
 
     fig.savefig(out_path, format="pdf", bbox_inches="tight")
     logger.info("Wrote %s", out_path)
@@ -209,11 +397,11 @@ def plot_panel(diagram, out_path, label_text=None, panel_width=None,
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="SPICES Figure 1 (panels c, d): Li-Fe-P Pourbaix diagrams",
+        description="SPICES Figure 1 (panels c, d): Li-Fe-P Pourbaix double panel",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-o", "--output-dir", default="additional_plots/figures",
-                        help="Directory for the two output PDFs")
+                        help="Directory for the output PDF")
     parser.add_argument("--cache-dir", default=".",
                         help="Directory holding saved_pbx_entries/ (default: .)")
     parser.add_argument("--api-key", default=None,
@@ -223,11 +411,15 @@ def main(argv=None):
     parser.add_argument("--snapshot-release", default=None,
                         help="MP snapshot release (or SPICES_MP_SNAPSHOT_RELEASE env)")
     parser.add_argument("--ref-ph", type=float, default=REF_PH,
-                        help="pH of the operating point selecting the highlighted region")
+                        help="pH of the operating point selecting the LiFePO4 region")
     parser.add_argument("--ref-v", type=float, default=REF_V,
                         help="Voltage (V vs SHE) of that operating point")
-    parser.add_argument("--panel-width", type=float, default=None,
-                        help="Panel width in inches (default SINGLE_COL_WIDTH = 3.5)")
+    parser.add_argument("--fig-width", type=float, default=FIG_WIDTH,
+                        help="Total figure width in inches (default 0.65 x DOUBLE_COL_WIDTH)")
+    parser.add_argument("--fig-height", type=float, default=FIG_HEIGHT,
+                        help="Figure height in inches")
+    parser.add_argument("--label-fontsize-d", type=float, default=LABEL_FONTSIZE_D,
+                        help="Font size (pt) of the panel-d in-box labels")
     args = parser.parse_args(argv)
 
     setup_logging()
@@ -248,15 +440,10 @@ def main(argv=None):
     pbx_d = build_diagram(entries, CONC_DICT_D)
 
     os.makedirs(args.output_dir, exist_ok=True)
-    plot_panel(
-        pbx_c, os.path.join(args.output_dir, "figure_1_panel_c.pdf"),
-        label_text=PANEL_C_LABEL, panel_width=args.panel_width,
-        ref_ph=args.ref_ph, ref_v=args.ref_v,
-    )
-    plot_panel(
-        pbx_d, os.path.join(args.output_dir, "figure_1_panel_d.pdf"),
-        label_text=None, panel_width=args.panel_width,
-        ref_ph=args.ref_ph, ref_v=args.ref_v,
+    plot_figure(
+        pbx_c, pbx_d, os.path.join(args.output_dir, "figure_1_panel_cd.pdf"),
+        fig_width=args.fig_width, fig_height=args.fig_height,
+        ref_ph=args.ref_ph, ref_v=args.ref_v, label_fontsize=args.label_fontsize_d,
     )
 
 

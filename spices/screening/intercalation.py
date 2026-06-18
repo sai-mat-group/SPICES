@@ -376,9 +376,8 @@ def _get_voltage_plateau_df(
                 voltage_vs_SHE,
                 save_plot=save_plot,
                 save_plot_path=plot_path,
-                title=f"Seawater metastability (Criterion {stability_criterion})",
-                A_phase_name=f"{charged_row['Formula']} {charged_row['MP id']}",
-                B_phase_name=f"{discharged_row['Formula']} {discharged_row['MP id']}",
+                A_phase_name=f"{charged_row['Formula']}\n{charged_row['MP id']}",
+                B_phase_name=f"{discharged_row['Formula']}\n{discharged_row['MP id']}",
             )
             total_area, area_below, area_above = find_stability_area_around_voltage(
                 charged_coords,
