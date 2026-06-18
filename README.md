@@ -125,6 +125,19 @@ combined = run_intercalation_screening(
     restart=True,
 )
 
+# Stage 3: re-render BOTH plot kinds (component graphs + per-plateau
+# pH-overlap PDFs) from a completed run, fully OFFLINE (no MP/snapshot
+# access) and without rewriting any xlsx — mirrors Stage 4's
+# --rerender-plots.  Useful to add plots to a run done without
+# save_plots, or to refresh plot styling.  input_path is not needed.
+from spices.screening.intercalation import rerender_intercalation_plots
+
+rerender_intercalation_plots(
+    element="Ca",
+    output_dir="Ca_intercalation/",
+    n_workers=24,
+)
+
 # Stage 4: Compare frameworks across working ions.  The graph is built ONCE
 # over every ion in stage3_dirs; `elements` only restricts the per-ion Excel
 # output (default None → all ions present).  It also writes
@@ -266,6 +279,7 @@ For multi-worker runs against the snapshot backend, export `SPICES_MP_BACKEND=sn
 * **`--restart`** (Stage 2) resumes an interrupted run.  In Phase 1, only chemsys/sea-comp keys whose Pourbaix pickle is missing from disk are re-dispatched — if 8000 of 10000 unique diagrams already exist, the remaining 2000 are split across all workers.  In Phase 2, only rows whose `Seawater stability` is still NaN are re-evaluated, with checkpoint files from `runtime_sheets/` and `{element}_evaluated_backup.xlsx` merged in.
 * **`--restart`** (Stage 3) resumes an interrupted intercalation run.  Sub-step 2 resumes from per-row checkpoints in `runtime_sheets/`.  Sub-step 3 skips a composition whose `Voltage_plateau_data/{composition}/sc_{N}/{composition}.xlsx` already exists for every requested selection criterion; partial compositions are re-built from the on-disk adjacency cache (`{output_dir}/adjacency_cache/{composition}.pkl`), so the O(n²) `StructureMatcher` work is paid only once.
 * **Stage 4 framework cache** — `run_framework_comparison` bundles the loaded framework pool *and* the O(n²) cross-element `StructureMatcher` adjacency into a single pickle (`{output_dir}/step4_cache.pkl`, or `step4_cache_reconnected.pkl` with `--reconnect-isolated`) plus a `.meta.json` sidecar.  Every run validates the sidecar (schema version, Stage-3 ion dirs and their order, sheet name, reconnect flag, and the full mp-id list); any mismatch — or a truncated / corrupt pickle caught while unpickling — is treated as a cache miss and rebuilt, so a kill mid-write is self-healing on the next run even though the Stage 4 write is *not* atomic (unlike the Stage 2/3 PID-temp + `os.replace` pattern).  `--rerender-plots` requires a valid cache and re-draws the PNGs *and* refreshes `structure_voltage_records.json` (the Stage-5 figure data), skipping the framework load, the O(n²) build, and the per-ion Excel writes; `--force-rebuild` ignores any existing cache and rebuilds from scratch.  Stage 4 is otherwise single-process, and Stage 5 has no cache or restart path.
+* **Stage 3 `--rerender-plots`** — re-renders both step-3 plot kinds (component-graph PDFs under `Voltage_plateau_data/{framework}/graphs/` and the per-plateau pH-overlap PDFs under `sc_{N}/`) from a completed run's persisted data, **fully offline** (no MP/snapshot access — graphs reuse `adjacency_cache/` + on-disk struct CIFs, voltage plots read coords from the composition sheets and voltages from the `sc_{N}` plateau sheets) and **plots-only** (no xlsx writes, no step-4 combine).  It skips steps 1–4 entirely and errors with a clear `FileNotFoundError` if no completed run is found in the output dir.  Voltage plots whose metastability coords were computed on-the-fly for seawater-stable phases during the original run (and never written back to the composition sheet) cannot be reproduced offline; they are skipped and listed in `{output_dir}/rerender_skipped_plots.csv`.  Component graphs are always fully reproducible.  Parallelizes per-composition via `-n N` (same worker pool as the full run); mutually exclusive with `--restart`; `--no-voltage-plots` / `--no-component-graphs` restrict to one kind.
 * **Hard guard on `restart=False`** — if the Stage 2 output xlsx already contains evaluated rows and `--restart` is *not* passed, the run aborts with a clear error rather than silently overwriting prior progress.  Pass `--restart` to resume, or delete the file to start over.
 * **Atomic final write** — the output xlsx is written via `to_excel(<tmp>); os.replace(<tmp>, <final>)`.  A kill mid-write leaves either the previous file or the new one, never a corrupt half-written xlsx.  `runtime_sheets/` is cleaned up only after `os.replace` succeeds.  Stage 3's adjacency pickles use the same PID-tagged temp + `os.replace` pattern so two workers can never leave a truncated pickle on disk.
 * **Honest worker-death diagnostics** — when one worker dies, `ProcessPoolExecutor` cancels every pending future and each cancellation surfaces as `BrokenProcessPool`.  Stage 2 distinguishes the *first* (root-cause) failure from subsequent cascade cancellations in the log, then runs a post-mortem scan of `dmesg -T` and `journalctl --user` so the user can tell apart a real OOM (kernel SIGKILL of `python`), a SLURM cgroup time-limit kill, and a process-internal exception.  Stage 3's sub-step 3 dispatcher aborts on the first per-composition worker exception so partial-state corruption cannot accrete silently — re-run with `--restart` to resume.
@@ -294,6 +308,11 @@ python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_int
 # is paid only once per composition across reruns.
 python scripts/run_intercalation_screening.py Ca seawater_results.xlsx -o Ca_intercalation/ \
     -n 8 --restart
+
+# Stage 3 — re-render plots offline from a completed run (no MP/snapshot
+# access, no xlsx writes).  input_path is optional here.  Use
+# --no-voltage-plots / --no-component-graphs to render only one kind.
+python scripts/run_intercalation_screening.py Ca --rerender-plots -o Ca_intercalation/ -n 8
 
 # Stage 4: framework comparison (graph-based; one build over all ions present)
 python scripts/run_framework_comparison.py --stage3-dir ./intercalation_results/

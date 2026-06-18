@@ -1609,6 +1609,182 @@ def _step3_process_composition(
                 vdf.to_excel(writer, sheet_name=name, index=False)
 
 
+def _parse_coords_cell(val):
+    """Parse a ``Seawater metastability (Criterion N)`` cell into a list
+    of ``(pH, V)`` tuples.
+
+    Cells are stored as object lists or their string repr (see
+    :func:`_get_voltage_plateau_df`).  Returns ``[]`` for NaN, empty, or
+    unparseable cells so the caller can treat "no coords" uniformly.
+    """
+    if isinstance(val, (list, tuple)):
+        return list(val)
+    if isinstance(val, str):
+        try:
+            parsed = ast.literal_eval(val)
+        except (ValueError, SyntaxError):
+            return []
+        return list(parsed) if isinstance(parsed, (list, tuple)) else []
+    return []
+
+
+def _rerender_process_composition(
+    fname,
+    composition_dir,
+    plateau_dir,
+    adjacency_cache_dir,
+    working_ion,
+    selection_criteria,
+    save_voltage_plots,
+    save_graphs,
+    charged_struct_dir,
+    struct_dir,
+    structure_cache_dir,
+    skipped_dir,
+):
+    """Offline per-composition plot re-render worker (no MP/Pourbaix).
+
+    Regenerates, purely from a completed run's persisted data:
+
+    * **component-graph PDFs** (``graphs/component_{i}.pdf``) via
+      :func:`build_graph_components_from_sheet` (reuses
+      ``adjacency_cache/{framework}.pkl`` and loads structs from disk
+      CIFs — no MP fetch) + :func:`save_component_graphs`; and
+    * **voltage/pH-overlap PDFs** (``sc_{N}/{cMP}-{dMP}_{cF}-{dF}.pdf``)
+      via :func:`find_ph_range_at_voltage` with ``save_plot=True``.  The
+      charged/discharged metastability coords come from the composition
+      xlsx, the voltage from the ``sc_{N}`` plateau sheet.
+
+    No ``mp_client``, no :class:`PourbaixCache`, no xlsx writes.
+
+    Best-effort: any per-composition failure is logged and recorded,
+    never raised, so one bad framework can't abort the whole rerender
+    (this is a cosmetic regeneration, not the scientific pipeline).
+    Voltage plots whose coords are absent from the composition sheet
+    (the documented offline limitation) are recorded; all skips are
+    written to ``{skipped_dir}/{framework}.csv`` for the parent to
+    aggregate.
+    """
+    framework_name = fname.replace(".xlsx", "")
+    framework_dir = os.path.join(plateau_dir, framework_name)
+    # (framework, criterion, charged_mp, discharged_mp, reason)
+    skipped = []
+
+    try:
+        df = pd.read_excel(os.path.join(composition_dir, fname))
+    except Exception as e:
+        logger.warning("Rerender: cannot read %s (%s); skipping", fname, e)
+        return
+
+    if save_graphs:
+        try:
+            adjacency_cache_path = os.path.join(
+                adjacency_cache_dir, f"{framework_name}.pkl",
+            )
+            _, component_graphs = build_graph_components_from_sheet(
+                df,
+                working_ion=working_ion,
+                charged_struct_dir=charged_struct_dir,
+                struct_dir=struct_dir,
+                structure_cache_dir=structure_cache_dir,
+                adjacency_cache_path=adjacency_cache_path,
+            )
+            save_component_graphs(
+                component_graphs, os.path.join(framework_dir, "graphs"),
+            )
+        except Exception as e:
+            logger.warning(
+                "Rerender: graph render failed for %s (%s); skipping graphs",
+                framework_name, e,
+            )
+            skipped.append((framework_name, "graphs", "", "", repr(e)))
+
+    if save_voltage_plots:
+        for sc in selection_criteria:
+            sc_dir = os.path.join(framework_dir, f"sc_{sc}")
+            sheet_path = os.path.join(sc_dir, fname)
+            if not os.path.exists(sheet_path):
+                continue
+
+            coord_col = f"Seawater metastability (Criterion {sc})"
+            if coord_col not in df.columns:
+                logger.warning(
+                    "Rerender: %s missing column %r; skipping sc_%s "
+                    "voltage plots", fname, coord_col, sc,
+                )
+                continue
+            coords_by_mpid = {
+                row["MP id"]: _parse_coords_cell(row[coord_col])
+                for _, row in df.iterrows()
+            }
+
+            try:
+                sheets = pd.read_excel(sheet_path, sheet_name=None)
+            except Exception as e:
+                logger.warning(
+                    "Rerender: cannot read %s (%s); skipping", sheet_path, e,
+                )
+                continue
+
+            for sheet_df in sheets.values():
+                for _, prow in sheet_df.iterrows():
+                    c_mp = prow.get("Charged MP id")
+                    d_mp = prow.get("Discharged MP id")
+                    c_f = prow.get("Charged Formula")
+                    d_f = prow.get("Discharged Formula")
+                    voltage = prow.get("V vs SHE (V)")
+
+                    c_coords = coords_by_mpid.get(c_mp, [])
+                    d_coords = coords_by_mpid.get(d_mp, [])
+
+                    if not c_coords or not d_coords or pd.isna(voltage):
+                        logger.warning(
+                            "Rerender: skipping voltage plot %s-%s "
+                            "(%s/sc_%s) — coords/voltage absent from "
+                            "composition sheet", c_mp, d_mp,
+                            framework_name, sc,
+                        )
+                        skipped.append((
+                            framework_name, f"sc_{sc}", c_mp, d_mp,
+                            "coords or voltage absent",
+                        ))
+                        continue
+
+                    plot_path = os.path.join(
+                        sc_dir, f"{c_mp}-{d_mp}_{c_f}-{d_f}.pdf",
+                    )
+                    try:
+                        find_ph_range_at_voltage(
+                            c_coords,
+                            d_coords,
+                            voltage,
+                            save_plot=True,
+                            save_plot_path=plot_path,
+                            A_phase_name=f"{c_f}\n{c_mp}",
+                            B_phase_name=f"{d_f}\n{d_mp}",
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Rerender: voltage plot render failed %s-%s "
+                            "(%s); skipping", c_mp, d_mp, e,
+                        )
+                        skipped.append((
+                            framework_name, f"sc_{sc}", c_mp, d_mp, repr(e),
+                        ))
+
+    if skipped:
+        os.makedirs(skipped_dir, exist_ok=True)
+        pd.DataFrame(
+            skipped,
+            columns=[
+                "Framework formula", "Criterion",
+                "Charged MP id", "Discharged MP id", "Reason",
+            ],
+        ).to_csv(
+            os.path.join(skipped_dir, f"{framework_name}.csv"), index=False,
+        )
+
+
 def step3_create_voltage_plateau_sheets(
     composition_dir,
     output_dir,
@@ -1826,6 +2002,164 @@ def step4_create_combined_sheet(
 # ====================================================================
 
 
+def rerender_intercalation_plots(
+    element,
+    output_dir=None,
+    selection_criteria=None,
+    save_voltage_plots=True,
+    save_graphs=True,
+    n_workers=1,
+):
+    """Re-render step-3 plots offline from a completed run's data.
+
+    Mirrors Stage-4's ``--rerender-plots``: reuses a finished run's
+    persisted artifacts to redraw plots **without any Materials Project
+    / snapshot access** and **without rewriting any xlsx**.  Two plot
+    kinds are regenerated (see :func:`_rerender_process_composition`):
+
+    * component-graph PDFs (``Voltage_plateau_data/{fw}/graphs/``), and
+    * voltage/pH-overlap PDFs (``Voltage_plateau_data/{fw}/sc_{N}/``).
+
+    Reads ``unique_charged_composition_sheets/`` (metastability coords),
+    ``Voltage_plateau_data/{fw}/sc_{N}/{fw}.xlsx`` (accepted plateaus +
+    voltages), ``adjacency_cache/``, and the on-disk struct CIFs.
+
+    Limitation
+    ----------
+    Only voltage plots whose charged/discharged metastability coords are
+    persisted in the composition sheet can be regenerated offline.
+    Coords computed on-the-fly for seawater-stable phases by
+    :func:`populate_seawater_metastability_points_for_seawater_stable_phases`
+    during the original run are not written back, so those plateaus'
+    plots are skipped (and recorded in ``rerender_skipped_plots.csv``).
+    Component graphs are always fully reproducible.
+
+    Parameters
+    ----------
+    element : str
+        Working ion (``"Ca"``, ``"K"``, ``"Li"``, ``"Mg"``, ``"Na"``).
+    output_dir : str or None
+        Completed run directory.  Defaults to
+        ``"{element}_intercalation"``.
+    selection_criteria : list of int or None
+        Criteria whose ``sc_{N}`` voltage plots to redraw (default: 4).
+    save_voltage_plots : bool
+        Redraw the per-pair voltage/pH-overlap PDFs.
+    save_graphs : bool
+        Redraw the component-graph PDFs.
+    n_workers : int
+        Parallel per-composition workers (``<=1`` = sequential).
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``output_dir`` lacks a completed step-3 run
+        (``unique_charged_composition_sheets/`` with xlsx files and
+        ``Voltage_plateau_data/``).
+    ValueError
+        If both plot kinds are disabled (nothing to render).
+    """
+    if output_dir is None:
+        output_dir = f"{element}_intercalation"
+    if selection_criteria is None:
+        selection_criteria = DEFAULT_SELECTION_CRITERIA
+
+    if not save_voltage_plots and not save_graphs:
+        raise ValueError(
+            "Nothing to render: both voltage plots and component graphs "
+            "are disabled."
+        )
+
+    composition_dir = os.path.join(
+        output_dir, "unique_charged_composition_sheets",
+    )
+    plateau_dir = os.path.join(output_dir, "Voltage_plateau_data")
+    adjacency_cache_dir = os.path.join(output_dir, "adjacency_cache")
+    struct_dir = os.path.join(output_dir, "structs")
+    charged_struct_dir = os.path.join(output_dir, "charged_structs")
+    structure_cache_dir = os.path.join(output_dir, "All_charged_structures")
+    skipped_dir = os.path.join(output_dir, ".rerender_skipped")
+    summary_path = os.path.join(output_dir, "rerender_skipped_plots.csv")
+
+    if not os.path.isdir(composition_dir):
+        raise FileNotFoundError(
+            f"--rerender-plots requires a completed step-3 run, but "
+            f"{composition_dir} was not found. Run the full pipeline "
+            f"once first."
+        )
+    excel_files = sorted(
+        f for f in os.listdir(composition_dir) if f.endswith(".xlsx")
+    )
+    if not excel_files:
+        raise FileNotFoundError(
+            f"--rerender-plots found no composition sheets in "
+            f"{composition_dir}. Run the full pipeline once first."
+        )
+    if save_voltage_plots and not os.path.isdir(plateau_dir):
+        raise FileNotFoundError(
+            f"--rerender-plots requires {plateau_dir} for voltage plots, "
+            f"but it was not found. Run the full pipeline once first."
+        )
+
+    # Clear any stale per-worker skip files from an interrupted rerender.
+    if os.path.isdir(skipped_dir):
+        shutil.rmtree(skipped_dir)
+
+    def _args_for(fname):
+        return (
+            fname,
+            composition_dir,
+            plateau_dir,
+            adjacency_cache_dir,
+            element,
+            list(selection_criteria),
+            save_voltage_plots,
+            save_graphs,
+            charged_struct_dir,
+            struct_dir,
+            structure_cache_dir,
+            skipped_dir,
+        )
+
+    logger.info(
+        "Rerender: regenerating %s for %d compositions (n_workers=%d)",
+        "graphs + voltage plots" if (save_graphs and save_voltage_plots)
+        else ("graphs" if save_graphs else "voltage plots"),
+        len(excel_files), n_workers,
+    )
+
+    _dispatch_phase1_tasks(
+        "Rerender",
+        n_workers,
+        excel_files,
+        _rerender_process_composition,
+        _args_for,
+    )
+
+    # Aggregate per-composition skip files into one summary CSV.
+    if os.path.isdir(skipped_dir):
+        parts = [
+            pd.read_csv(os.path.join(skipped_dir, f))
+            for f in sorted(os.listdir(skipped_dir))
+            if f.endswith(".csv")
+        ]
+        shutil.rmtree(skipped_dir)
+        if parts:
+            combined = pd.concat(parts, ignore_index=True)
+            combined.to_csv(summary_path, index=False)
+            n_volt = int((combined["Criterion"] != "graphs").sum())
+            logger.warning(
+                "Rerender: %d item(s) could not be reproduced offline "
+                "(%d voltage plot(s)); see %s",
+                len(combined), n_volt, summary_path,
+            )
+            return
+    # No skips this run — drop a stale summary so it can't mislead.
+    if os.path.exists(summary_path):
+        os.remove(summary_path)
+    logger.info("Rerender: all requested plots regenerated with no skips.")
+
+
 def run_intercalation_screening(
     element,
     input_path,
@@ -1842,6 +2176,7 @@ def run_intercalation_screening(
     save_interval=100,
     max_retries=500,
     retry_delay=10.0,
+    rerender_plots=False,
 ):
     """
     Run the full intercalation voltage screening pipeline (Steps 1-4).
@@ -1893,6 +2228,13 @@ def run_intercalation_screening(
         Maximum retries per row on transient failure.
     retry_delay : float
         Seconds to wait between retries.
+    rerender_plots : bool
+        If True, skip the entire pipeline (steps 1-4) and instead
+        re-render step-3's plots **offline** from ``output_dir``'s
+        persisted data via :func:`rerender_intercalation_plots`.  No MP
+        / snapshot access and no xlsx writes.  ``save_plots`` selects
+        the voltage/pH-overlap PDFs and ``save_component_graphs`` the
+        component-graph PDFs.  Returns an empty dict.
 
     Notes
     -----
@@ -1918,7 +2260,19 @@ def run_intercalation_screening(
     -------
     dict
         Combined voltage plateau data (``'criterion N'`` -> DataFrame).
+        Empty dict when ``rerender_plots=True``.
     """
+    if rerender_plots:
+        rerender_intercalation_plots(
+            element=element,
+            output_dir=output_dir,
+            selection_criteria=selection_criteria,
+            save_voltage_plots=save_plots,
+            save_graphs=save_component_graphs,
+            n_workers=n_workers,
+        )
+        return {}
+
     if output_dir is None:
         output_dir = f"{element}_intercalation"
     if selection_criteria is None:
