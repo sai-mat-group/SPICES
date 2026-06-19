@@ -402,6 +402,38 @@ def make_networkx_graph(component_indices, all_frameworks, adjacency):
     return G
 
 
+def load_cached_graphs(cache_path):
+    """Reconstruct the Stage-4 connected-component graphs from a cache file.
+
+    Loads the ``{"combined_fw", "adjacency"}`` bundle written by
+    :func:`run_framework_comparison` (e.g. ``step4_cache.pkl``) and rebuilds the
+    same list of per-component NetworkX graphs the renderer uses, via
+    :func:`bfs_components` + :func:`make_networkx_graph`.  No StructureMatcher
+    work is needed — the adjacency is taken straight from the cache, so this is
+    cheap.  Intended for downstream consumers (e.g. the Stage-5 metastability
+    Venn panel) that need the graphs without re-running Stage 4.
+
+    Parameters
+    ----------
+    cache_path : str
+        Path to the pickled cache bundle.
+
+    Returns
+    -------
+    list of networkx.Graph
+        One graph per connected component, in cache order.
+    """
+    with open(cache_path, "rb") as fh:
+        bundle = pickle.load(fh)
+    combined_fw = bundle["combined_fw"]
+    adjacency = bundle["adjacency"]
+    components = bfs_components(adjacency, len(combined_fw))
+    return [
+        make_networkx_graph(comp, combined_fw, adjacency)
+        for comp in components
+    ]
+
+
 def _charged_discharged(u, v):
     """Return ``(charged, discharged)`` for an edge.
 
@@ -693,6 +725,107 @@ NODE_BORDER_WIDTH = 1.0
 # is tuned for in-graph readability.
 LEGEND_MARKER_SIZE = (2000 ** 0.5) * 0.3
 
+# Step4 top-legend layout (axes-fraction).  y > 1 places each row above the
+# axes; savefig.bbox="tight" (set in spices.plotting) captures them.  X_PREFIX
+# reserves horizontal room for the "Nodes:"/"Edges:" prefixes so the legend
+# handles start to their right.
+_TOP_LEGEND_Y = {"ions": 1.16, "nodes": 1.09, "edges": 1.02}
+_TOP_LEGEND_PREFIX_X = 0.10
+
+
+def _rounded_chip_handler():
+    """Legend handler that renders a Patch handle as a small rounded square
+    swatch, matching the step5 periodic-table legend chips (see
+    ``spices.screening.statistics.plot_periodic_table``) instead of
+    matplotlib's default full-width rectangle.
+    """
+    from matplotlib.legend_handler import HandlerPatch
+    from matplotlib.patches import FancyBboxPatch
+
+    class _RoundedChipHandler(HandlerPatch):
+        def create_artists(self, legend, orig_handle, xdescent, ydescent,
+                           width, height, fontsize, trans):
+            side = height
+            cx = -xdescent + (width - side) / 2.0
+            cy = -ydescent
+            chip = FancyBboxPatch(
+                (cx, cy), side, side,
+                boxstyle="round,pad=0,rounding_size=%.4f" % (side * 0.25),
+                mutation_scale=1.0,
+            )
+            self.update_prop(chip, orig_handle, legend)
+            chip.set_linewidth(0)
+            chip.set_transform(trans)
+            return [chip]
+
+    return _RoundedChipHandler()
+
+
+def _draw_top_legend(ax, shape_handles, edge_handles):
+    """Draw the step4 three-row legend above the axes.
+
+    Row 1: working-ion colour chips (rounded, no title), left-to-right
+    Li, Mg, Ca, Na, K, then a grey "Multi-ion / none" chip.
+    Row 2: a "Nodes:" prefix then the hexagon/circle phase-type handles.
+    Row 3: an "Edges:" prefix then the edge-type handles.
+
+    All rows use rcParams default legend styling (font, size) with no frames.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    if edge_handles is None:
+        raise ValueError("legend='top' requires edge_handles")
+
+    # Shrink the axes so the three legend rows (anchored above it at y>1) sit
+    # inside the figure canvas rather than spilling past the top edge.
+    ax.figure.subplots_adjust(top=0.80)
+
+    # The plain (Line2D) node/edge legends are added as artists; the ion
+    # legend, which carries the custom rounded-chip handler_map, is created
+    # LAST so it becomes the axes' active legend.  A legend with a custom
+    # handler_map only renders its handles when it is the active ``ax.legend_``
+    # — added-as-artist it would silently fail to draw — so the order matters.
+    leg_nodes = ax.legend(
+        handles=shape_handles, loc="lower left",
+        bbox_to_anchor=(_TOP_LEGEND_PREFIX_X, _TOP_LEGEND_Y["nodes"]),
+        ncol=len(shape_handles), frameon=False,
+    )
+    ax.add_artist(leg_nodes)
+
+    leg_edges = ax.legend(
+        handles=edge_handles, loc="lower left",
+        bbox_to_anchor=(_TOP_LEGEND_PREFIX_X, _TOP_LEGEND_Y["edges"]),
+        ncol=len(edge_handles), frameon=False,
+    )
+    ax.add_artist(leg_edges)
+
+    ion_order = ["Li", "Mg", "Ca", "Na", "K"]
+    ion_handles = [
+        mpatches.Patch(color=ION_COLORS[ion], label=ion) for ion in ion_order
+    ]
+    ion_handles.append(
+        mpatches.Patch(color="lightgrey", label="Multi-ion / none"),
+    )
+    ax.legend(
+        handles=ion_handles,
+        handler_map={mpatches.Patch: _rounded_chip_handler()},
+        loc="lower left", bbox_to_anchor=(0.0, _TOP_LEGEND_Y["ions"]),
+        ncol=len(ion_handles), frameon=False,
+    )
+
+    # Left-aligned "Nodes:"/"Edges:" prefixes, vertically centred on their
+    # legend row.  Measure the rendered legend extent (same approach as
+    # statistics.plot_periodic_table) so the prefix lines up with the handles.
+    ax.figure.canvas.draw()
+    inv = ax.transAxes.inverted()
+    for leg, label in ((leg_nodes, "Nodes:"), (leg_edges, "Edges:")):
+        bb = leg.get_window_extent().transformed(inv)
+        ax.text(
+            0.0, (bb.y0 + bb.y1) / 2.0, label, transform=ax.transAxes,
+            ha="left", va="center", fontsize=plt.rcParams["legend.fontsize"],
+        )
+
 
 def _node_color(G, n):
     """Resolve a node's display color: explicit attr, then ion lookup."""
@@ -704,12 +837,19 @@ def _node_color(G, n):
     return "lightgrey"
 
 
-def _draw_nodes_and_labels(G, pos):
-    """Draw nodes (expt hex / theoretical circle, ion-colored), labels,
-    and the two shared legends (working-ion color, phase shape).
+def _draw_nodes_and_labels(G, pos, legend="side", edge_handles=None):
+    """Draw nodes (expt hex / theoretical circle, ion-colored) and labels.
 
     Shared between the stage-4 graph renderer and the step3 component
     plotter.  Returns the current Axes.
+
+    ``legend`` selects the legend layout:
+      - ``"side"`` (default): the original framed working-ion + phase-type
+        legends anchored to the right.  Used by the step3 component plotter
+        (``spices.intercalation.grouping.save_component_graphs``).
+      - ``"top"``: the step4 three-row horizontal legend above the axes
+        (ion colour chips / Nodes / Edges); requires ``edge_handles``.
+      - ``"none"``: no legend.
     """
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
@@ -749,19 +889,6 @@ def _draw_nodes_and_labels(G, pos):
         text.set_clip_on(False)
 
     ax = plt.gca()
-    ion_handles = [
-        mpatches.Patch(color=c, label=ion)
-        for ion, c in ION_COLORS.items()
-    ]
-    ion_handles.append(
-        mpatches.Patch(color="lightgrey", label="Multi-ion / none"),
-    )
-    leg1 = ax.legend(
-        handles=ion_handles, title="Working Ion",
-        loc="upper left", bbox_to_anchor=(1.01, 1.02), frameon=True,
-    )
-    ax.add_artist(leg1)
-
     shape_handles = [
         Line2D([0], [0], marker="H", linestyle="None",
                fillstyle="none", markeredgecolor="black",
@@ -770,12 +897,33 @@ def _draw_nodes_and_labels(G, pos):
                fillstyle="none", markeredgecolor="black",
                markersize=LEGEND_MARKER_SIZE, label="Theoretical"),
     ]
-    leg2 = ax.legend(
-        handles=shape_handles, title="Phase type",
-        loc="upper left", bbox_to_anchor=(1.01, 0.61), frameon=True,
-        labelspacing=1.8, borderpad=0.8,
-    )
-    ax.add_artist(leg2)
+
+    if legend == "side":
+        ion_handles = [
+            mpatches.Patch(color=c, label=ion)
+            for ion, c in ION_COLORS.items()
+        ]
+        ion_handles.append(
+            mpatches.Patch(color="lightgrey", label="Multi-ion / none"),
+        )
+        leg1 = ax.legend(
+            handles=ion_handles, title="Working Ion",
+            loc="upper left", bbox_to_anchor=(1.01, 1.02), frameon=True,
+        )
+        ax.add_artist(leg1)
+
+        leg2 = ax.legend(
+            handles=shape_handles, title="Phase type",
+            loc="upper left", bbox_to_anchor=(1.01, 0.61), frameon=True,
+            labelspacing=1.8, borderpad=0.8,
+        )
+        ax.add_artist(leg2)
+    elif legend == "top":
+        _draw_top_legend(ax, shape_handles, edge_handles)
+    elif legend == "none":
+        pass
+    else:
+        raise ValueError(f"Unknown legend mode: {legend!r}")
 
     _pad_axes_to_fit_nodes(ax, pos)
     return ax
@@ -936,7 +1084,7 @@ def save_graph_figures(
     metastability_criterion=4,
     min_area_fraction=0.80,
 ):
-    """Render and save graph PNGs organized by number of ions."""
+    """Render and save graph PDFs organized by number of ions."""
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
     import networkx as nx
@@ -969,8 +1117,24 @@ def save_graph_figures(
         )
         pos = nx.spring_layout(G_display)
 
+        edge_handles = [
+            Line2D([0], [0], color="tab:gray", alpha=0.4, lw=1.0,
+                   linestyle=(0, (5, 3)),
+                   label="Not (meta)stable / Diff. ions"),
+            Line2D([0], [0], color="tab:gray", alpha=0.6, lw=1.0,
+                   linestyle="solid", label="(Meta)stable"),
+            Line2D([0], [0], color="tab:blue", lw=1.0,
+                   linestyle=(0, (5, 3)),
+                   label="(Meta)stable across pH 7-8.5"),
+            Line2D([0], [0], color="tab:blue", lw=1.0,
+                   linestyle="solid",
+                   label="Area > 80% across pH 7-8.5"),
+        ]
+
         plt.figure(figsize=(7.2, 5.4))
-        ax = _draw_nodes_and_labels(G_display, pos)
+        ax = _draw_nodes_and_labels(
+            G_display, pos, legend="top", edge_handles=edge_handles,
+        )
 
         nx.draw_networkx_edges(
             G_display, pos,
@@ -996,25 +1160,6 @@ def save_graph_figures(
             edge_color="tab:blue", width=1.0, style="solid", alpha=1,
         )
 
-        edge_handles = [
-            Line2D([0], [0], color="tab:gray", alpha=0.4, lw=1.0,
-                   linestyle=(0, (5, 3)),
-                   label="Not (meta)stable / Diff. ions"),
-            Line2D([0], [0], color="tab:gray", alpha=0.6, lw=1.0,
-                   linestyle="solid", label="(Meta)stable"),
-            Line2D([0], [0], color="tab:blue", lw=1.0,
-                   linestyle=(0, (5, 3)),
-                   label="(Meta)stable across pH 7-8.5"),
-            Line2D([0], [0], color="tab:blue", lw=1.0,
-                   linestyle="solid",
-                   label="Area > 80% across pH 7-8.5"),
-        ]
-        ax.legend(
-            handles=edge_handles, title="Edge type",
-            loc="upper left", bbox_to_anchor=(1.01, 0.37),
-            frameon=True, handlelength=2.8,
-        )
-
         ax.spines[:].set_visible(False)
         ax.set_xticks([])
         ax.set_yticks([])
@@ -1028,7 +1173,7 @@ def save_graph_figures(
         os.makedirs(sub_dir, exist_ok=True)
         plt.savefig(
             os.path.join(
-                sub_dir, f"image_{idx}_{framework_formula}.png",
+                sub_dir, f"image_{idx}_{framework_formula}.pdf",
             ),
         )
         plt.close()
@@ -1260,7 +1405,7 @@ def run_framework_comparison(
 
     Loads frameworks for all ions in ``stage3_dirs``, builds one shared
     adjacency over the combined framework pool, identifies connected
-    components, and renders one set of graph PNGs. Then, for each ion
+    components, and renders one set of graph PDFs. Then, for each ion
     in ``elements``, partitions that ion's voltage plateau DataFrame
     into ``only_{ion}`` (frameworks unique to this ion's component) and
     ``multiple_ions`` (frameworks whose component spans more than one
@@ -1306,7 +1451,7 @@ def run_framework_comparison(
         ``StructureMatcher.fit`` says otherwise.
     rerender_plots : bool
         If True, require a valid cache and skip both the framework load
-        and the per-ion Excel writes; only regenerate PNGs.  Raises
+        and the per-ion Excel writes; only regenerate PDFs.  Raises
         ``FileNotFoundError`` if no valid cache is found.  Use when
         iterating on plot styling.
     force_rebuild : bool

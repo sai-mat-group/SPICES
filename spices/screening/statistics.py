@@ -633,30 +633,173 @@ def plot_pipeline_bar_chart(
     return fig
 
 
-def plot_nested_venn(
-    element,
-    counts,
-    labels,
-    save_path=None,
-):
-    """
-    Filter funnel: concentric, area-proportional circles showing the
-    progressive narrowing of the screening at each pipeline stage.
+# Metastability-tier colours, outermost (least restrictive) -> innermost.
+# grey -> light blue -> blue -> navy, echoing the Stage-4 graph edge palette.
+METASTABILITY_VENN_COLORS = ["#9E9E9E", "#9ECAE1", "#3182BD", "#08519C"]
+METASTABILITY_VENN_LABELS = [
+    "Metastable at intercalation voltage",
+    "Metastable throughout pH 7–8.5",
+    "Metastability area ≥ 80%",
+    "≥ 1 experimental (dis)charged electrode",
+]
+# Working-ion order for the panel (left to right).
+METASTABILITY_VENN_ION_ORDER = ("Li", "Mg", "Ca", "Na", "K")
 
-    (This is a nested-circle funnel, not a true Venn diagram and not
-    "vertically" stacked; Fix #7.) Each circle's radius is proportional
-    to ``sqrt(count / counts[0])``, so areas are proportional to counts.
-    Labels are placed to the side with leader lines to avoid overlap when
-    counts are close.
+
+def compute_metastability_venn_counts(
+    graphs,
+    df_dict,
+    ions,
+    pH_window=(7.0, 8.5),
+    metastability_criterion=4,
+    min_area_fraction=0.80,
+):
+    """Count, per working ion, how many Stage-4 graph components fall in each
+    cumulative metastability tier.
+
+    Each connected-component graph from Stage 4 is one rendered figure.  Its
+    edges are classified by
+    :func:`spices.screening.framework_comparison.classify_edges` into the same
+    visual categories the Stage-4 renderer draws.  The four tiers are nested
+    (each a superset of the next):
+
+    1. **Metastable at intercalation voltage** — a same-ion edge with a voltage
+       plateau (``same_ion`` grey-solid, ``pH_filtered`` blue-dashed, or
+       ``pH_area_filtered`` blue-solid).
+    2. **Metastable throughout the pH window** — ``pH_filtered`` ∪
+       ``pH_area_filtered`` (blue edges).
+    3. **Metastability area ≥ ``min_area_fraction``** — ``pH_area_filtered``
+       (blue-solid).
+    4. **≥ 1 experimental (dis)charged electrode** — a ``pH_area_filtered`` edge
+       with at least one experimental (hexagonal, ``is_expt``) endpoint.
+
+    A component is counted at most once per tier per ion; a multi-ion component
+    can contribute to several ions.  ``diff_ion`` / ``no_voltage`` (grey-dashed)
+    edges never qualify.
 
     Parameters
     ----------
-    element : str
-        Ion name (for title and color).
-    counts : list of int
-        Decreasing counts, e.g. [metastable, with_voltage, filtered].
-    labels : list of str
-        Label for each level.
+    graphs : list of networkx.Graph
+        Per-component graphs (e.g. from
+        :func:`spices.screening.framework_comparison.load_cached_graphs`).
+    df_dict : dict
+        Maps ion symbol -> voltage-plateau DataFrame (the ``criterion N`` sheet
+        of ``All_voltage_plateaus.xlsx``).  Must cover every ion present in the
+        graphs (``classify_edges`` looks up each same-ion edge).
+    ions : iterable of str
+        Working ions to report counts for.
+    pH_window : tuple of float
+    metastability_criterion : int
+    min_area_fraction : float
+
+    Returns
+    -------
+    dict
+        ``{ion: [n1, n2, n3, n4]}`` with ``n1 >= n2 >= n3 >= n4``.
+    """
+    from spices.screening.framework_comparison import classify_edges
+
+    ions = list(ions)
+    counts = {ion: [0, 0, 0, 0] for ion in ions}
+
+    for G in graphs:
+        eg = classify_edges(
+            G, df_dict, pH_window, metastability_criterion, min_area_fraction,
+        )
+        # Cumulative edge sets (tier1 ⊇ tier2 ⊇ tier3 by construction).
+        tier3 = eg["pH_area_filtered"]
+        tier2 = eg["pH_filtered"] + tier3
+        tier1 = eg["same_ion"] + tier2
+
+        for ion in ions:
+            in1 = any(u.working_ion.symbol == ion for u, _ in tier1)
+            in2 = any(u.working_ion.symbol == ion for u, _ in tier2)
+            in3 = any(u.working_ion.symbol == ion for u, _ in tier3)
+            in4 = any(
+                u.working_ion.symbol == ion and (u.is_expt or v.is_expt)
+                for u, v in tier3
+            )
+            # Tiers are nested by construction; force monotonicity defensively.
+            in1 = in1 or in2 or in3 or in4
+            in2 = in2 or in3 or in4
+            in3 = in3 or in4
+            counts[ion][0] += int(in1)
+            counts[ion][1] += int(in2)
+            counts[ion][2] += int(in3)
+            counts[ion][3] += int(in4)
+
+    return counts
+
+
+def _spread_positions(values, min_gap):
+    """Push 1-D positions apart so consecutive ones differ by >= ``min_gap``.
+
+    Preserves order; used to declutter the per-ring count labels so their text
+    never overlaps when two circles have similar radii.
+    """
+    arr = np.asarray(values, dtype=float)
+    order = np.argsort(arr)
+    s = arr[order].copy()
+    for i in range(1, len(s)):
+        if s[i] - s[i - 1] < min_gap:
+            s[i] = s[i - 1] + min_gap
+    out = np.empty_like(arr)
+    out[order] = s
+    return out
+
+
+def _rounded_chip_handler():
+    """Legend handler rendering a Patch as a small rounded-square swatch, to
+    match the Stage-5 periodic-table legend chips (``plot_periodic_table``)."""
+    from matplotlib.legend_handler import HandlerPatch
+    from matplotlib.patches import FancyBboxPatch
+
+    class _RoundedChipHandler(HandlerPatch):
+        def create_artists(self, legend, orig_handle, xdescent, ydescent,
+                           width, height, fontsize, trans):
+            side = height
+            cx = -xdescent + (width - side) / 2.0
+            cy = -ydescent
+            chip = FancyBboxPatch(
+                (cx, cy), side, side,
+                boxstyle=f"round,pad=0,rounding_size={0.25 * side}",
+                linewidth=0, facecolor=orig_handle.get_facecolor(),
+                transform=trans,
+            )
+            return [chip]
+
+    return _RoundedChipHandler()
+
+
+def plot_metastability_venn_panel(
+    counts_by_ion,
+    ion_order=METASTABILITY_VENN_ION_ORDER,
+    colors=None,
+    labels=None,
+    save_path=None,
+):
+    """Single double-column figure: one area-proportional concentric-circle
+    "Venn" per working ion, left to right, with a shared two-row legend above.
+
+    Each ion gets four nested circles (the tiers from
+    :func:`compute_metastability_venn_counts`).  Circle areas are proportional
+    to the counts on a **single global scale** shared across all ions, so a set
+    is drawn the same size regardless of which ion it belongs to.  Each ring is
+    annotated with its count; labels are decluttered (and given a white
+    background) so text never overlaps.
+
+    Parameters
+    ----------
+    counts_by_ion : dict
+        ``{ion: [n1, n2, n3, n4]}`` (decreasing), from
+        :func:`compute_metastability_venn_counts`.
+    ion_order : iterable of str
+        Left-to-right ion order; ions absent from ``counts_by_ion`` are skipped.
+    colors : list of str or None
+        Tier fill colours (outer -> inner). Defaults to
+        :data:`METASTABILITY_VENN_COLORS`.
+    labels : list of str or None
+        Tier legend labels. Defaults to :data:`METASTABILITY_VENN_LABELS`.
     save_path : str or None
 
     Returns
@@ -665,48 +808,91 @@ def plot_nested_venn(
     """
     apply_publication_style()
     import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
     from matplotlib.patches import Circle
 
-    fig, ax = plt.subplots(figsize=(4.5, 3.5))
-    ax.set_aspect("equal")
+    if colors is None:
+        colors = METASTABILITY_VENN_COLORS
+    if labels is None:
+        labels = METASTABILITY_VENN_LABELS
 
-    max_radius = 2.0
-    n = len(counts)
-    color = ION_COLORS.get(element, "gray")
+    ions = [ion for ion in ion_order if ion in counts_by_ion]
+    n = len(ions)
 
-    radii = []
-    for i, count in enumerate(counts):
-        radius = max_radius * np.sqrt(count / counts[0]) if counts[0] else 0
-        radii.append(radius)
-        circle = Circle(
-            (0, 0), radius,
-            fill=True, facecolor=color,
-            alpha=min(0.15 + 0.2 * i, 1.0),
-            edgecolor="black", linewidth=1.0,
-        )
-        ax.add_patch(circle)
+    # Global radius scale: area ∝ count across the whole figure.
+    global_max = max(
+        (c for ion in ions for c in counts_by_ion[ion]), default=0
+    )
 
-    # Stack labels on the right with leader lines to each circle's top.
-    label_x = max_radius + 0.8
-    label_ys = np.linspace(max_radius, -max_radius, n) if n > 1 else [0]
-    for label, count, radius, ly in zip(labels, counts, radii, label_ys):
-        ax.annotate(
-            f"{label}\n({count})",
-            xy=(0, radius), xytext=(label_x, ly),
-            ha="left", va="center", fontweight="bold",
-            arrowprops=dict(arrowstyle="-", lw=0.6, color="grey"),
-        )
+    fig, axes = plt.subplots(
+        1, max(n, 1),
+        figsize=(DOUBLE_COL_WIDTH, 0.34 * DOUBLE_COL_WIDTH),
+    )
+    axes = np.atleast_1d(axes)
+    # Reserve the top strip for the two-row legend.
+    fig.subplots_adjust(top=0.74, bottom=0.10, left=0.02, right=0.98, wspace=0.1)
 
-    ax.set_xlim(-max_radius - 0.5, max_radius + 3.0)
-    ax.set_ylim(-max_radius - 0.5, max_radius + 0.5)
-    ax.set_title(element, fontweight="bold")
-    ax.axis("off")
+    R_max = 1.0
+    label_top = R_max  # tracks the highest count-label, to set y-limits.
 
-    plt.tight_layout()
+    for ax, ion in zip(axes, ions):
+        ax.set_aspect("equal")
+        ax.axis("off")
+        cts = counts_by_ion[ion]
+        radii = [
+            R_max * np.sqrt(c / global_max) if global_max else 0.0
+            for c in cts
+        ]
+
+        # Paint outer -> inner so smaller rings sit on top.
+        for z, (r, col) in enumerate(zip(radii, colors)):
+            if r <= 0:
+                continue
+            ax.add_patch(Circle(
+                (0, 0), r, facecolor=col, edgecolor="white",
+                linewidth=0.5, zorder=2 + z,
+            ))
+
+        # Count labels at each ring apex (0, r), decluttered vertically with a
+        # short leader line so the text never overlaps and stays readable.
+        live = [(i, r, c) for i, (r, c) in enumerate(zip(radii, cts)) if r > 0]
+        if live:
+            apex_y = [r for _, r, _ in live]
+            lab_y = _spread_positions(apex_y, min_gap=0.16)
+            label_top = max(label_top, float(np.max(lab_y)))
+            for (i, r, c), ly in zip(live, lab_y):
+                if abs(ly - r) > 1e-3:
+                    ax.plot([0, 0], [r, ly], color="0.5", lw=0.5, zorder=10)
+                ax.text(
+                    0, ly, str(c), ha="center", va="center", zorder=11,
+                    bbox=dict(boxstyle="round,pad=0.15", facecolor="white",
+                              edgecolor="none", alpha=0.85),
+                )
+
+        # Ion label below the circles (kept clear of the top legend).
+        ax.text(0, -R_max - 0.18, ion, ha="center", va="top",
+                fontweight="bold")
+        ax.set_xlim(-R_max - 0.1, R_max + 0.1)
+        ax.set_ylim(-R_max - 0.35, label_top + 0.2)
+
+    # Shared two-row legend (4 chips, 2 columns) above the row, styled like the
+    # periodic-table legend swatches. matplotlib fills columns top-to-bottom, so
+    # reorder the handles to read in tier order across then down (outer pair on
+    # the top row, inner pair below).
+    order = [0, 2, 1, 3] if len(labels) == 4 else range(len(labels))
+    handles = [
+        mpatches.Patch(facecolor=colors[i], label=labels[i]) for i in order
+    ]
+    fig.legend(
+        handles=handles, ncol=2, loc="upper center",
+        bbox_to_anchor=(0.5, 1.0), frameon=False,
+        handler_map={mpatches.Patch: _rounded_chip_handler()},
+        handletextpad=0.5, columnspacing=2.0,
+    )
 
     if save_path:
         fig.savefig(save_path)
-        logger.info("Filter funnel saved to %s", save_path)
+        logger.info("Metastability Venn panel saved to %s", save_path)
 
     return fig
 
@@ -1296,6 +1482,7 @@ def run_statistics(
     min_area_fraction=0.80,
     save_plots=True,
     stage4_records=None,
+    stage4_cache_path=None,
     make_periodic_table=True,
     bar_color_by="stage",
     yscale="log",
@@ -1324,6 +1511,12 @@ def run_statistics(
         present on disk, the combined structure-voltage figure is produced
         (single PDF, two panels); when given but missing, a warning is logged
         and the figure is skipped.
+    stage4_cache_path : str or None
+        Path to the Stage-4 graph cache (``step4_cache.pkl``) used to build the
+        metastability Venn panel. Defaults to ``step4_cache.pkl`` next to
+        ``stage4_records``; pass explicitly for a non-default cache (e.g.
+        ``step4_cache_reconnected.pkl``). The panel is skipped with a warning if
+        the cache or the per-ion voltage Excels are missing.
     make_periodic_table : bool
     bar_color_by : {"stage", "ion"}
     yscale : {"log", "linear"}
@@ -1450,24 +1643,58 @@ def run_statistics(
                 color_by=bar_color_by, yscale=yscale,
             )
 
-        # Per-ion filter funnel
-        venn_dir = os.path.join(output_dir, "nested_venn")
-        os.makedirs(venn_dir, exist_ok=True)
-        for e in plotted:
-            s = summary[e]
-            counts = [
-                s.get(f"metastable_c{metastability_criterion}", 0),
-                s.get("voltage_phases", 0),
-                s.get("filtered_phases", 0),
-            ]
-            labels = [
-                f"Metastable (C{metastability_criterion})",
-                "With voltage",
-                "pH + area filtered",
-            ]
-            plot_nested_venn(
-                e, counts, labels,
-                save_path=os.path.join(venn_dir, f"{e}_nested_venn.png"),
+        # Metastability Venn panel — derived from the Stage-4 graph cache
+        # (one combined figure: one concentric-circle Venn per ion).
+        cache_path = stage4_cache_path
+        if cache_path is None and stage4_records:
+            cache_path = os.path.join(
+                os.path.dirname(os.path.abspath(stage4_records)),
+                "step4_cache.pkl",
+            )
+        if cache_path and os.path.exists(cache_path):
+            from spices.screening.framework_comparison import load_cached_graphs
+
+            # classify_edges needs a voltage DataFrame for every ion present in
+            # the cached graphs (= all Stage-3 ions). Skip the panel if any is
+            # unreadable rather than aborting mid-classification.
+            df_dict, missing = {}, []
+            for ion, s3 in stage3_dirs.items():
+                vp = os.path.join(s3, "All_voltage_plateaus.xlsx")
+                try:
+                    df_dict[ion] = pd.read_excel(
+                        vp, sheet_name=f"criterion {metastability_criterion}",
+                    )
+                except (FileNotFoundError, ValueError, KeyError) as exc:
+                    missing.append(ion)
+                    logger.warning(
+                        "Cannot read voltage plateaus for %s (%s)", ion, exc,
+                    )
+            if missing:
+                logger.warning(
+                    "Skipping metastability Venn panel; missing voltage data "
+                    "for %s.", missing,
+                )
+            else:
+                graphs = load_cached_graphs(cache_path)
+                venn_ions = [
+                    i for i in METASTABILITY_VENN_ION_ORDER if i in df_dict
+                ]
+                counts_by_ion = compute_metastability_venn_counts(
+                    graphs, df_dict, venn_ions,
+                    pH_window=pH_window,
+                    metastability_criterion=metastability_criterion,
+                    min_area_fraction=min_area_fraction,
+                )
+                plot_metastability_venn_panel(
+                    counts_by_ion,
+                    save_path=os.path.join(
+                        output_dir, "metastability_venn.pdf",
+                    ),
+                )
+        elif stage4_cache_path or stage4_records:
+            logger.warning(
+                "No Stage-4 cache at %s; skipping the metastability Venn panel. "
+                "Run Stage-4 with cache_adjacency=True first.", cache_path,
             )
 
         # Periodic table (no pipeline data needed)

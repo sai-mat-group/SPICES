@@ -55,6 +55,13 @@ def main():
              "path derived from --stage4-dir)",
     )
     parser.add_argument(
+        "--stage4-cache", default=None,
+        help="Explicit path to the Stage-4 graph cache (step4_cache.pkl) for "
+             "the metastability Venn panel. Default: step4_cache.pkl next to "
+             "the records file; pass step4_cache_reconnected.pkl here if Stage "
+             "4 was run with reconnect_isolated.",
+    )
+    parser.add_argument(
         "-o", "--output-dir", default=None,
         help="Output directory (default: statistics_output/)",
     )
@@ -127,6 +134,7 @@ def main():
         min_area_fraction=args.min_area,
         save_plots=not args.no_plots,
         stage4_records=stage4_records,
+        stage4_cache_path=args.stage4_cache,
         make_periodic_table=not args.no_periodic_table,
         bar_color_by=args.bar_color_by,
         experimental_only_ions=experimental_only_ions,

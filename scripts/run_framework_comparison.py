@@ -4,7 +4,7 @@ CLI wrapper for SPICES Stage 4: graph-based framework comparison.
 
 A single invocation builds the cross-ion structural-match graph once
 and writes one ``pH_area_filtered_plateaus.xlsx`` per ion. Shared graph
-PNGs land under ``{output_dir}/All_graphs/``.
+PDFs land under ``{output_dir}/All_graphs/``.
 
 Usage examples:
 
@@ -98,7 +98,7 @@ def main():
     parser.add_argument(
         "--no-plots",
         action="store_true",
-        help="Skip saving graph PNGs",
+        help="Skip saving graph PDFs",
     )
     parser.add_argument(
         "--adj-cache",
@@ -125,7 +125,7 @@ def main():
         help=(
             "Require an existing valid cache; skip framework load + "
             "adjacency build AND per-ion Excel writes. Only regenerates "
-            "the PNGs. Errors out if no valid cache is found."
+            "the PDFs. Errors out if no valid cache is found."
         ),
     )
     parser.add_argument(
