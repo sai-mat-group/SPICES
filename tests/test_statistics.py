@@ -525,6 +525,15 @@ class TestFigureSmoke:
         fig = plot_structure_voltages_combined(path, save_path=str(out))
         assert out.exists()
         assert fig is not None
+        # Restyle: two full-width panels (no separate right-hand legend axis)
+        # and a frameless top legend on the upper panel.
+        assert len(fig.axes) == 2
+        ax_top = fig.axes[0]
+        assert ax_top.get_legend() is not None
+        # One nude-gradient axvspan band per single-ion column: the only
+        # difference in top-panel patches between gradient on/off (3 columns).
+        plain = plot_structure_voltages_combined(path, gradient_background=False)
+        assert len(ax_top.patches) - len(plain.axes[0].patches) == 3
 
 
 class TestRunStatisticsStructureVoltage:

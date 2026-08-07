@@ -634,8 +634,9 @@ def plot_pipeline_bar_chart(
 
 
 # Metastability-tier colours, outermost (least restrictive) -> innermost.
-# grey -> light blue -> blue -> navy, echoing the Stage-4 graph edge palette.
-METASTABILITY_VENN_COLORS = ["#9E9E9E", "#9ECAE1", "#3182BD", "#08519C"]
+# light grey -> steel blue -> orange -> dark green, matching the reference
+# Venn-panel figure (a qualitative scheme, not a single-hue gradient).
+METASTABILITY_VENN_COLORS = ["#DCDCDC", "#34607F", "#E69A2E", "#285B2D"]
 METASTABILITY_VENN_LABELS = [
     "Metastable at intercalation voltage",
     "Metastable throughout pH 7–8.5",
@@ -731,23 +732,6 @@ def compute_metastability_venn_counts(
     return counts
 
 
-def _spread_positions(values, min_gap):
-    """Push 1-D positions apart so consecutive ones differ by >= ``min_gap``.
-
-    Preserves order; used to declutter the per-ring count labels so their text
-    never overlaps when two circles have similar radii.
-    """
-    arr = np.asarray(values, dtype=float)
-    order = np.argsort(arr)
-    s = arr[order].copy()
-    for i in range(1, len(s)):
-        if s[i] - s[i - 1] < min_gap:
-            s[i] = s[i - 1] + min_gap
-    out = np.empty_like(arr)
-    out[order] = s
-    return out
-
-
 def _rounded_chip_handler():
     """Legend handler rendering a Patch as a small rounded-square swatch, to
     match the Stage-5 periodic-table legend chips (``plot_periodic_table``)."""
@@ -778,15 +762,19 @@ def plot_metastability_venn_panel(
     labels=None,
     save_path=None,
 ):
-    """Single double-column figure: one area-proportional concentric-circle
-    "Venn" per working ion, left to right, with a shared two-row legend above.
+    """Single double-column figure: one area-proportional nested-circle "Venn"
+    per working ion, packed left to right on a shared axes, with the tier legend
+    tucked into the empty upper-right.
 
     Each ion gets four nested circles (the tiers from
     :func:`compute_metastability_venn_counts`).  Circle areas are proportional
     to the counts on a **single global scale** shared across all ions, so a set
-    is drawn the same size regardless of which ion it belongs to.  Each ring is
-    annotated with its count; labels are decluttered (and given a white
-    background) so text never overlaps.
+    is drawn the same size regardless of which ion it belongs to, and the
+    largest circle (Li's outer tier) is sized to ~90% of the drawable axes
+    height.  Within an ion the four circles are **bottom-aligned** — every ring
+    shares the bottom-most point — which frees the top of each set for the
+    count labels (stacked near each ring's top, coloured for contrast).  Ions
+    are packed by size so small ions (Na, K) do not leave large empty margins.
 
     Parameters
     ----------
@@ -817,75 +805,104 @@ def plot_metastability_venn_panel(
         labels = METASTABILITY_VENN_LABELS
 
     ions = [ion for ion in ion_order if ion in counts_by_ion]
-    n = len(ions)
 
-    # Global radius scale: area ∝ count across the whole figure.
+    # Global radius scale: area ∝ count across the whole figure, so the largest
+    # count (Li's outer tier) defines R_max = 1 data unit and every other circle
+    # follows from sqrt(count / global_max).
     global_max = max(
         (c for ion in ions for c in counts_by_ion[ion]), default=0
     )
 
-    fig, axes = plt.subplots(
-        1, max(n, 1),
-        figsize=(DOUBLE_COL_WIDTH, 0.34 * DOUBLE_COL_WIDTH),
-    )
-    axes = np.atleast_1d(axes)
-    # Reserve the top strip for the two-row legend.
-    fig.subplots_adjust(top=0.74, bottom=0.10, left=0.02, right=0.98, wspace=0.1)
+    figsize = (DOUBLE_COL_WIDTH, 0.34 * DOUBLE_COL_WIDTH)
+    fig, ax = plt.subplots(figsize=figsize)
+    # One shared axes. A thin strip at the bottom of the figure holds the ion
+    # symbols; the axes fills the rest. Equal aspect (datalim-adjusted, so the
+    # axes box keeps filling its slot rather than shrinking) keeps circles round.
+    m_left, m_right, m_top, m_bottom = 0.005, 0.995, 0.99, 0.07
+    fig.subplots_adjust(left=m_left, right=m_right, top=m_top, bottom=m_bottom)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.axis("off")
 
+    # Vertical budget: the biggest circle (diameter 2*R_max) is sized to 99% of
+    # the plotting-area height, so it nearly fills the figure. y data-span =
+    # 2*R_max / 0.99; the ~1% slack is split top/bottom and the circles are
+    # vertically centred in the axes (the ion symbols live in the figure strip
+    # below, drawn unclipped).
     R_max = 1.0
-    label_top = R_max  # tracks the highest count-label, to set y-limits.
+    height_frac = 0.99
+    y_span = (2 * R_max) / height_frac
+    slack = y_span - 2 * R_max
+    y_bottom = -slack / 2.0
+    y_top = y_bottom + y_span
 
-    for ax, ion in zip(axes, ions):
-        ax.set_aspect("equal")
-        ax.axis("off")
+    # Per-tier count-label colour, for contrast against each fill: dark on the
+    # grey & orange tiers (idx 0, 2), white on the steel-blue & green tiers
+    # (idx 1, 3). Keyed on the original tier index so it is stable when a tier
+    # is empty (skipped).
+    def _label_color(tier_idx):
+        return "white" if tier_idx in (1, 3) else "#222222"
+
+    gap = 0.12  # horizontal breathing room between adjacent ions' outer circles
+    prev_x = prev_r = 0.0
+    for k, ion in enumerate(ions):
         cts = counts_by_ion[ion]
-        radii = [
-            R_max * np.sqrt(c / global_max) if global_max else 0.0
-            for c in cts
-        ]
+        radii = [np.sqrt(c / global_max) if global_max else 0.0 for c in cts]
+        r_outer = next((r for r in radii if r > 0), 0.0)
 
-        # Paint outer -> inner so smaller rings sit on top.
+        # Pack left-to-right: the first ion sits one outer-radius from the left
+        # edge; each later centre clears both neighbours' outer radii plus a gap.
+        x_ion = r_outer if k == 0 else prev_x + prev_r + r_outer + gap
+        prev_x, prev_r = x_ion, r_outer
+
+        # Bottom-align: every ring centred at (x_ion, r_i) shares the bottom-most
+        # point (x_ion, 0). Paint outer -> inner so inner rings sit on top.
         for z, (r, col) in enumerate(zip(radii, colors)):
             if r <= 0:
                 continue
             ax.add_patch(Circle(
-                (0, 0), r, facecolor=col, edgecolor="white",
-                linewidth=0.5, zorder=2 + z,
+                (x_ion, r), r, facecolor=col, edgecolor="black",
+                linewidth=0.6, zorder=2 + z,
             ))
 
-        # Count labels at each ring apex (0, r), decluttered vertically with a
-        # short leader line so the text never overlaps and stays readable.
+        # Count labels stacked near the top of each set. Bottom-alignment puts
+        # ring i's top at 2*r_i, so its visible crescent is centred at the
+        # midpoint of consecutive tops (r_i + r_next); the innermost label sits
+        # at its own centre (r_i).
         live = [(i, r, c) for i, (r, c) in enumerate(zip(radii, cts)) if r > 0]
-        if live:
-            apex_y = [r for _, r, _ in live]
-            lab_y = _spread_positions(apex_y, min_gap=0.16)
-            label_top = max(label_top, float(np.max(lab_y)))
-            for (i, r, c), ly in zip(live, lab_y):
-                if abs(ly - r) > 1e-3:
-                    ax.plot([0, 0], [r, ly], color="0.5", lw=0.5, zorder=10)
-                ax.text(
-                    0, ly, str(c), ha="center", va="center", zorder=11,
-                    bbox=dict(boxstyle="round,pad=0.15", facecolor="white",
-                              edgecolor="none", alpha=0.85),
-                )
+        for j, (i, r, c) in enumerate(live):
+            ly = r + live[j + 1][1] if j + 1 < len(live) else r
+            ax.text(
+                x_ion, ly, str(c), ha="center", va="center",
+                color=_label_color(i), zorder=11,
+            )
 
-        # Ion label below the circles (kept clear of the top legend).
-        ax.text(0, -R_max - 0.18, ion, ha="center", va="top",
-                fontweight="bold")
-        ax.set_xlim(-R_max - 0.1, R_max + 0.1)
-        ax.set_ylim(-R_max - 0.35, label_top + 0.2)
+        # Ion symbol in the figure strip just below the shared baseline; drawn
+        # unclipped so it shows even though it sits below the axes data range.
+        ax.text(x_ion, y_bottom - 0.03, ion, ha="center", va="top",
+                fontweight="bold", clip_on=False)
 
-    # Shared two-row legend (4 chips, 2 columns) above the row, styled like the
-    # periodic-table legend swatches. matplotlib fills columns top-to-bottom, so
-    # reorder the handles to read in tier order across then down (outer pair on
-    # the top row, inner pair below).
-    order = [0, 2, 1, 3] if len(labels) == 4 else range(len(labels))
+    # Equal aspect: the width data-span = the height span scaled by the axes'
+    # physical aspect, so circles stay round while the spare width on the right
+    # holds the legend.
+    x_left = -0.12
+    axes_aspect = ((m_right - m_left) * figsize[0]) / (
+        (m_top - m_bottom) * figsize[1]
+    )
+    x_span = y_span * axes_aspect
+    ax.set_xlim(x_left, x_left + x_span)
+    ax.set_ylim(y_bottom, y_top)
+
+    # Shared 4-chip, 2-column legend, styled like the periodic-table swatches and
+    # nudged into the empty upper-right (right of Li, above the small ions) so it
+    # never overlaps a set. matplotlib fills columns top-to-bottom, so reorder
+    # the handles to read in tier order across then down.
+    order = [0, 2, 1, 3] if len(labels) == 4 else list(range(len(labels)))
     handles = [
         mpatches.Patch(facecolor=colors[i], label=labels[i]) for i in order
     ]
-    fig.legend(
-        handles=handles, ncol=2, loc="upper center",
-        bbox_to_anchor=(0.5, 1.0), frameon=False,
+    ax.legend(
+        handles=handles, ncol=2, loc="upper left",
+        bbox_to_anchor=(0.34, 1.0), frameon=False,
         handler_map={mpatches.Patch: _rounded_chip_handler()},
         handletextpad=0.5, columnspacing=2.0,
     )
@@ -1169,17 +1186,49 @@ def build_structure_voltage_data(
     return data, n_ions
 
 
+# Light "nude" background gradient for the single-ion panel: a symmetric arc
+# from a cool grey-green through a warm cream back to grey-green. Anchors
+# sampled from the 3rd-iteration reference figure
+# (structure_intercalation_voltages_colored_background.png). Built lazily so
+# importing this module stays side-effect free.
+_NUDE_GRADIENT_ANCHORS = ["#E4E5DF", "#FFF4E1", "#E4E5DF"]
+_NUDE_GRADIENT_CACHE = None
+
+
+def _NUDE_GRADIENT(t):
+    """Return the nude-gradient RGBA at position ``t`` in ``[0, 1]``."""
+    global _NUDE_GRADIENT_CACHE
+    if _NUDE_GRADIENT_CACHE is None:
+        from matplotlib.colors import LinearSegmentedColormap
+        _NUDE_GRADIENT_CACHE = LinearSegmentedColormap.from_list(
+            "spices_nude", _NUDE_GRADIENT_ANCHORS,
+        )
+    return _NUDE_GRADIENT_CACHE(t)
+
+
+# Hatch stroke width for the "hashed" (qualify < area < hatch) overlays and the
+# matching legend swatch. Finer than matplotlib's 1.0 default so the diagonal
+# fill reads as a light texture rather than coarse stripes. Set per-artist (not
+# via rcParams) so unrelated hatched figures (e.g. the Pourbaix diagram) keep
+# the default.
+_HATCH_LINEWIDTH = 0.5
+
+
 def _render_ion_selective_panel(
     ax, data, *, ion_colors, ref_pH, apply_shifts,
     tick_fontsize, label_fontsize, y_limits,
-    hatch_rect_height, marker_size,
+    hatch_rect_height, marker_size, gradient_background=True,
 ):
     """Render the single-ion panel of the combined structure-voltage figure.
 
     Columns are grouped along the x-axis in ``ION_COLORS`` order; within an
-    ion the builder already sorts columns by ``label_key``. Returns the set
-    of ions actually drawn and the mp-id list (one per x-tick, empty string
-    when absent) so the caller can place mp-id labels after layout.
+    ion the builder already sorts columns by ``label_key``. When
+    ``gradient_background`` is true, each phase column is backed by a light
+    "nude" band sampled left-to-right from :data:`_NUDE_GRADIENT` (reproducing
+    the 3rd-iteration ``structure_intercalation_voltages_colored_background``
+    look). Returns the set of ions actually drawn and the mp-id list (one per
+    x-tick, empty string when absent) so the caller can place mp-id labels
+    after layout.
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
@@ -1206,14 +1255,32 @@ def _render_ion_selective_panel(
                            color=ion_colors.get(ion, "gray"),
                            edgecolor="black", linewidths=0.6, zorder=3)
                 if style == "hashed":
-                    ax.add_patch(Rectangle(
+                    rect = Rectangle(
                         (x_counter - 0.2, v - hatch_rect_height / 2.0),
                         0.4, hatch_rect_height,
                         facecolor="none",
                         edgecolor=ion_colors.get(ion, "gray"),
                         hatch="////", linewidth=0, zorder=4,
-                    ))
+                    )
+                    rect.set_hatch_linewidth(_HATCH_LINEWIDTH)
+                    ax.add_patch(rect)
             x_counter += 1
+
+    # Light "nude" background, one progressively-varying band per phase column.
+    if gradient_background and x_counter:
+        denom = max(x_counter - 1, 1)
+        for i in range(x_counter):
+            ax.axvspan(i - 0.5, i + 0.5,
+                       facecolor=_NUDE_GRADIENT(i / denom), zorder=0)
+
+    # Centred "1 ion" header, matching the "{n} ions" headers on the multi-ion
+    # panel below.
+    if x_counter:
+        ax.text(
+            (x_counter - 1) / 2.0, 0.97, "1 ion",
+            transform=ax.get_xaxis_transform(), ha="center", va="top",
+            fontsize=tick_fontsize, fontweight="bold", zorder=5,
+        )
 
     o_line, h_line = _water_stability_ref_lines(ref_pH, apply_shifts)
     ax.axhline(o_line, color="blue", linestyle="--", linewidth=0.8)
@@ -1292,12 +1359,14 @@ def _render_multi_ion_panel(
                            edgecolor="black", linewidths=0.6,
                            alpha=0.3 if faded else 1.0, zorder=3)
                 if style == "hashed":
-                    ax.add_patch(Rectangle(
+                    rect = Rectangle(
                         (idx - 0.2, v - hatch_rect_height / 2.0),
                         0.4, hatch_rect_height, facecolor="none",
                         edgecolor=ion_colors.get(ion, "gray"),
                         hatch="////", linewidth=0, zorder=4,
-                    ))
+                    )
+                    rect.set_hatch_linewidth(_HATCH_LINEWIDTH)
+                    ax.add_patch(rect)
 
     o_line, h_line = _water_stability_ref_lines(ref_pH, apply_shifts)
     ax.axhline(o_line, color="blue", linestyle="--", linewidth=0.8)
@@ -1318,16 +1387,56 @@ def _render_multi_ion_panel(
     return ions_present, mpids
 
 
+# Step4-style top-legend rows (ax_top axes-fraction; y > 1 sits above the
+# panel). The figure's top margin is shrunk in plot_structure_voltages_combined
+# and savefig(bbox_inches="tight") captures the overflow.
+_SV_TOP_LEGEND_Y = {"ions": 1.18, "markers": 1.06}
+
+
+def _draw_sv_top_legend(ax, ion_handles, marker_handles):
+    """Draw two frameless horizontal legend rows above *ax* (step4 style).
+
+    Row 1: working-ion colour chips (rounded, via step4's chip handler).
+    Row 2: marker / hatched-area / faded-partner swatches. The ion-chip row is
+    created LAST so it becomes the axes' active legend -- a legend carrying a
+    custom ``handler_map`` only renders when it is ``ax.legend_`` (mirrors the
+    note in :func:`spices.screening.framework_comparison._draw_top_legend`).
+    """
+    import matplotlib.patches as mpatches
+    from spices.screening.framework_comparison import _rounded_chip_handler
+
+    leg_markers = ax.legend(
+        handles=marker_handles, loc="lower left",
+        bbox_to_anchor=(0.0, _SV_TOP_LEGEND_Y["markers"]),
+        ncol=len(marker_handles), frameon=False,
+    )
+    # The legend handler rebuilds its own swatch and drops the proxy's
+    # hatch_linewidth, so set it on the drawn legend patch to match the in-plot
+    # markers.
+    for patch in leg_markers.get_patches():
+        if patch.get_hatch():
+            patch.set_hatch_linewidth(_HATCH_LINEWIDTH)
+    ax.add_artist(leg_markers)
+
+    ax.legend(
+        handles=ion_handles,
+        handler_map={mpatches.Patch: _rounded_chip_handler()},
+        loc="lower left", bbox_to_anchor=(0.0, _SV_TOP_LEGEND_Y["ions"]),
+        ncol=len(ion_handles), frameon=False,
+    )
+
+
 def plot_structure_voltages_combined(
     records,
     *,
     ion_colors=None,
     background_colors=None,
+    gradient_background=True,
     y_limits=(-1.0, 1.5),
     ref_pH=None,
     apply_shifts=True,
     save_path=None,
-    figsize=(7.2, 6),
+    figsize=(DOUBLE_COL_WIDTH, 6),
     tick_fontsize=7,
     label_fontsize=8,
     mpid_fontsize=None,
@@ -1342,13 +1451,15 @@ def plot_structure_voltages_combined(
     Combined ion-selective + multi-ion structure-voltage figure (PDF).
 
     Top panel: single-ion intercalating frameworks (columns grouped in
-    ``ION_COLORS`` order). Bottom panel: multi-ion frameworks (columns
-    ordered by ion count, shaded by group, with an in-band ``"{n} ions"``
-    header). A single legend on the right combines the working-ion patches
-    with the marker / hatch / faded swatches.
+    ``ION_COLORS`` order), each backed by a light "nude" gradient band when
+    ``gradient_background`` is true. Bottom panel: multi-ion frameworks
+    (columns ordered by ion count, shaded by group, with an in-band
+    ``"{n} ions"`` header). Two frameless legend rows sit above the figure
+    (step4 style): working-ion chips on top, marker / hatch / faded swatches
+    below.
 
-    Width matches the package's double-column convention (7.2 in, see
-    :mod:`spices.plotting`); height accommodates both panels comfortably.
+    Both panels span the full double-column width (see :mod:`spices.plotting`);
+    height accommodates both panels and the top legend comfortably.
     Hexagon markers = experimental, circles = theoretical; ``hashed`` =
     metastability area between ``qualify_area`` and ``hatch_area``; ``faded``
     = partner ion that intercalates the host but is not seawater-stable
@@ -1408,14 +1519,13 @@ def plot_structure_voltages_combined(
     )
 
     fig = plt.figure(figsize=figsize)
+    # Two stacked panels at full width (no right-hand legend column); ``top``
+    # reserves headroom for the two legend rows anchored above ax_top.
     gs = fig.add_gridspec(
-        2, 2, width_ratios=[6, 1], height_ratios=[1, 1],
-        hspace=0.6, wspace=0.05,
+        2, 1, height_ratios=[1, 1], hspace=0.6, top=0.86,
     )
-    ax_top = fig.add_subplot(gs[0, 0])
-    ax_bot = fig.add_subplot(gs[1, 0])
-    ax_legend = fig.add_subplot(gs[:, 1])
-    ax_legend.axis("off")
+    ax_top = fig.add_subplot(gs[0])
+    ax_bot = fig.add_subplot(gs[1])
 
     ions_top, mpids_top = _render_ion_selective_panel(
         ax_top, sv_ion,
@@ -1423,7 +1533,7 @@ def plot_structure_voltages_combined(
         ref_pH=ref_pH, apply_shifts=apply_shifts,
         tick_fontsize=tick_fontsize, label_fontsize=label_fontsize,
         y_limits=y_limits, hatch_rect_height=hatch_rect_height,
-        marker_size=marker_size,
+        marker_size=marker_size, gradient_background=gradient_background,
     )
     ions_bot, mpids_bot = _render_multi_ion_panel(
         ax_bot, sv_multi, n_ions,
@@ -1439,23 +1549,23 @@ def plot_structure_voltages_combined(
         Patch(facecolor=ion_colors.get(i, "gray"), edgecolor="black", label=i)
         for i in ION_COLORS if i in ions_present
     ]
+    hatch_handle = Patch(
+        facecolor="none", edgecolor="black", hatch="////",
+        label=f"{int(qualify_area * 100)}% < area < "
+              f"{int(hatch_area * 100)}%",
+    )
+    hatch_handle.set_hatch_linewidth(_HATCH_LINEWIDTH)
     marker_handles = [
         Line2D([0], [0], marker="h", color="w", markerfacecolor="gray",
                markeredgecolor="black", markersize=7, label="Experimental"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor="gray",
                markeredgecolor="black", markersize=6, label="Theoretical"),
-        Patch(facecolor="none", edgecolor="black", hatch="////",
-              label=f"{int(qualify_area * 100)}% < area < "
-                    f"{int(hatch_area * 100)}%"),
+        hatch_handle,
         Line2D([0], [0], marker="o", color="w", markerfacecolor="gray",
                markeredgecolor="black", markersize=6, alpha=0.4,
-               label="Other ion\n(not seawater stable)"),
+               label="Other ion (not seawater stable)"),
     ]
-    ax_legend.legend(
-        handles=ion_handles + marker_handles,
-        loc="center left", frameon=True, fontsize=tick_fontsize,
-        handlelength=1.5, borderaxespad=0.0,
-    )
+    _draw_sv_top_legend(ax_top, ion_handles, marker_handles)
 
     # mp-id labels drawn after axes positions settle so the rotated offsets
     # are honoured; bbox_inches="tight" then absorbs the overflow.
