@@ -1054,7 +1054,7 @@ def build_structure_voltage_data(
     top_n=None,
     experimental_only_ions=None,
     faded_mode="all",
-    require_experimental_anchor=True,
+    anchor_filter="solid",
 ):
     """
     Build structure-voltage plot data from Stage-4 records (E2).
@@ -1077,12 +1077,29 @@ def build_structure_voltage_data(
         (multi-ion only) ``"all"`` shows every faded partner-ion marker;
         ``"ph_covering"`` hides faded markers whose plateau does not cover the
         pH window. Routing / ``n_ions`` come from the records and are unchanged.
-    require_experimental_anchor : bool
-        When ``True`` (default), drop any component that carries a hashed or
-        faded marker but has no ``status="solid"`` + ``type="Experimental"``
-        anchor: the weaker secondary markers are only shown for hosts with at
-        least one strong experimental plateau. Set ``False`` to disable the
-        filter and recover the pre-filter behaviour.
+    anchor_filter : {"solid", "experimental", None}
+        Which anchor a component must carry to be drawn. Marker statuses
+        (assigned in Stage 4) mean: ``"solid"`` = the host's own qualifying
+        plateau (covers the pH window, area >= hatch threshold);
+        ``"hashed"`` = the host's own borderline plateau (qualify < area <
+        hatch); ``"faded"`` = a *partner* ion's non-qualifying plateau, drawn
+        only as context.
+
+        ``"solid"`` (default)
+            Keep a component iff it has at least one solid marker, whether
+            Experimental or Theoretical. Partner-ion failures (faded) and
+            borderline extras (hashed) never delete a column on their own;
+            hashed-only components are dropped. Monotone: adding a partner
+            ion can never remove a column.
+        ``"experimental"``
+            The stricter historical rule: drop any component that carries a
+            hashed or faded marker but has no ``status="solid"`` +
+            ``type="Experimental"`` anchor. Note this deletes hosts whose
+            own solid plateau is Theoretical as soon as any weaker marker
+            is present.
+        ``None``
+            No anchor filtering; every component of the requested route is
+            kept.
 
     Returns
     -------
@@ -1112,7 +1129,16 @@ def build_structure_voltage_data(
 
     comps = [c for c in records.get("components", []) if c["route"] == mode]
 
-    if require_experimental_anchor:
+    if anchor_filter == "solid":
+        # Every record has >= 1 qualifying (solid/hashed) marker, so "keep
+        # iff any solid marker" is the whole rule: faded markers describe a
+        # partner ion's plateau, not this host's qualification, and must not
+        # gate the host's admission.
+        comps = [
+            c for c in comps
+            if any(m["status"] == "solid" for m in c["markers"])
+        ]
+    elif anchor_filter == "experimental":
         def _drop(c):
             has_weak = any(
                 m["status"] in ("hashed", "faded") for m in c["markers"]
@@ -1123,6 +1149,11 @@ def build_structure_voltage_data(
             )
             return has_weak and not has_anchor
         comps = [c for c in comps if not _drop(c)]
+    elif anchor_filter is not None:
+        raise ValueError(
+            f"Unknown anchor_filter {anchor_filter!r} "
+            "(expected 'solid', 'experimental', or None)"
+        )
 
     def _style(marker):
         # "solid" -> None (plain marker); "hashed"/"faded" pass through.
@@ -1206,12 +1237,15 @@ def _NUDE_GRADIENT(t):
     return _NUDE_GRADIENT_CACHE(t)
 
 
-# Hatch stroke width for the "hashed" (qualify < area < hatch) overlays and the
-# matching legend swatch. Finer than matplotlib's 1.0 default so the diagonal
-# fill reads as a light texture rather than coarse stripes. Set per-artist (not
-# via rcParams) so unrelated hatched figures (e.g. the Pourbaix diagram) keep
-# the default.
-_HATCH_LINEWIDTH = 0.5
+# Hatch cosmetics for the "hashed" (qualify < area < hatch) overlays and the
+# matching legend swatch. Stroke width finer than matplotlib's 1.0 default so
+# the diagonal fill reads as a light texture rather than coarse stripes; the
+# density (lines per rectangle) scales with the number of repeated "/" symbols,
+# tuned so ~5 lines cross the small overlay rect. Set per-artist (not via
+# rcParams) so unrelated hatched figures (e.g. the Pourbaix diagram) keep the
+# defaults.
+_HATCH_LINEWIDTH = 0.45
+_HATCH_PATTERN = "/" * 10
 
 
 def _render_ion_selective_panel(
@@ -1260,7 +1294,7 @@ def _render_ion_selective_panel(
                         0.4, hatch_rect_height,
                         facecolor="none",
                         edgecolor=ion_colors.get(ion, "gray"),
-                        hatch="////", linewidth=0, zorder=4,
+                        hatch=_HATCH_PATTERN, linewidth=0, zorder=4,
                     )
                     rect.set_hatch_linewidth(_HATCH_LINEWIDTH)
                     ax.add_patch(rect)
@@ -1363,7 +1397,7 @@ def _render_multi_ion_panel(
                         (idx - 0.2, v - hatch_rect_height / 2.0),
                         0.4, hatch_rect_height, facecolor="none",
                         edgecolor=ion_colors.get(ion, "gray"),
-                        hatch="////", linewidth=0, zorder=4,
+                        hatch=_HATCH_PATTERN, linewidth=0, zorder=4,
                     )
                     rect.set_hatch_linewidth(_HATCH_LINEWIDTH)
                     ax.add_patch(rect)
@@ -1445,7 +1479,7 @@ def plot_structure_voltages_combined(
     hatch_area=0.80,
     experimental_only_ions=None,
     faded_mode="all",
-    require_experimental_anchor=True,
+    anchor_filter="solid",
 ):
     """
     Combined ion-selective + multi-ion structure-voltage figure (PDF).
@@ -1471,10 +1505,12 @@ def plot_structure_voltages_combined(
     ----------
     records : dict or str
         Stage-4 ``structure_voltage_records.json`` (path or loaded dict).
-    require_experimental_anchor : bool
-        Pass-through to :func:`build_structure_voltage_data`. When ``True``
-        (default), frameworks that carry only weaker (hashed/faded) markers
-        without an experimental solid anchor are dropped from both panels.
+    anchor_filter : {"solid", "experimental", None}
+        Pass-through to :func:`build_structure_voltage_data` (applies to both
+        panels). ``"solid"`` (default) keeps every framework with at least
+        one solid marker of either type; ``"experimental"`` is the stricter
+        historical rule requiring a solid+Experimental anchor whenever any
+        hashed/faded marker is present; ``None`` disables the filter.
     experimental_only_ions, faded_mode
         Pass-through to :func:`build_structure_voltage_data` for the
         respective panels.
@@ -1510,12 +1546,12 @@ def plot_structure_voltages_combined(
     sv_ion = build_structure_voltage_data(
         records, "ion_selective",
         experimental_only_ions=experimental_only_ions,
-        require_experimental_anchor=require_experimental_anchor,
+        anchor_filter=anchor_filter,
     )
     sv_multi, n_ions = build_structure_voltage_data(
         records, "multi_ion",
         faded_mode=faded_mode,
-        require_experimental_anchor=require_experimental_anchor,
+        anchor_filter=anchor_filter,
     )
 
     fig = plt.figure(figsize=figsize)
@@ -1550,7 +1586,7 @@ def plot_structure_voltages_combined(
         for i in ION_COLORS if i in ions_present
     ]
     hatch_handle = Patch(
-        facecolor="none", edgecolor="black", hatch="////",
+        facecolor="none", edgecolor="black", hatch=_HATCH_PATTERN,
         label=f"{int(qualify_area * 100)}% < area < "
               f"{int(hatch_area * 100)}%",
     )
@@ -1598,7 +1634,7 @@ def run_statistics(
     yscale="log",
     experimental_only_ions=("Li",),
     faded_mode="all",
-    require_experimental_anchor=True,
+    anchor_filter="solid",
 ):
     """
     Run the full Stage-5 statistics pipeline across all ions.
@@ -1638,11 +1674,14 @@ def run_statistics(
         Controls which non-qualifying partner-ion markers are drawn faded in
         the multi-ion panel. ``"all"`` (default) draws every partner plateau;
         ``"ph_covering"`` draws only those covering the pH window.
-    require_experimental_anchor : bool
-        When ``True`` (default), frameworks that carry hashed/faded markers
-        but lack a ``status="solid"`` + ``type="Experimental"`` anchor are
-        dropped from both panels. Set ``False`` to recover the pre-filter
-        behaviour and see every framework.
+    anchor_filter : {"solid", "experimental", None}
+        Anchor filter for the combined structure-voltage figure (both
+        panels; see :func:`build_structure_voltage_data`). ``"solid"``
+        (default) keeps every framework with at least one solid marker,
+        Experimental or Theoretical; ``"experimental"`` is the stricter
+        historical rule dropping frameworks that carry hashed/faded markers
+        without a solid+Experimental anchor; ``None`` disables the filter
+        and shows every framework.
 
     Returns
     -------
@@ -1826,7 +1865,7 @@ def run_statistics(
                 qualify_area=qa, hatch_area=ha,
                 experimental_only_ions=experimental_only_ions,
                 faded_mode=faded_mode,
-                require_experimental_anchor=require_experimental_anchor,
+                anchor_filter=anchor_filter,
                 save_path=os.path.join(output_dir, "structure_voltages.pdf"),
             )
         elif stage4_records:

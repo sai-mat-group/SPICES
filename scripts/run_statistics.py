@@ -91,12 +91,16 @@ def main():
              "(default: Li; pass '' to disable). Affects ONLY that panel.",
     )
     parser.add_argument(
-        "--no-experimental-anchor", dest="require_experimental_anchor",
-        action="store_false", default=True,
-        help="Disable the experimental-anchor filter on the combined "
-             "structure-voltage figure (default: filter ON). With the flag "
-             "set, frameworks with no solid+Experimental marker (area >= "
-             "80%%) that carry only hashed/faded markers are kept.",
+        "--anchor-filter", choices=["solid", "experimental", "none"],
+        default="solid",
+        help="Anchor filter on the combined structure-voltage figure (both "
+             "panels). 'solid' (default): keep every framework with at "
+             "least one solid marker (area >= 80%%, Experimental or "
+             "Theoretical); hashed-only frameworks are dropped and faded "
+             "partner-ion markers never delete a column. 'experimental': "
+             "the stricter historical rule -- drop any framework carrying a "
+             "hashed/faded marker unless it also has a solid+Experimental "
+             "marker. 'none': no filtering; every framework is drawn.",
     )
     parser.add_argument(
         "--no-periodic-table", action="store_true",
@@ -139,7 +143,9 @@ def main():
         bar_color_by=args.bar_color_by,
         experimental_only_ions=experimental_only_ions,
         faded_mode=args.faded_partner_plateaus,
-        require_experimental_anchor=args.require_experimental_anchor,
+        anchor_filter=(
+            None if args.anchor_filter == "none" else args.anchor_filter
+        ),
     )
 
     for element, data in summary.items():

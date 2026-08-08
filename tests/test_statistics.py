@@ -276,8 +276,7 @@ class TestBuildStructureVoltageData:
             # Disable the anchor filter: this test asserts hashed-style
             # passthrough, not the filter behaviour.
             data = build_structure_voltage_data(
-                json.load(fh), "ion_selective",
-                require_experimental_anchor=False)
+                json.load(fh), "ion_selective", anchor_filter=None)
         assert data["Li"]["FePO4\nmp-1"][0][2] == "hashed"
 
     def test_experimental_only_filter(self, tmp_path):
@@ -395,9 +394,9 @@ class TestBuildStructureVoltageData:
         with pytest.raises(ValueError):
             build_structure_voltage_data(path, "bogus")
 
-    def test_experimental_anchor_filter_drops_unsupported(self, tmp_path):
-        # A component whose only marker is hashed (no solid+Experimental
-        # anchor) is dropped under the default filter and kept when the
+    def test_anchor_filter_drops_hashed_only(self, tmp_path):
+        # A component whose only marker is hashed (no solid marker at all)
+        # is dropped under the default "solid" filter and kept when the
         # filter is disabled.
         comps = [_ion_comp(
             0, "ion_selective", 1, "FePO4\nmp-1",
@@ -407,12 +406,14 @@ class TestBuildStructureVoltageData:
         data = build_structure_voltage_data(path, "ion_selective")
         assert "Li" not in data
         data = build_structure_voltage_data(
-            path, "ion_selective", require_experimental_anchor=False)
+            path, "ion_selective", anchor_filter=None)
         assert "FePO4\nmp-1" in data["Li"]
 
-    def test_experimental_anchor_filter_keeps_pure_solid(self, tmp_path):
-        # A component with only solid markers (no hashed/faded at all) is
-        # untouched by the filter, regardless of Experimental vs Theoretical.
+    def test_anchor_filter_keeps_pure_solid(self, tmp_path):
+        # A component with only solid markers is kept under both anchor
+        # modes, regardless of Experimental vs Theoretical... except that
+        # "experimental" also fires when a weak marker is present (covered
+        # in the tests below).
         comps = [
             _ion_comp(0, "ion_selective", 1, "FePO4\nmp-1",
                       [_marker("Li", 0.3, "solid", "Experimental")]),
@@ -420,35 +421,101 @@ class TestBuildStructureVoltageData:
                       [_marker("Li", 0.1, "solid", "Theoretical")]),
         ]
         path = _write_records(tmp_path, comps)
-        data = build_structure_voltage_data(path, "ion_selective")
-        assert set(data["Li"]) == {"FePO4\nmp-1", "TiO2\nmp-2"}
+        for mode in ("solid", "experimental"):
+            data = build_structure_voltage_data(
+                path, "ion_selective", anchor_filter=mode)
+            assert set(data["Li"]) == {"FePO4\nmp-1", "TiO2\nmp-2"}
 
-    def test_experimental_anchor_filter_multi_ion_faded(self, tmp_path):
-        # Multi-ion component with a faded partner: kept iff the same
-        # component also carries a solid+Experimental anchor (regardless of
-        # which ion it belongs to).
-        with_anchor = [_ion_comp(
-            0, "multi_ion", 2, "FePO4\nmp-1",
-            [_marker("Li", 0.35, "solid", "Experimental", area=0.95),
-             _marker("Na", 0.30, "faded", "Theoretical", area=0.5,
-                     covers_pH=True)],
-        )]
-        path = _write_records(tmp_path, with_anchor)
-        data, _ = build_structure_voltage_data(path, "multi_ion")
-        assert "FePO4\nmp-1" in data
-
-        without_anchor = [_ion_comp(
+    def test_anchor_filter_solid_keeps_faded_partner(self, tmp_path):
+        # The mp-540111 / mp-774537 shape: a solid THEORETICAL plateau plus
+        # a faded partner. The partner's failure is context, not host
+        # weakness, so the default "solid" filter keeps the column; the
+        # historical "experimental" rule drops it (no Experimental anchor).
+        comps = [_ion_comp(
             0, "multi_ion", 2, "FePO4\nmp-1",
             [_marker("Li", 0.35, "solid", "Theoretical", area=0.95),
              _marker("Na", 0.30, "faded", "Theoretical", area=0.5,
                      covers_pH=True)],
         )]
-        path = _write_records(tmp_path, without_anchor)
+        path = _write_records(tmp_path, comps)
+        data, _ = build_structure_voltage_data(path, "multi_ion")
+        assert "FePO4\nmp-1" in data
+        data, _ = build_structure_voltage_data(
+            path, "multi_ion", anchor_filter="experimental")
+        assert data == {}
+
+    def test_anchor_filter_solid_keeps_solid_plus_hashed(self, tmp_path):
+        # The MnFe(PO4)2 shape: the host's own solid plateau plus its own
+        # borderline hashed one. "solid" keeps it; "experimental" drops it
+        # because the hashed marker fires without an Experimental anchor.
+        comps = [_ion_comp(
+            0, "multi_ion", 2, "MnFe(PO4)2\nmp-1",
+            [_marker("Mg", 0.2, "solid", "Theoretical", area=0.82),
+             _marker("Li", 0.3, "hashed", "Theoretical", area=0.79)],
+        )]
+        path = _write_records(tmp_path, comps)
+        data, _ = build_structure_voltage_data(path, "multi_ion")
+        assert "MnFe(PO4)2\nmp-1" in data
+        data, _ = build_structure_voltage_data(
+            path, "multi_ion", anchor_filter="experimental")
+        assert data == {}
+
+    def test_anchor_filter_solid_drops_weak_only_multi_ion(self, tmp_path):
+        # hashed + faded with no solid marker anywhere: dropped by default.
+        comps = [_ion_comp(
+            0, "multi_ion", 2, "TiO2\nmp-1",
+            [_marker("Li", 0.3, "hashed", "Experimental", area=0.75),
+             _marker("Mg", 0.1, "faded", "Theoretical", area=0.4,
+                     covers_pH=False)],
+        )]
+        path = _write_records(tmp_path, comps)
         data, _ = build_structure_voltage_data(path, "multi_ion")
         assert data == {}
         data, _ = build_structure_voltage_data(
-            path, "multi_ion", require_experimental_anchor=False)
+            path, "multi_ion", anchor_filter=None)
+        assert "TiO2\nmp-1" in data
+
+    def test_anchor_filter_experimental_keeps_anchored(self, tmp_path):
+        # Historical rule preserved: solid+Experimental anchors a component
+        # that also carries a faded partner.
+        comps = [_ion_comp(
+            0, "multi_ion", 2, "FePO4\nmp-1",
+            [_marker("Li", 0.35, "solid", "Experimental", area=0.95),
+             _marker("Na", 0.30, "faded", "Theoretical", area=0.5,
+                     covers_pH=True)],
+        )]
+        path = _write_records(tmp_path, comps)
+        data, _ = build_structure_voltage_data(
+            path, "multi_ion", anchor_filter="experimental")
         assert "FePO4\nmp-1" in data
+
+    def test_anchor_filter_monotone_under_new_partner(self, tmp_path):
+        # Regression for the non-monotonicity flaw: the same host must be
+        # kept both as a 1-ion ion_selective component and after Stage 4
+        # re-routes it multi_ion with an added faded partner.
+        alone = [_ion_comp(
+            0, "ion_selective", 1, "Ti2(PO4)3\nmp-1",
+            [_marker("Mg", 0.23, "solid", "Theoretical", area=0.995)],
+        )]
+        path = _write_records(tmp_path, alone)
+        data = build_structure_voltage_data(path, "ion_selective")
+        assert "Ti2(PO4)3\nmp-1" in data["Mg"]
+
+        with_partner = [_ion_comp(
+            0, "multi_ion", 2, "Ti2(PO4)3\nmp-1",
+            [_marker("Mg", 0.23, "solid", "Theoretical", area=0.995),
+             _marker("Li", -0.4, "faded", "Theoretical", area=0.39,
+                     covers_pH=True)],
+        )]
+        path = _write_records(tmp_path, with_partner)
+        data, _ = build_structure_voltage_data(path, "multi_ion")
+        assert "Ti2(PO4)3\nmp-1" in data
+
+    def test_anchor_filter_unknown_value_raises(self, tmp_path):
+        path = _write_records(tmp_path, [])
+        with pytest.raises(ValueError, match="anchor_filter"):
+            build_structure_voltage_data(
+                path, "ion_selective", anchor_filter="bogus")
 
 
 class TestFigureSmoke:
@@ -491,9 +558,9 @@ class TestFigureSmoke:
         # hashed overlay + ION_COLORS x-ordering, multi-ion (bottom) with
         # the n_ions grouping (3-ion host listed first to confirm it is
         # re-ordered after the 2-ion host), a faded partner marker, and
-        # the combined right-side legend + mp-id x-ticks. Defaults to the
-        # experimental-anchor filter ON, so the fixture supplies a
-        # solid+Experimental anchor on every component drawn here.
+        # the combined right-side legend + mp-id x-ticks. The default
+        # anchor_filter="solid" keeps every component here since each one
+        # carries at least one solid marker.
         comps = [
             _ion_comp(0, "ion_selective", 1, "FePO4\nmp-1",
                       [_marker("Li", 0.3, "solid", "Experimental",
@@ -540,8 +607,8 @@ class TestRunStatisticsStructureVoltage:
     """End-to-end wiring of the records JSON -> the combined PDF."""
 
     def test_writes_combined_figure_from_records(self, tmp_path):
-        # Provide a solid+Experimental anchor on the multi-ion component so
-        # the default experimental-anchor filter keeps the faded partner.
+        # The multi-ion component carries a solid marker, so the default
+        # anchor_filter="solid" keeps it (faded partner included).
         comps = [
             _ion_comp(0, "ion_selective", 1, "FePO4\nmp-1",
                       [_marker("Li", 0.3, "solid", "Experimental")]),
