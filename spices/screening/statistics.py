@@ -43,6 +43,12 @@ from spices.plotting import (
 
 logger = logging.getLogger(__name__)
 
+# Left-to-right working-ion order shared by every Stage-5 publication figure
+# (bar chart, metastability Venn, structure-voltage panels + legend). Kept
+# separate from ``ION_COLORS`` (a colour map whose key order also drives the
+# Stage-4 figures) so the display order can change independently.
+ION_DISPLAY_ORDER = ("Li", "Mg", "Ca", "Na", "K")
+
 
 # ====================================================================
 # Statistics functions
@@ -514,9 +520,6 @@ _PERIODIC_TABLE_ELEMENTS = [
 # tab20b 10/20).
 PIPELINE_BAR_COLORS = ["#87ceeb", "#6b6ecf", "#e7ba52"]
 
-# Left-to-right ion order for the bar chart (publication panel b).
-PIPELINE_BAR_ION_ORDER = ["Li", "Mg", "Ca", "Na", "K"]
-
 
 def plot_pipeline_bar_chart(
     stage_data,
@@ -643,8 +646,6 @@ METASTABILITY_VENN_LABELS = [
     "Metastability area ≥ 80%",
     "≥ 1 experimental (dis)charged electrode",
 ]
-# Working-ion order for the panel (left to right).
-METASTABILITY_VENN_ION_ORDER = ("Li", "Mg", "Ca", "Na", "K")
 
 
 def compute_metastability_venn_counts(
@@ -757,7 +758,7 @@ def _rounded_chip_handler():
 
 def plot_metastability_venn_panel(
     counts_by_ion,
-    ion_order=METASTABILITY_VENN_ION_ORDER,
+    ion_order=ION_DISPLAY_ORDER,
     colors=None,
     labels=None,
     save_path=None,
@@ -1178,7 +1179,7 @@ def build_structure_voltage_data(
             per_ion[ion].append((c["label_key"], entries, max_area))
 
         data = {}
-        for ion in ION_COLORS:
+        for ion in ION_DISPLAY_ORDER:
             comp_list = per_ion.get(ion)
             if not comp_list:
                 continue
@@ -1255,7 +1256,7 @@ def _render_ion_selective_panel(
 ):
     """Render the single-ion panel of the combined structure-voltage figure.
 
-    Columns are grouped along the x-axis in ``ION_COLORS`` order; within an
+    Columns are grouped along the x-axis in ``ION_DISPLAY_ORDER``; within an
     ion the builder already sorts columns by ``label_key``. When
     ``gradient_background`` is true, each phase column is backed by a light
     "nude" band sampled left-to-right from :data:`_NUDE_GRADIENT` (reproducing
@@ -1270,7 +1271,7 @@ def _render_ion_selective_panel(
     x_labels = []
     x_counter = 0
     ions_present = set()
-    for ion in ION_COLORS:
+    for ion in ION_DISPLAY_ORDER:
         structures = data.get(ion)
         if not structures:
             continue
@@ -1485,7 +1486,7 @@ def plot_structure_voltages_combined(
     Combined ion-selective + multi-ion structure-voltage figure (PDF).
 
     Top panel: single-ion intercalating frameworks (columns grouped in
-    ``ION_COLORS`` order), each backed by a light "nude" gradient band when
+    ``ION_DISPLAY_ORDER``), each backed by a light "nude" gradient band when
     ``gradient_background`` is true. Bottom panel: multi-ion frameworks
     (columns ordered by ion count, shaded by group, with an in-band
     ``"{n} ions"`` header). Two frameless legend rows sit above the figure
@@ -1583,7 +1584,7 @@ def plot_structure_voltages_combined(
     ions_present = ions_top | ions_bot
     ion_handles = [
         Patch(facecolor=ion_colors.get(i, "gray"), edgecolor="black", label=i)
-        for i in ION_COLORS if i in ions_present
+        for i in ION_DISPLAY_ORDER if i in ions_present
     ]
     hatch_handle = Patch(
         facecolor="none", edgecolor="black", hatch=_HATCH_PATTERN,
@@ -1773,7 +1774,7 @@ def run_statistics(
         plotted = list(summary.keys())
 
         # Bar chart — fixed left-to-right ion order for the publication panel.
-        bar_order = [e for e in PIPELINE_BAR_ION_ORDER if e in plotted]
+        bar_order = [e for e in ION_DISPLAY_ORDER if e in plotted]
         bar_order += [e for e in plotted if e not in bar_order]
         bar_data = {}
         for e in bar_order:
@@ -1826,7 +1827,7 @@ def run_statistics(
             else:
                 graphs = load_cached_graphs(cache_path)
                 venn_ions = [
-                    i for i in METASTABILITY_VENN_ION_ORDER if i in df_dict
+                    i for i in ION_DISPLAY_ORDER if i in df_dict
                 ]
                 counts_by_ion = compute_metastability_venn_counts(
                     graphs, df_dict, venn_ions,
