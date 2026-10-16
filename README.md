@@ -2,7 +2,7 @@
 
 **S**eawater **P**ourbaix **I**ntercalation **C**ation **E**lectrode **S**creening
 
-A Python package for high-throughput screening of cathode materials for desalination applications using Pourbaix diagram analysis and Materials Project data.
+A Python package for high-throughput screening of cathode materials for electrochemical ion recovery and desalination applications using Pourbaix diagram analysis and Materials Project data. The manuscript describing this work, "Identifying intercalation electrodes for electrochemical ion recovery and desalination" is currently under review with a pre-print available on [arXiv](https://arxiv.org/abs/2610.20834). In case you use any of the data or codes developed in this work, we would appreciate a citation of our manuscript at [arXiv](https://arxiv.org/abs/2610.20834).
 
 ## Overview
 
